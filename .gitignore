@@ -1,0 +1,67 @@
+# =============================================================================
+# Hammer — do NOT push these to GitHub (size, secrets, local runtime)
+# =============================================================================
+
+# Historical price CSVs — often hundreds of MB; GitHub rejects files >100MB
+data/**/*
+!data/.gitkeep
+
+# Backtest / live output (CSVs, ledgers, Excel exports)
+output/
+
+# Generated chart PNGs
+plots/
+
+# Optional JSON presets (may contain client-specific strategy params)
+presets/
+
+# Local run history (SQLite)
+run_history.db
+*.db-journal
+
+# Live trading logs (may include account hints)
+# (lives under output/live/ — covered by output/)
+
+# PyInstaller / build artifacts (large binaries)
+build/
+dist/
+*.spec
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# Secrets & credentials — never commit
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Cursor / local
+.cursor/
+
+# Large archives
+*.zip
+*.7z
+*.tar.gz
+
+# Jupyter / notebooks checkpoints (if any)
+.ipynb_checkpoints/

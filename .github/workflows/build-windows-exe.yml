@@ -1,0 +1,72 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "dashboard.py"
+      - "logic.py"
+      - "doji_logic.py"
+      - "backtest.py"
+      - "plotting.py"
+      - "broker.py"
+      - "live.py"
+      - "live_journal.py"
+      - "indicators/**"
+      - "requirements.txt"
+      - ".github/workflows/build-windows-exe.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          $args = @(
+            "--onefile",
+            "--windowed",
+            "--name", "HammerCandleBacktestDashboard",
+            "--collect-all", "PySide6",
+            "--collect-data", "matplotlib",
+            "--collect-all", "polars",
+            "--hidden-import", "doji_logic",
+            "--hidden-import", "broker",
+            "--hidden-import", "live",
+            "--hidden-import", "live_journal",
+            "--hidden-import", "indicators",
+            "--hidden-import", "indicators.filter",
+            "--hidden-import", "indicators.supertrend",
+            "--hidden-import", "indicators.vwap",
+            "--hidden-import", "indicators.config",
+            "--hidden-import", "indicators.registry",
+            "--hidden-import", "MetaTrader5",
+            "--hidden-import", "openpyxl",
+            "--hidden-import", "openpyxl.styles"
+          )
+          if (Test-Path "app_icon.ico") {
+            $args += @("--icon", "app_icon.ico")
+          }
+          $args += "dashboard.py"
+          pyinstaller @args
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HammerCandleBacktestDashboard-windows
+          path: dist/HammerCandleBacktestDashboard.exe
+          if-no-files-found: error
