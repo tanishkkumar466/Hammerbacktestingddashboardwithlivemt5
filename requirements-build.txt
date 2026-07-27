@@ -1,0 +1,3 @@
+# Windows CI / local PyInstaller build (install on top of runtime deps)
+-r requirements.txt
+pyinstaller>=6.3,<7

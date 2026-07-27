@@ -5,6 +5,7 @@ on:
   push:
     branches: [main, master]
     paths:
+      - "main.py"
       - "dashboard.py"
       - "logic.py"
       - "doji_logic.py"
@@ -13,8 +14,13 @@ on:
       - "broker.py"
       - "live.py"
       - "live_journal.py"
+      - "fetch.py"
       - "indicators/**"
       - "requirements.txt"
+      - "requirements-build.txt"
+      - "HammerCandleBacktestDashboard.spec"
+      - "logo.ico"
+      - "app_icon.ico"
       - ".github/workflows/build-windows-exe.yml"
 
 jobs:
@@ -29,44 +35,72 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
 
-      - name: Build executable
+      - name: Verify source tree
         shell: pwsh
         run: |
-          $args = @(
-            "--onefile",
-            "--windowed",
-            "--name", "HammerCandleBacktestDashboard",
-            "--collect-all", "PySide6",
-            "--collect-data", "matplotlib",
-            "--collect-all", "polars",
-            "--hidden-import", "doji_logic",
-            "--hidden-import", "broker",
-            "--hidden-import", "live",
-            "--hidden-import", "live_journal",
-            "--hidden-import", "indicators",
-            "--hidden-import", "indicators.filter",
-            "--hidden-import", "indicators.supertrend",
-            "--hidden-import", "indicators.vwap",
-            "--hidden-import", "indicators.config",
-            "--hidden-import", "indicators.registry",
-            "--hidden-import", "MetaTrader5",
-            "--hidden-import", "openpyxl",
-            "--hidden-import", "openpyxl.styles"
+          $required = @(
+            "main.py", "dashboard.py", "logic.py", "doji_logic.py", "backtest.py",
+            "plotting.py", "broker.py", "live.py", "live_journal.py",
+            "HammerCandleBacktestDashboard.spec"
           )
-          if (Test-Path "app_icon.ico") {
-            $args += @("--icon", "app_icon.ico")
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) { throw "Missing required file: $f" }
           }
-          $args += "dashboard.py"
-          pyinstaller @args
+          if (-not (Test-Path "indicators/__init__.py")) { throw "Missing indicators package" }
+          if (Test-Path "logo.ico") {
+            Write-Host "Using logo.ico for exe + window icon"
+          } elseif (Test-Path "app_icon.ico") {
+            Write-Host "logo.ico not found — using app_icon.ico"
+          } else {
+            Write-Host "No .ico in repo — build will use default PyInstaller icon"
+          }
 
-      - name: Upload artifact
+      - name: Build executable (PyInstaller spec)
+        run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
+
+      - name: Smoke-check EXE
+        shell: pwsh
+        run: |
+          $exe = "dist/HammerCandleBacktestDashboard.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
+          Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
+
+      - name: Package delivery folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/HammerCandleBacktestDashboard" | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard/"
+          @"
+          Hammer Candle Backtest Dashboard (Windows)
+
+          1. Copy your data/ folder (XAUUSD CSVs) next to the .exe if not already present.
+          2. Double-click HammerCandleBacktestDashboard.exe
+          3. If SmartScreen appears: More info -> Run anyway (unsigned app).
+
+          Live MT5: Windows only — install MetaTrader 5 terminal and pip MetaTrader5 on dev machine;
+          the frozen exe includes the MetaTrader5 package for import on client PC with MT5 installed.
+          "@ | Set-Content -Encoding UTF8 "dist/HammerCandleBacktestDashboard/README.txt"
+          Compress-Archive -Path "dist/HammerCandleBacktestDashboard/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
+
+      - name: Upload artifact (exe)
         uses: actions/upload-artifact@v4
         with:
           name: HammerCandleBacktestDashboard-windows
           path: dist/HammerCandleBacktestDashboard.exe
+          if-no-files-found: error
+
+      - name: Upload artifact (zip with readme)
+        uses: actions/upload-artifact@v4
+        with:
+          name: HammerCandleBacktestDashboard-windows-zip
+          path: dist/HammerCandleBacktestDashboard-windows.zip
           if-no-files-found: error

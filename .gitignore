@@ -26,6 +26,7 @@ run_history.db
 build/
 dist/
 *.spec
+!HammerCandleBacktestDashboard.spec
 *.exe
 
 # Python
