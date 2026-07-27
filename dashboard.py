@@ -88,7 +88,7 @@ from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperT
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
 from broker import BrokerCredentials, MT5Broker
-from live_journal import append_session_log, live_journal_dir, trades_csv_path, session_log_path
+from live_journal import append_session_log, append_session_header, live_journal_dir, trades_csv_path, session_log_path
 
 
 # ============================================================================
@@ -126,7 +126,7 @@ DEFAULT_OUTPUT_DIR = os.path.join(APP_DIR, "output")
 PRESETS_DIR = os.path.join(APP_DIR, "presets")
 DEFAULT_PLOTS_DIR = os.path.join(APP_DIR, "plots")
 RUN_DATABASE_PATH = os.path.join(APP_DIR, "run_history.db")
-LIVE_JOURNAL_DIR = os.path.join(DEFAULT_OUTPUT_DIR, "live")
+LIVE_JOURNAL_DIR = live_journal_dir(DEFAULT_OUTPUT_DIR)
 
 LIVE_ORDER_MODES = (
     ("market", "Market — instant at ask/bid"),
@@ -1793,8 +1793,9 @@ class LiveSettingsDialog(QDialog):
         strat_btn_row.addStretch()
         strat_layout.addLayout(strat_btn_row)
         strat_note = QLabel(
-            "Before live: run a backtest on the same symbol/timeframe, optionally save a preset, "
-            "then load it under Run Settings on the Parameters panel."
+            "Live uses the <b>current Parameters panel</b> at Start (pattern, shape, entry/exit, "
+            "timeframe RR/SL, indicators) — same objects as backtest Run. "
+            "Adjust parameters there, optionally save/load a preset, then Start live."
         )
         strat_note.setWordWrap(True)
         strat_note.setObjectName("sectionHint")
@@ -1920,7 +1921,7 @@ class LiveSettingsDialog(QDialog):
         dash._save_live_settings()
         dash._refresh_live_config_summary()
         dash._refresh_live_strategy_summary()
-        if dash._live_thread is not None and dash._live_thread.isRunning():
+        if dash._live_worker_running():
             dash._live_log(
                 "[SETTINGS] Symbol or execution changed — Stop live and Start again for orders to use the new symbol."
             )
@@ -2005,6 +2006,7 @@ class BacktestDashboard(QMainWindow):
             pass
         self._live_engine: Optional[live_trading.LiveTradingEngine] = None
         self._live_thread: Optional[LiveTradingThread] = None
+        self._active_live_journal_dir: Optional[str] = None
         self._live_health_timer = QTimer(self)
         self._live_health_timer.setInterval(8000)
         self._live_health_timer.timeout.connect(self._check_live_worker_health)
@@ -3608,7 +3610,8 @@ class BacktestDashboard(QMainWindow):
         self.live_pattern_combo = QComboBox()
         self.live_pattern_combo.addItems(list(PATTERN_REGISTRY.keys()))
         self.live_pattern_combo.setToolTip(
-            "Hammer or Doji — same body/wick/direction/indicator settings as backtest."
+            "Mirrors Parameters → Pattern. Live reads all shape, entry/exit, RR/SL, and "
+            "indicator fields from the Parameters panel when you click Start live."
         )
         self.live_pattern_combo.currentTextChanged.connect(self._on_live_pattern_combo_changed)
 
@@ -3717,7 +3720,7 @@ class BacktestDashboard(QMainWindow):
             QMessageBox.information(
                 self,
                 "Live running",
-                "Stop the live loop before changing settings, then Start again to apply.",
+                "Stop live before changing settings, then Start again.",
             )
             return
         dlg = LiveSettingsDialog(self)
@@ -4045,7 +4048,8 @@ class BacktestDashboard(QMainWindow):
         line = f"[{ts}] {message}"
         print(line, flush=True)
         file_line = f"{datetime.now().isoformat(timespec='seconds')} {line}"
-        append_session_log(LIVE_JOURNAL_DIR, file_line)
+        journal = (self._active_live_journal_dir or "").strip() or LIVE_JOURNAL_DIR
+        append_session_log(journal, file_line)
         self._live_log_bridge.line_ready.emit(line)
 
     def _on_live_connect(self):
@@ -4099,8 +4103,11 @@ class BacktestDashboard(QMainWindow):
             except (ValueError, AttributeError):
                 return default
 
+        sym = self.live_symbol.text().strip() or "XAUUSD"
+        journal_dir = live_journal_dir(DEFAULT_OUTPUT_DIR)
+
         return live_trading.LiveRunConfig(
-            symbol=self.live_symbol.text().strip() or "XAUUSD",
+            symbol=sym,
             timeframe_label=self.live_timeframe.currentText(),
             volume=_f("live_volume", 0.01),
             magic=_i("live_magic", 88001001),
@@ -4116,13 +4123,16 @@ class BacktestDashboard(QMainWindow):
             max_lot_size=_f("live_max_lot_cap", 0.10),
             use_thread_pool_signal_cpu=self._live_thread_pool_checked(),
             use_ray_if_available=self._live_ray_checked(),
-            journal_dir=live_journal_dir(DEFAULT_OUTPUT_DIR),
+            journal_dir=journal_dir,
             order_mode=self._live_order_mode_value(),
             limit_offset_points=_f("live_limit_offset", 0.0),
             price_deviation_points=_i("live_deviation", 20),
             order_comment=(self.live_order_comment.text().strip() or "HammerDashboard")[:31],
             fallback_to_market_on_limit_fail=self.live_fallback_market.isChecked(),
         )
+
+    def _live_worker_running(self) -> bool:
+        return self._live_thread is not None and self._live_thread.isRunning()
 
     def _on_live_start(self):
         if not self.mt5_broker.is_connected:
@@ -4131,78 +4141,67 @@ class BacktestDashboard(QMainWindow):
                 "Click Connect MT5 first. Live trading requires Windows + MetaTrader5 package.",
             )
             return
-        if self._live_thread is not None and self._live_thread.isRunning():
-            QMessageBox.information(self, "Live", "Live loop is already running.")
+        if self._live_worker_running():
+            QMessageBox.information(self, "Live", "Live is already running — Stop live first.")
             return
 
         try:
-            # Live Settings symbol/timeframe are authoritative — do not overwrite from backtest on Start.
-            if hasattr(self, "live_pattern_combo"):
-                pattern = self.live_pattern_combo.currentText()
-                if pattern and hasattr(self, "pattern_combo"):
-                    if self.pattern_combo.currentText() != pattern:
-                        self.pattern_combo.setCurrentText(pattern)
-            else:
-                pattern = self.pattern_combo.currentText()
-            strategy_config = self._build_strategy_config()
-            pattern_type = PATTERN_REGISTRY.get(pattern, {}).get("pattern_type", "hammer")
-            indicator_stack = self._build_indicator_stack()
             live_cfg = self._build_live_run_config()
+            pattern, pattern_type, strategy_config, indicator_stack = (
+                self._collect_live_strategy_from_parameters()
+            )
         except Exception as e:
             QMessageBox.critical(self, "Invalid parameters", f"Could not read strategy settings:\n{e}")
             return
 
-        sym_ok, sym_msg, resolved_sym = self.mt5_broker.resolve_and_ensure_symbol(live_cfg.symbol)
-        if not sym_ok:
+        live_tf = live_cfg.timeframe_label
+        tf_settings = getattr(strategy_config, "timeframe_settings", None) or {}
+        if live_tf not in tf_settings:
             QMessageBox.warning(
                 self,
-                "Symbol not ready",
-                f"{sym_msg}\n\nFix the symbol under Live → Settings → Execution, then Start again.",
+                "Timeframe settings missing",
+                f"No RR/SL settings found for live timeframe {live_tf} in Parameters → Timeframes.\n"
+                "Set RR and Max SL for that row, then Start live again.",
             )
-            self._live_log(f"[BLOCKED] Start cancelled: {sym_msg}")
+            return
+
+        sym_ok, sym_msg, resolved_sym = self.mt5_broker.resolve_and_ensure_symbol(live_cfg.symbol)
+        if not sym_ok:
+            QMessageBox.warning(self, "Symbol not ready", sym_msg)
+            self._live_log(f"[BLOCKED] {sym_msg}")
             return
         if resolved_sym != live_cfg.symbol.strip():
-            self.live_symbol.setText(resolved_sym)
-            self._save_live_settings()
             live_cfg = dataclasses.replace(live_cfg, symbol=resolved_sym)
+            self.live_symbol.setText(resolved_sym)
         self._live_log(sym_msg)
 
         self._refresh_live_strategy_summary()
-
         is_demo = self.mt5_broker.account_is_demo()
         real_money = is_demo is False
 
         if live_cfg.demo_accounts_only and real_money:
-            QMessageBox.warning(
-                self,
-                "Demo-only mode",
-                "“Optional: restrict to demo accounts only” is checked but this login is a LIVE account.\n\n"
-                "Uncheck that option in Live — Safety to run on this account.",
-            )
+            QMessageBox.warning(self, "Demo-only mode", "Demo-only is on but this is a LIVE account.")
             return
-
         risk_err = live_trading.validate_risk_config(live_cfg, real_money=real_money)
         if risk_err and not live_cfg.dry_run:
-            QMessageBox.warning(
-                self,
-                "Set risk limits",
-                f"{risk_err}\n\nConfigure limits under Live — Safety before sending orders.",
-            )
-            self._live_log(f"[BLOCKED] Start cancelled: {risk_err}")
+            QMessageBox.warning(self, "Set risk limits", risk_err)
             return
 
         preflight = self._live_preflight_notes(live_cfg)
-        pre_body = "\n".join(f"• {line}" for line in preflight)
-        if not self._live_dry_run_checked():
-            pre_title = "Start live — confirm"
-        else:
-            pre_title = "Start live (dry run) — confirm"
+        tf_set = tf_settings.get(live_tf)
+        if tf_set is not None:
+            preflight.append(
+                f"Logic params for {live_tf}: RR={tf_set.rr_multiple} max SL=${tf_set.max_sl_usd} "
+                f"(from Parameters → Timeframes)."
+            )
+        summary = (
+            f"• {pattern} on {live_cfg.symbol} @ {live_cfg.timeframe_label} "
+            f"magic={live_cfg.magic} lots={live_cfg.volume}"
+        )
+        pre_body = "\n".join(preflight + [""] + [summary])
         ans = QMessageBox.question(
-            self,
-            pre_title,
-            f"{pre_body}\n\nStart the live worker now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+            self, "Start live — confirm", f"{pre_body}\n\nStart live?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
         if ans != QMessageBox.Yes:
             self._live_log("Start live cancelled at pre-flight checklist.")
@@ -4211,22 +4210,15 @@ class BacktestDashboard(QMainWindow):
         if not live_cfg.dry_run:
             acct = "LIVE / real money" if real_money else "this account"
             ans = QMessageBox.warning(
-                self,
-                "Send real orders?",
-                f"Dry run is OFF — the bot will send orders to MT5 ({acct}).\n\n"
-                f"Strategy: {pattern}\n"
-                f"Symbol: {live_cfg.symbol} @ {live_cfg.timeframe_label}\n"
-                f"Lots: {live_cfg.volume} (cap {live_cfg.max_lot_size})\n"
-                f"Max loss today: ${live_cfg.max_daily_loss_usd:.2f} | "
-                f"Max trades: {live_cfg.max_daily_trades}\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                self, "Send real orders?",
+                f"Dry run is OFF — orders will be sent to MT5 ({acct}).\n\n{pre_body}\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if ans != QMessageBox.Yes:
                 return
 
         self._save_live_settings()
+        self._active_live_journal_dir = live_cfg.journal_dir or LIVE_JOURNAL_DIR
         self._live_engine = live_trading.LiveTradingEngine(
             broker=self.mt5_broker,
             live_config=live_cfg,
@@ -4240,74 +4232,69 @@ class BacktestDashboard(QMainWindow):
         self._live_thread.finished_cleanly.connect(self._on_live_worker_finished)
         self._live_thread.crashed.connect(self._on_live_worker_crashed)
         self._live_thread.start()
+        self._live_log(
+            f"Started {pattern} | {live_cfg.symbol} @ {live_cfg.timeframe_label} | "
+            f"lots={live_cfg.volume} magic={live_cfg.magic}"
+        )
+        self._live_log(live_trading.summarize_strategy_params(
+            strategy_config, live_cfg.timeframe_label, pattern_type,
+        ))
+
         self._live_health_timer.start()
         self.live_start_btn.setEnabled(False)
         self.live_stop_btn.setEnabled(True)
         dry = "ON (no orders)" if live_cfg.dry_run else "OFF (orders enabled)"
-        self._live_log(
-            f"Start live — dry run {dry} | strategy {pattern} | "
-            f"{live_cfg.symbol} @ {live_cfg.timeframe_label} | lots={live_cfg.volume}"
-        )
-        self._live_log(f"Log file: {session_log_path(live_cfg.journal_dir)}")
-        self._live_log(f"Trades CSV: {trades_csv_path(live_cfg.journal_dir)}")
-        self._set_app_status(f"Live: running (dry run {dry})")
-        self._live_log(
-            f"Worker thread started (thread pool={'on' if live_cfg.use_thread_pool_signal_cpu else 'off'}, "
-            f"ray={'on' if live_cfg.use_ray_if_available else 'off'})."
-        )
+        self._set_app_status(f"Live: running, dry run {dry}")
         self.live_dock.show()
         self.live_dock.raise_()
 
     def _on_live_worker_finished(self):
-        self._live_health_timer.stop()
-        if self._live_thread is not self.sender() and self._live_thread is not None:
-            pass
-        self._finalize_live_worker_stopped()
+        if self._live_thread is not None and not self._live_thread.isRunning():
+            self._live_health_timer.stop()
+            self._finalize_live_worker_stopped()
 
     def _on_live_worker_crashed(self, detail: str):
-        self._live_health_timer.stop()
         self._live_log(f"[FATAL] Live worker crashed:\n{detail}")
+        self._live_health_timer.stop()
         QMessageBox.critical(
-            self,
-            "Live worker stopped",
-            "The live trading thread stopped unexpectedly. The dashboard is still running.\n\n"
-            "Check Live — Log for details, then fix MT5 connection or parameters and Start again.",
+            self, "Live worker stopped",
+            "Live trading stopped unexpectedly. Check Live — Log.",
         )
         self._finalize_live_worker_stopped()
 
     def _finalize_live_worker_stopped(self):
         self._live_engine = None
         self._live_thread = None
+        self._active_live_journal_dir = None
         if hasattr(self, "live_start_btn"):
             self.live_start_btn.setEnabled(True)
         if hasattr(self, "live_stop_btn"):
             self.live_stop_btn.setEnabled(False)
-        self._set_app_status("Live: stopped (worker exited)")
+        self._set_app_status("Live: stopped")
 
     def _check_live_worker_health(self):
-        if self._live_thread is None or not self._live_thread.isRunning():
-            return
-        if self._live_engine is None:
+        eng = self._live_engine
+        if eng is None:
             return
         import time as _time
 
-        stale_sec = _time.monotonic() - self._live_engine.last_heartbeat_mono
+        stale_sec = _time.monotonic() - eng.last_heartbeat_mono
         if stale_sec > 90:
-            self._live_log(
-                f"[WARN] No live heartbeat for {stale_sec:.0f}s — MT5 may be hung. "
-                "Use Stop live and reconnect if needed."
-            )
+            self._live_log(f"[WARN] No live heartbeat for {stale_sec:.0f}s.")
 
     def _stop_live_trading(self):
-        if self._live_thread is not None and self._live_thread.isRunning():
-            self._live_log("Stop live requested — shutting down worker…")
+        if self._live_worker_running():
+            self._live_log("Stop live requested — shutting down…")
             self._set_app_status("Live: stopping…")
+        if self._live_engine is not None:
+            self._live_engine.request_stop()
+        if self._live_thread is not None and self._live_thread.isRunning():
             self._live_thread.request_stop()
-            if not self._live_thread.wait(15000):
-                self._live_log("[WARN] Live thread still stopping — wait a few seconds before starting again.")
+            self._live_thread.wait(15000)
         self._live_health_timer.stop()
         self._live_engine = None
         self._live_thread = None
+        self._active_live_journal_dir = None
         if hasattr(self, "live_start_btn"):
             self.live_start_btn.setEnabled(True)
         if hasattr(self, "live_stop_btn"):
@@ -4514,29 +4501,65 @@ class BacktestDashboard(QMainWindow):
             return widget.currentText()
         return None
 
+    def _read_ui_field(self, name: str, default_val: Any, ftype: str) -> Any:
+        """Read a Parameters-panel widget when present; otherwise use logic default."""
+        widget = self.field_widgets.get(name)
+        if widget is None:
+            return default_val
+        raw = self._widget_value(widget)
+        if ftype == FIELD_TYPE_CHECK:
+            return bool(raw)
+        if ftype == FIELD_TYPE_DROPDOWN:
+            enum_cls = type(default_val)
+            try:
+                return enum_cls(raw)
+            except (ValueError, TypeError):
+                return default_val
+        raw_str = (raw if raw is not None else "")
+        if isinstance(raw_str, str) and not raw_str.strip():
+            return default_val
+        try:
+            return self._parse_value(raw_str, default_val)
+        except (ValueError, TypeError):
+            return default_val
+
+    def _collect_live_strategy_from_parameters(self):
+        """
+        Build the same strategy + indicator objects as backtest Run, from the current
+        Parameters panel (pattern, shape, entry/exit, risk, timeframe RR/SL, indicators).
+        """
+        if hasattr(self, "live_pattern_combo") and hasattr(self, "pattern_combo"):
+            live_pat = self.live_pattern_combo.currentText()
+            if live_pat and self.pattern_combo.findText(live_pat) >= 0:
+                if self.pattern_combo.currentText() != live_pat:
+                    self.pattern_combo.blockSignals(True)
+                    self.pattern_combo.setCurrentText(live_pat)
+                    self.pattern_combo.blockSignals(False)
+                    self._apply_pattern_field_visibility()
+        self._sync_live_pattern_from_dashboard()
+        self._apply_pattern_field_visibility()
+
+        pattern = self.pattern_combo.currentText()
+        pattern_type = PATTERN_REGISTRY.get(pattern, {}).get("pattern_type", "hammer")
+        strategy_config = self._build_strategy_config()
+        indicator_stack = self._build_indicator_stack()
+        return pattern, pattern_type, strategy_config, indicator_stack
+
     def _build_doji_ratio_config(self) -> doji_logic.DojiRatioConfig:
         defaults = doji_logic.DojiRatioConfig()
         kwargs = {}
         for name, _, ftype, _ in DOJI_SHAPE_FIELDS:
-            widget = self.field_widgets[name]
             field_name = name.replace("doji_", "", 1) if name.startswith("doji_") else name
             default_val = getattr(defaults, field_name)
-            if ftype == FIELD_TYPE_CHECK:
-                kwargs[field_name] = bool(self._widget_value(widget))
-            else:
-                kwargs[field_name] = self._parse_value(self._widget_value(widget), default_val)
+            kwargs[field_name] = self._read_ui_field(name, default_val, ftype)
         return doji_logic.DojiRatioConfig(**kwargs)
 
     def _build_hammer_ratio_config(self) -> logic.HammerRatioConfig:
         defaults = logic.HammerRatioConfig()
         kwargs = {}
         for name, _, ftype, _ in HAMMER_SHAPE_FIELDS:
-            widget = self.field_widgets[name]
             default_val = getattr(defaults, name)
-            if ftype == FIELD_TYPE_CHECK:
-                kwargs[name] = bool(self._widget_value(widget))
-            else:
-                kwargs[name] = self._parse_value(self._widget_value(widget), default_val)
+            kwargs[name] = self._read_ui_field(name, default_val, ftype)
         return logic.HammerRatioConfig(**kwargs)
 
     def _build_hammer_strategy_config(self) -> logic.StrategyConfig:
@@ -4545,22 +4568,27 @@ class BacktestDashboard(QMainWindow):
         defaults = logic.StrategyConfig()
 
         for name, _, ftype, _ in STRATEGY_FIELDS:
-            widget = self.field_widgets[name]
             default_val = getattr(defaults, name)
-            raw = self._widget_value(widget)
-
-            if ftype == FIELD_TYPE_CHECK:
-                kwargs[name] = bool(raw)
-            elif ftype == FIELD_TYPE_DROPDOWN:
-                enum_cls = type(default_val)
-                kwargs[name] = enum_cls(raw)
-            else:
-                kwargs[name] = self._parse_value(raw, default_val)
+            kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
         timeframe_settings = {}
         for tf in TIMEFRAME_LABELS:
-            rr = float(self.timeframe_widgets[tf]["rr"].text())
-            sl = float(self.timeframe_widgets[tf]["sl"].text())
+            tw = self.timeframe_widgets.get(tf)
+            if tw is None:
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                if defaults_tf is not None:
+                    timeframe_settings[tf] = logic.TimeframeSetting(
+                        rr_multiple=defaults_tf.rr_multiple,
+                        max_sl_usd=defaults_tf.max_sl_usd,
+                    )
+                continue
+            try:
+                rr = float(tw["rr"].text())
+                sl = float(tw["sl"].text())
+            except (ValueError, AttributeError, KeyError):
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
+                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
             timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
         kwargs["timeframe_settings"] = timeframe_settings
 
@@ -4623,33 +4651,32 @@ class BacktestDashboard(QMainWindow):
             ("doji_allow_red_trades", "allow_red_trades"),
         ]
         for ui_name, cfg_name in doji_strategy_fields:
-            widget = self.field_widgets.get(ui_name)
-            if widget is None:
-                continue
             default_val = getattr(defaults, cfg_name)
-            raw = self._widget_value(widget)
-            if isinstance(default_val, bool):
-                kwargs[cfg_name] = bool(raw)
-            else:
-                enum_cls = type(default_val)
-                kwargs[cfg_name] = enum_cls(raw)
+            ftype = FIELD_TYPE_CHECK if isinstance(default_val, bool) else FIELD_TYPE_DROPDOWN
+            kwargs[cfg_name] = self._read_ui_field(ui_name, default_val, ftype)
 
         for name, _, ftype, _ in ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS:
-            widget = self.field_widgets[name]
             default_val = getattr(defaults, name)
-            raw = self._widget_value(widget)
-            if ftype == FIELD_TYPE_CHECK:
-                kwargs[name] = bool(raw)
-            elif ftype == FIELD_TYPE_DROPDOWN:
-                enum_cls = type(default_val)
-                kwargs[name] = enum_cls(raw)
-            else:
-                kwargs[name] = self._parse_value(raw, default_val)
+            kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
         timeframe_settings = {}
         for tf in TIMEFRAME_LABELS:
-            rr = float(self.timeframe_widgets[tf]["rr"].text())
-            sl = float(self.timeframe_widgets[tf]["sl"].text())
+            tw = self.timeframe_widgets.get(tf)
+            if tw is None:
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                if defaults_tf is not None:
+                    timeframe_settings[tf] = logic.TimeframeSetting(
+                        rr_multiple=defaults_tf.rr_multiple,
+                        max_sl_usd=defaults_tf.max_sl_usd,
+                    )
+                continue
+            try:
+                rr = float(tw["rr"].text())
+                sl = float(tw["sl"].text())
+            except (ValueError, AttributeError, KeyError):
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
+                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
             timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
         kwargs["timeframe_settings"] = timeframe_settings
 
@@ -5430,12 +5457,8 @@ if __name__ == "__main__":
     QDir.addSearchPath("checkicon", _generate_checkmark_icon())
     app.setStyleSheet(STYLESHEET)
 
-    # Custom app icon: drop an "app_icon.ico" (or .png) next to this
-    # script -- picked up automatically here, and also bundled into the
-    # exe via PyInstaller's --add-data flag (see PACKAGING_GUIDE.md).
-    # If it's not there, the app just runs with Qt's default icon --
-    # nothing breaks either way.
-    for icon_filename in ("app_icon.ico", "app_icon.png"):
+    # Custom app icon: logo.ico or app_icon.ico next to the app / bundled via PyInstaller datas.
+    for icon_filename in ("logo.ico", "app_icon.ico", "app_icon.png", "logo.png"):
         icon_path = get_asset_path(icon_filename)
         if os.path.exists(icon_path):
             app_icon = QIcon(icon_path)

@@ -280,6 +280,71 @@ class MT5Broker:
         digits = int(getattr(sym_info, "digits", 5) or 5)
         return round(float(price), digits)
 
+    def terminal_allows_trading(self) -> Tuple[bool, str]:
+        if not self.is_connected:
+            return False, "Not connected."
+        term = self._mt5.terminal_info()
+        if term is None:
+            return False, "MT5 terminal_info() unavailable."
+        if not getattr(term, "trade_allowed", True):
+            return False, (
+                "AutoTrading disabled in MT5 — click 'Algo Trading' on the toolbar "
+                "or Tools → Options → Expert Advisors → Allow algorithmic trading."
+            )
+        if getattr(term, "dlls_allowed", True) is False:
+            return False, "DLL imports disabled in MT5 terminal settings."
+        return True, ""
+
+    def _symbol_allows_trading(self, sym_info) -> Tuple[bool, str]:
+        if sym_info is None:
+            return False, "Symbol info unavailable."
+        mode = int(getattr(sym_info, "trade_mode", 4) or 4)
+        disabled = getattr(self._mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+        close_only = getattr(self._mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", 3)
+        if mode == disabled:
+            return False, "Symbol trading is disabled on this broker."
+        if mode == close_only:
+            return False, "Symbol is close-only — new entries not allowed."
+        return True, ""
+
+    def _prepare_sl_tp(
+        self,
+        sym_info,
+        direction: logic.TradeDirection,
+        ref_price: float,
+        sl: float,
+        tp: float,
+    ) -> Tuple[float, float, Optional[str]]:
+        """Normalize prices and enforce broker minimum stop distance (trade_stops_level)."""
+        sl_n = self._normalize_price(sym_info, float(sl)) if sl else 0.0
+        tp_n = self._normalize_price(sym_info, float(tp)) if tp else 0.0
+        ref = float(ref_price)
+        point = float(getattr(sym_info, "point", 0.0) or 0.0)
+        stops_level = int(getattr(sym_info, "trade_stops_level", 0) or 0)
+        if point <= 0 or stops_level <= 0:
+            return sl_n, tp_n, None
+        min_dist = stops_level * point
+        if direction == logic.TradeDirection.BUY:
+            if sl_n > 0 and (ref - sl_n) < min_dist - point * 0.01:
+                return sl_n, tp_n, (
+                    f"Stop loss too close to price for {getattr(sym_info, 'name', '?')} "
+                    f"(broker min {stops_level} points)."
+                )
+            if tp_n > 0 and (tp_n - ref) < min_dist - point * 0.01:
+                return sl_n, tp_n, (
+                    f"Take profit too close to price (broker min {stops_level} points)."
+                )
+        else:
+            if sl_n > 0 and (sl_n - ref) < min_dist - point * 0.01:
+                return sl_n, tp_n, (
+                    f"Stop loss too close to price (broker min {stops_level} points)."
+                )
+            if tp_n > 0 and (ref - tp_n) < min_dist - point * 0.01:
+                return sl_n, tp_n, (
+                    f"Take profit too close to price (broker min {stops_level} points)."
+                )
+        return sl_n, tp_n, None
+
     def _compute_limit_price(
         self,
         sym_info,
@@ -309,6 +374,8 @@ class MT5Broker:
         deviation: int = 20,
     ) -> Tuple[bool, str, Optional[int]]:
         mode = (order_mode or "market").strip().lower()
+        if mode not in ("market", "limit_entry", "limit_offset"):
+            return False, f"Unknown order_mode {order_mode!r}.", None
         if mode == "market":
             return self.send_market_order(
                 symbol, direction, volume, sl, tp, magic,
@@ -341,9 +408,22 @@ class MT5Broker:
         if not self.is_connected:
             return False, "Not connected.", None
 
+        ok_term, term_msg = self.terminal_allows_trading()
+        if not ok_term:
+            return False, term_msg, None
+
+        ok_sym, msg, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok_sym:
+            return False, msg, None
+        symbol = resolved
+
         sym_info = self._mt5.symbol_info(symbol)
         if sym_info is None:
             return False, f"Symbol {symbol} unavailable.", None
+
+        ok_trade, trade_msg = self._symbol_allows_trading(sym_info)
+        if not ok_trade:
+            return False, trade_msg, None
 
         tick = self._mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -351,12 +431,18 @@ class MT5Broker:
 
         if direction == logic.TradeDirection.BUY:
             order_type = self._mt5.ORDER_TYPE_BUY
-            price = tick.ask
+            price = float(tick.ask)
         else:
             order_type = self._mt5.ORDER_TYPE_SELL
-            price = tick.bid
+            price = float(tick.bid)
 
         volume = self._normalize_volume(sym_info, volume)
+        if volume < float(sym_info.volume_min):
+            return False, f"Volume {volume} below symbol minimum {sym_info.volume_min}.", None
+
+        sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
+        if stop_err:
+            return False, stop_err, None
 
         filling_modes = self._filling_modes_for_symbol(sym_info)
         last_err = "No filling mode available"
@@ -410,9 +496,22 @@ class MT5Broker:
         if not self.is_connected:
             return False, "Not connected.", None
 
+        ok_term, term_msg = self.terminal_allows_trading()
+        if not ok_term:
+            return False, term_msg, None
+
+        ok_sym, msg, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok_sym:
+            return False, msg, None
+        symbol = resolved
+
         sym_info = self._mt5.symbol_info(symbol)
         if sym_info is None:
             return False, f"Symbol {symbol} unavailable.", None
+
+        ok_trade, trade_msg = self._symbol_allows_trading(sym_info)
+        if not ok_trade:
+            return False, trade_msg, None
 
         tick = self._mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -435,6 +534,13 @@ class MT5Broker:
                 ), None
 
         volume = self._normalize_volume(sym_info, volume)
+        if volume < float(sym_info.volume_min):
+            return False, f"Volume {volume} below symbol minimum {sym_info.volume_min}.", None
+
+        sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
+        if stop_err:
+            return False, stop_err, None
+
         filling_modes = self._filling_modes_for_symbol(sym_info)
         last_err = "No filling mode available"
         retcode_unsupported = getattr(self._mt5, "TRADE_RETCODE_INVALID_FILL", 10030)

@@ -22,9 +22,11 @@ for you to set up.
    `backtest.py`, and `plotting.py` in a folder together (leave
    `fetch.py` out -- it's never imported by the dashboard, so it
    wouldn't get bundled anyway, but no need to include it).
-2. Copy the `.github/workflows/build-windows-exe.yml` file (included
-   alongside this guide) into that same folder, keeping the
-   `.github/workflows/` path structure.
+2. Copy the `.github/workflows/build-windows-exe.yml` file and
+   `HammerCandleBacktestDashboard.spec` (included alongside this guide)
+   into that same folder, keeping the `.github/workflows/` path structure.
+   Put your Windows icon at **`logo.ico`** in the repo root (or keep
+   `app_icon.ico` as fallback). Both are bundled into the exe.
 3. Create a new GitHub repository (private is fine -- Actions works
    the same either way) and push this folder to it:
    ```

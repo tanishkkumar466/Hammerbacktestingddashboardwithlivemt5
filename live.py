@@ -7,6 +7,7 @@ Risk limits are enforced only from LiveRunConfig (Live tab), not backtest settin
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -21,13 +22,51 @@ import doji_logic
 import logic
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters
-from live_journal import append_trade_row
+from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
 
 
 LogFn = Callable[[str], None]
 
 MAX_CONSECUTIVE_POLL_ERRORS = 25
 SIGNAL_COMPUTE_TIMEOUT_SEC = 90.0
+
+
+def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_type: str) -> str:
+    """One-line snapshot of logic parameters used for signals (matches backtest config)."""
+    tf_settings = getattr(strategy_config, "timeframe_settings", None) or {}
+    tf_set = tf_settings.get(timeframe_label)
+    if tf_set is not None:
+        rr = getattr(tf_set, "rr_multiple", "?")
+        max_sl = getattr(tf_set, "max_sl_usd", "?")
+        tf_part = f"TF {timeframe_label}: RR={rr} max_SL=${max_sl}"
+    else:
+        tf_part = f"TF {timeframe_label}: (no RR/SL in config)"
+
+    entry_rule = getattr(strategy_config, "entry_rule", None)
+    entry_off = getattr(strategy_config, "entry_offset", 0.0)
+    buf_mode = getattr(strategy_config, "buffer_mode", None)
+    sl_pct = getattr(strategy_config, "sl_buffer_pct", None)
+    risk_on = getattr(strategy_config, "enable_risk_limit", True)
+
+    parts = [
+        "[PARAMS]",
+        tf_part,
+        f"entry={entry_rule} offset=${entry_off}",
+        f"SL buffer={buf_mode} ({sl_pct}%)" if sl_pct is not None else f"SL buffer={buf_mode}",
+        f"risk_limit={'on' if risk_on else 'off'}",
+    ]
+
+    if pattern_type == "doji":
+        parts.append(
+            f"doji_style={getattr(strategy_config, 'doji_style', '—')} "
+            f"dir={getattr(strategy_config, 'doji_direction_mode', '—')}"
+        )
+    else:
+        parts.append(
+            f"green→{getattr(strategy_config, 'green_direction', '—')} "
+            f"red→{getattr(strategy_config, 'red_direction', '—')}"
+        )
+    return " | ".join(str(p) for p in parts)
 
 
 @dataclass
@@ -98,7 +137,10 @@ def find_actionable_signal(
     strategy_config,
     indicator_stack,
 ) -> Optional[logic.TradeSignal]:
-    """Signal on last closed bar with entry on the forming bar."""
+    """Signal on last closed bar with entry on the forming bar.
+
+    timeframe_logic_label must match strategy config keys (1m, 1h, …), not MT5 folder names (1min, 1hour).
+    """
     if len(closed) < 3:
         return None
 
@@ -151,6 +193,8 @@ class LiveTradingEngine:
         self.indicator_stack = indicator_stack
         self.log = log
         self._journal_dir = (live_config.journal_dir or "").strip()
+        if self._journal_dir:
+            os.makedirs(self._journal_dir, exist_ok=True)
         self._stop = False
         self._last_closed_bar_ts: Optional[object] = None
         self._active_symbol: str = (live_config.symbol or "").strip()
@@ -240,7 +284,19 @@ class LiveTradingEngine:
 
     def _run_impl(self):
         cfg = self.live_config
-        _, logic_tf = TIMEFRAME_MT5_MAP[cfg.timeframe_label]
+        if cfg.timeframe_label not in TIMEFRAME_MT5_MAP:
+            self.log(f"[ERROR] Unknown live timeframe label: {cfg.timeframe_label}")
+            return
+
+        if not self.broker.is_connected:
+            self.log("[ERROR] MT5 not connected — connect in Live panel before Start.")
+            return
+
+        with self._broker_lock:
+            ok_term, term_msg = self.broker.terminal_allows_trading()
+        if not ok_term:
+            self.log(f"[ERROR] {term_msg}")
+            return
 
         with self._broker_lock:
             ok, msg, resolved = self.broker.resolve_and_ensure_symbol(cfg.symbol)
@@ -283,16 +339,33 @@ class LiveTradingEngine:
         inds = ", ".join(self.indicator_stack.enabled_indicator_ids()) or "none"
         if self._journal_dir:
             self.log(f"[LIVE] Journal folder: {self._journal_dir}")
+            self.log(f"[LIVE] Session log: {session_log_path(self._journal_dir)}")
+            self.log(f"[LIVE] Trades CSV: {trades_csv_path(self._journal_dir)}")
+            append_session_header(
+                self._journal_dir,
+                f"Live session — {self.pattern_label} on {self._active_symbol} "
+                f"@ {cfg.timeframe_label} magic={cfg.magic}",
+            )
+        else:
+            self.log("[WARN] journal_dir not set — live_trades.csv will not be written.")
+
+        self.log(
+            f"[LIVE] MT5 account {info.get('login', '?')} @ {info.get('server', '?')} "
+            f"({info.get('currency', '')})"
+        )
         self.log(
             f"[LIVE] Strategy: {self.pattern_label} ({self.pattern_type}) | "
             f"Indicators: {inds} | {self._active_symbol} {cfg.timeframe_label} | "
             f"lots={cfg.volume} | dry_run={cfg.dry_run} | order={cfg.order_mode}"
         )
+        self.log(summarize_strategy_params(
+            self.strategy_config, cfg.timeframe_label, self.pattern_type,
+        ))
 
         while not self._stop:
             self.touch_heartbeat()
             try:
-                self._poll_once(logic_tf)
+                self._poll_once(cfg.timeframe_label)
                 self._consecutive_errors = 0
             except Exception as e:
                 self._consecutive_errors += 1
@@ -376,8 +449,12 @@ class LiveTradingEngine:
 
         return find_actionable_signal(*args)
 
-    def _poll_once(self, logic_tf: str):
+    def _poll_once(self, config_timeframe_label: str):
+        """config_timeframe_label: dashboard TF key (1m, 1h, …) matching strategy timeframe_settings."""
         cfg = self.live_config
+        if not self.broker.is_connected:
+            self.log("[WARN] MT5 disconnected — poll skipped. Reconnect and Start live again.")
+            return
         sym = self._active_symbol or cfg.symbol
         with self._broker_lock:
             closed, forming, err = self.broker.fetch_rates(
@@ -401,7 +478,7 @@ class LiveTradingEngine:
         self._last_closed_bar_ts = last_ts
         self.log(f"[LIVE] New closed bar {last_ts}")
 
-        sig = self._compute_signal(closed, forming, logic_tf)
+        sig = self._compute_signal(closed, forming, config_timeframe_label)
         if sig is None:
             self.log("[LIVE] No new valid signal on this bar.")
             return
