@@ -135,8 +135,11 @@ class MT5Broker:
     def spread_points(self, symbol: str) -> Optional[float]:
         if not self.is_connected:
             return None
-        info = self._mt5.symbol_info(symbol)
-        tick = self._mt5.symbol_info_tick(symbol)
+        ok, _, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return None
+        info = self._mt5.symbol_info(resolved)
+        tick = self._mt5.symbol_info_tick(resolved)
         if info is None or tick is None or info.point <= 0:
             return None
         return (float(tick.ask) - float(tick.bid)) / float(info.point)
@@ -257,6 +260,21 @@ class MT5Broker:
             close=last,
         )
 
+    @staticmethod
+    def _split_mt5_rates(rates) -> Tuple[Any, List[Any]]:
+        """
+        MT5 Python returns bars sorted by open time ascending.
+        The forming (current) bar is the one with the latest open time.
+        """
+        if rates is None or len(rates) == 0:
+            raise ValueError("empty rates")
+        if len(rates) == 1:
+            return rates[0], []
+        by_time = sorted(rates, key=lambda r: int(r["time"]))
+        forming_r = by_time[-1]
+        closed_rs = by_time[:-1]
+        return forming_r, closed_rs
+
     def fetch_rates(
         self,
         symbol: str,
@@ -265,7 +283,7 @@ class MT5Broker:
     ) -> Tuple[List[logic.Candle], Optional[logic.Candle], str, Dict[str, Any]]:
         """
         Returns (closed_candles chronological, forming_candle, error_msg, meta).
-        MT5 index 0 is the current forming bar. Meta includes bid/ask and freshness hints.
+        Forming bar = latest open time in the MT5 array (ascending). Meta includes bid/ask and freshness.
         """
         meta: Dict[str, Any] = {}
         if not self.is_connected:
@@ -296,7 +314,11 @@ class MT5Broker:
             err = self._mt5.last_error()
             return [], None, f"No rates for {sym} {timeframe_label}: {err}", meta
 
-        forming_ts = self._rate_bar_time(rates[0])
+        try:
+            forming_r_probe, _ = self._split_mt5_rates(rates)
+            forming_ts = self._rate_bar_time(forming_r_probe)
+        except ValueError:
+            forming_ts = self._rate_bar_time(rates[-1])
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         forming_age = (now_naive - forming_ts).total_seconds()
         meta["forming_bar_time"] = forming_ts
@@ -307,14 +329,19 @@ class MT5Broker:
                 sym, tf_const, datetime.now(timezone.utc), count,
             )
             if rates_alt is not None and len(rates_alt) > 0:
-                alt_ts = self._rate_bar_time(rates_alt[0])
-                alt_age = (now_naive - alt_ts).total_seconds()
-                if abs(alt_age) < abs(forming_age):
-                    rates = rates_alt
-                    meta["rates_source"] = "copy_rates_from"
-                    forming_ts = alt_ts
-                    meta["forming_bar_time"] = forming_ts
-                    meta["forming_age_sec"] = alt_age
+                try:
+                    _f_alt, _c_alt = self._split_mt5_rates(rates_alt)
+                    alt_ts = self._rate_bar_time(_f_alt)
+                    alt_age = (now_naive - alt_ts).total_seconds()
+                    if abs(alt_age) < abs(forming_age):
+                        rates = rates_alt
+                        meta["rates_source"] = "copy_rates_from"
+                        forming_ts = alt_ts
+                        meta["forming_bar_time"] = forming_ts
+                        meta["forming_age_sec"] = alt_age
+                        forming_age = alt_age
+                except ValueError:
+                    pass
             if forming_age > tf_sec * 3:
                 meta["stale_warning"] = (
                     f"Forming bar time {forming_ts} looks stale vs clock "
@@ -331,11 +358,15 @@ class MT5Broker:
                 close=float(r["close"]),
             )
 
-        forming = _to_candle(rates[0])
+        try:
+            forming_r, closed_rs = self._split_mt5_rates(rates)
+        except ValueError:
+            return [], None, f"No rates for {sym} {timeframe_label}.", meta
+
+        forming = _to_candle(forming_r)
         forming = self._merge_tick_into_forming(forming, tick)
         meta["forming_close"] = forming.close
-        closed_rev = [_to_candle(r) for r in rates[1:]]
-        closed = list(reversed(closed_rev))
+        closed = [_to_candle(r) for r in closed_rs]
         if closed:
             meta["last_closed_time"] = closed[-1].timestamp
             meta["last_closed_close"] = closed[-1].close
@@ -350,7 +381,10 @@ class MT5Broker:
     def count_open_positions(self, symbol: str, magic: int) -> int:
         if not self.is_connected:
             return 0
-        positions = self._mt5.positions_get(symbol=symbol)
+        ok, _, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return 0
+        positions = self._mt5.positions_get(symbol=resolved)
         if positions is None:
             return 0
         return sum(1 for p in positions if int(p.magic) == int(magic))

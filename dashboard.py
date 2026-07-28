@@ -1849,6 +1849,8 @@ class LiveSettingsDialog(QDialog):
         off_hint.setObjectName("sectionHint")
         order_form.addRow("Limit offset (points)", d.live_limit_offset)
         order_form.addRow(off_hint)
+        order_form.addRow("Max entry vs market (points)", d.live_max_entry_deviation)
+        order_form.addRow(d.live_limit_offset_from_market)
         order_form.addRow("Max slippage / deviation (pts)", d.live_deviation)
         order_form.addRow("Order comment", d.live_order_comment)
         order_form.addRow(d.live_fallback_market)
@@ -3651,6 +3653,16 @@ class BacktestDashboard(QMainWindow):
         for mode_id, label in LIVE_ORDER_MODES:
             self.live_order_mode.addItem(label, mode_id)
         self.live_limit_offset = QLineEdit("0")
+        self.live_max_entry_deviation = QLineEdit("200")
+        self.live_max_entry_deviation.setToolTip(
+            "If strategy entry (candle open) is farther than this many points from bid/ask, "
+            "live sends a market order at current price with SL/TP re-anchored (recommended for XAU)."
+        )
+        self.live_limit_offset_from_market = QCheckBox("Limit offset from current bid/ask (not candle entry)")
+        self.live_limit_offset_from_market.setChecked(True)
+        self.live_limit_offset_from_market.setToolTip(
+            "When order type is Limit — entry ± offset, base the limit on live tick price instead of backtest entry."
+        )
         self.live_deviation = QLineEdit("20")
         self.live_order_comment = QLineEdit("HammerDashboard")
 
@@ -3732,6 +3744,7 @@ class BacktestDashboard(QMainWindow):
             self.live_symbol, self.live_timeframe, self.live_volume, self.live_magic,
             self.live_max_positions, self.live_poll_sec, self.live_history_bars,
             self.live_order_mode, self.live_limit_offset, self.live_deviation,
+            self.live_max_entry_deviation, self.live_limit_offset_from_market,
             self.live_order_comment, self.live_demo_only,
             self.live_max_daily_trades, self.live_max_daily_loss,
             self.live_min_minutes_between, self.live_max_spread, self.live_max_lot_cap,
@@ -3985,6 +3998,8 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/use_ray", self._live_ray_checked())
         s.setValue("live/order_mode", self._live_order_mode_value())
         s.setValue("live/limit_offset", self.live_limit_offset.text())
+        s.setValue("live/max_entry_deviation", self.live_max_entry_deviation.text())
+        s.setValue("live/limit_offset_from_market", self.live_limit_offset_from_market.isChecked())
         s.setValue("live/deviation", self.live_deviation.text())
         s.setValue("live/order_comment", self.live_order_comment.text())
         s.setValue("live/history_bars", self.live_history_bars.text())
@@ -4020,6 +4035,10 @@ class BacktestDashboard(QMainWindow):
         if hasattr(self, "live_history_bars"):
             self.live_history_bars.setText(s.value("live/history_bars", "400", type=str))
             self.live_limit_offset.setText(s.value("live/limit_offset", "0", type=str))
+            self.live_max_entry_deviation.setText(s.value("live/max_entry_deviation", "200", type=str))
+            self.live_limit_offset_from_market.setChecked(
+                s.value("live/limit_offset_from_market", True, type=bool)
+            )
             self.live_deviation.setText(s.value("live/deviation", "20", type=str))
             self.live_order_comment.setText(s.value("live/order_comment", "HammerDashboard", type=str))
             mode = s.value("live/order_mode", "market", type=str)
@@ -4129,6 +4148,8 @@ class BacktestDashboard(QMainWindow):
             price_deviation_points=_i("live_deviation", 20),
             order_comment=(self.live_order_comment.text().strip() or "HammerDashboard")[:31],
             fallback_to_market_on_limit_fail=self.live_fallback_market.isChecked(),
+            max_entry_deviation_points=_f("live_max_entry_deviation", 200.0),
+            limit_offset_from_market=self.live_limit_offset_from_market.isChecked(),
         )
 
     def _live_worker_running(self) -> bool:

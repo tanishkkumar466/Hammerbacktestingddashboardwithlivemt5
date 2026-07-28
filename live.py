@@ -494,12 +494,15 @@ class LiveTradingEngine:
         effective_mode = order_mode
         limit_price: Optional[float] = strat_entry
 
-        if order_mode == "market" or dev_pts > cfg.max_entry_deviation_points:
-            if order_mode != "market":
+        max_dev = float(cfg.max_entry_deviation_points or 0)
+        force_market_dev = max_dev > 0 and dev_pts > max_dev
+
+        if order_mode == "market" or force_market_dev:
+            if order_mode != "market" and force_market_dev:
                 self.log(
                     f"[LIVE] Strategy entry {strat_entry:.2f} vs "
                     f"{'ask' if is_buy else 'bid'} {market:.2f} ({dev_pts:.0f} pts) — "
-                    f"using MARKET (max deviation {cfg.max_entry_deviation_points:.0f} pts)."
+                    f"using MARKET (max deviation {max_dev:.0f} pts)."
                 )
             effective_mode = "market"
             fill_ref = market
