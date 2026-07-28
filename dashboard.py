@@ -1179,6 +1179,19 @@ QDockWidget::close-button, QDockWidget::float-button {
     background: transparent; border: none; padding: 2px; icon-size: 13px;
 }
 
+/* ---- Panel dividers: wide enough to actually grab and drag.
+   Without this rule the native separator is ~1px and users think
+   the panels are not resizable at all. ---- */
+QMainWindow::separator {
+    background: #DDE1E6;
+    width: 7px;    /* separator between side-by-side panels */
+    height: 7px;   /* separator between stacked panels */
+    border-radius: 3px;
+}
+QMainWindow::separator:hover {
+    background: #34A853;
+}
+
 /* ---- Pattern-In-Context timeframe tabs: 7 tabs need to fit in a
    narrower dock, so give this specific tab bar tighter sizing than
    the main parameter tabs. ---- */
@@ -2783,7 +2796,13 @@ class BacktestDashboard(QMainWindow):
         tabs.addTab(self._make_run_settings_tab(defaults_backtest), "Run Settings")
 
         QTimer.singleShot(0, self._apply_pattern_field_visibility)
-        return wrap
+        # Scroll wrapper keeps the panel resizable below its natural width
+        # (the wide tab bar otherwise locks the dock divider in place).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(wrap)
+        return scroll
 
     def _on_pattern_changed(self, _pattern_name: str = ""):
         self._apply_pattern_field_visibility()
@@ -3063,7 +3082,14 @@ class BacktestDashboard(QMainWindow):
         sub_tabs.addTab(self._build_signal_shape_tab(), "Signal Shape")
         sub_tabs.addTab(self._build_pattern_context_tab(), "Pattern In Context")
 
-        return wrap
+        # Scroll wrapper: without it the one-line toolbar (BUY/SELL +
+        # Classic/Inverted buttons) forces a ~714px minimum width and the
+        # panel divider refuses to move — panels must always be resizable.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(wrap)
+        return scroll
 
     def _build_preview_toolbar(self) -> QWidget:
         """BUY vs SELL and classic vs inverted preview toggles (hammer + context charts)."""
@@ -4873,7 +4899,13 @@ class BacktestDashboard(QMainWindow):
         toolbar.setLayout(button_row)
         layout.addWidget(toolbar)
 
-        return wrap
+        # Scroll wrapper keeps the panel resizable below its natural width
+        # (wide tables/toolbars otherwise lock the dock divider in place).
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(wrap)
+        return scroll
 
     @staticmethod
     def _empty_state_label(text: str) -> QLabel:
