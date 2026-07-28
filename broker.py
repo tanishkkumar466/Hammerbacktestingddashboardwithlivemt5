@@ -23,6 +23,17 @@ TIMEFRAME_MT5_MAP: Dict[str, Tuple[str, str]] = {
     "1m": ("TIMEFRAME_M1", "1min"),
 }
 
+# Bar duration in seconds (for live freshness checks)
+TIMEFRAME_SECONDS: Dict[str, int] = {
+    "1h": 3600,
+    "30m": 1800,
+    "15m": 900,
+    "10m": 600,
+    "5m": 300,
+    "3m": 180,
+    "1m": 60,
+}
+
 
 @dataclass
 class BrokerCredentials:
@@ -130,6 +141,30 @@ class MT5Broker:
             return None
         return (float(tick.ask) - float(tick.bid)) / float(info.point)
 
+    def get_tick_prices(self, symbol: str) -> Optional[Tuple[float, float]]:
+        """Current (bid, ask) after resolving symbol."""
+        if not self.is_connected:
+            return None
+        ok, _, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return None
+        tick = self._mt5.symbol_info_tick(resolved)
+        if tick is None:
+            return None
+        return float(tick.bid), float(tick.ask)
+
+    def symbol_point(self, symbol: str) -> Optional[float]:
+        if not self.is_connected:
+            return None
+        ok, _, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return None
+        info = self._mt5.symbol_info(resolved)
+        if info is None:
+            return None
+        pt = float(getattr(info, "point", 0.0) or 0.0)
+        return pt if pt > 0 else None
+
     def ensure_symbol(self, symbol: str) -> Tuple[bool, str]:
         ok, msg, _resolved = self.resolve_and_ensure_symbol(symbol)
         return ok, msg
@@ -196,28 +231,98 @@ class MT5Broker:
         note = f" (resolved from {requested})" if resolved != requested else ""
         return True, f"Symbol ready: {resolved}{note}", resolved
 
-    def fetch_rates(self, symbol: str, timeframe_label: str, count: int = 400) -> Tuple[List[logic.Candle], Optional[logic.Candle], str]:
+    @staticmethod
+    def _rate_bar_time(r) -> datetime:
+        return datetime.fromtimestamp(int(r["time"]), tz=timezone.utc).replace(tzinfo=None)
+
+    @staticmethod
+    def _merge_tick_into_forming(forming: logic.Candle, tick) -> logic.Candle:
+        """Update forming bar OHLC from the latest tick (MT5 bar cache can lag ticks)."""
+        if tick is None:
+            return forming
+        bid = float(getattr(tick, "bid", 0) or 0)
+        ask = float(getattr(tick, "ask", 0) or 0)
+        last = float(getattr(tick, "last", 0) or 0)
+        if last <= 0:
+            last = ask if ask > 0 else bid
+        if last <= 0:
+            return forming
+        hi = max(forming.high, forming.open, last, bid, ask)
+        lo = min(forming.low, forming.open, last, bid, ask)
+        return logic.Candle(
+            timestamp=forming.timestamp,
+            open=forming.open,
+            high=hi,
+            low=lo,
+            close=last,
+        )
+
+    def fetch_rates(
+        self,
+        symbol: str,
+        timeframe_label: str,
+        count: int = 400,
+    ) -> Tuple[List[logic.Candle], Optional[logic.Candle], str, Dict[str, Any]]:
         """
-        Returns (closed_candles chronological, forming_candle, error_msg).
-        MT5 index 0 is the current forming bar.
+        Returns (closed_candles chronological, forming_candle, error_msg, meta).
+        MT5 index 0 is the current forming bar. Meta includes bid/ask and freshness hints.
         """
+        meta: Dict[str, Any] = {}
         if not self.is_connected:
-            return [], None, "Not connected."
+            return [], None, "Not connected.", meta
         ok, msg, resolved = self.resolve_and_ensure_symbol(symbol)
         if not ok:
-            return [], None, msg
+            return [], None, msg, meta
         sym = resolved
         if timeframe_label not in TIMEFRAME_MT5_MAP:
-            return [], None, f"Unknown timeframe: {timeframe_label}"
+            return [], None, f"Unknown timeframe: {timeframe_label}", meta
         tf_name, _ = TIMEFRAME_MT5_MAP[timeframe_label]
         tf_const = getattr(self._mt5, tf_name)
+        tf_sec = TIMEFRAME_SECONDS.get(timeframe_label, 60)
+
+        if not self._mt5.symbol_select(sym, True):
+            return [], None, f"Could not select symbol {sym} in Market Watch.", meta
+
+        tick = self._mt5.symbol_info_tick(sym)
+        if tick is not None:
+            meta["bid"] = float(tick.bid)
+            meta["ask"] = float(tick.ask)
+            meta["tick_time"] = datetime.fromtimestamp(
+                int(getattr(tick, "time", 0) or 0), tz=timezone.utc,
+            ).replace(tzinfo=None)
+
         rates = self._mt5.copy_rates_from_pos(sym, tf_const, 0, count)
         if rates is None or len(rates) == 0:
             err = self._mt5.last_error()
-            return [], None, f"No rates for {sym} {timeframe_label}: {err}"
+            return [], None, f"No rates for {sym} {timeframe_label}: {err}", meta
+
+        forming_ts = self._rate_bar_time(rates[0])
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        forming_age = (now_naive - forming_ts).total_seconds()
+        meta["forming_bar_time"] = forming_ts
+        meta["forming_age_sec"] = forming_age
+
+        if forming_age > tf_sec * 2.5 or forming_age < -tf_sec:
+            rates_alt = self._mt5.copy_rates_from(
+                sym, tf_const, datetime.now(timezone.utc), count,
+            )
+            if rates_alt is not None and len(rates_alt) > 0:
+                alt_ts = self._rate_bar_time(rates_alt[0])
+                alt_age = (now_naive - alt_ts).total_seconds()
+                if abs(alt_age) < abs(forming_age):
+                    rates = rates_alt
+                    meta["rates_source"] = "copy_rates_from"
+                    forming_ts = alt_ts
+                    meta["forming_bar_time"] = forming_ts
+                    meta["forming_age_sec"] = alt_age
+            if forming_age > tf_sec * 3:
+                meta["stale_warning"] = (
+                    f"Forming bar time {forming_ts} looks stale vs clock "
+                    f"(age {forming_age:.0f}s). Check MT5 quotes / symbol {sym}."
+                )
 
         def _to_candle(r) -> logic.Candle:
-            ts = datetime.fromtimestamp(int(r["time"]), tz=timezone.utc).replace(tzinfo=None)
+            ts = self._rate_bar_time(r)
             return logic.Candle(
                 timestamp=ts,
                 open=float(r["open"]),
@@ -227,9 +332,20 @@ class MT5Broker:
             )
 
         forming = _to_candle(rates[0])
+        forming = self._merge_tick_into_forming(forming, tick)
+        meta["forming_close"] = forming.close
         closed_rev = [_to_candle(r) for r in rates[1:]]
         closed = list(reversed(closed_rev))
-        return closed, forming, ""
+        if closed:
+            meta["last_closed_time"] = closed[-1].timestamp
+            meta["last_closed_close"] = closed[-1].close
+        return closed, forming, "", meta
+
+    def fetch_rates_legacy(
+        self, symbol: str, timeframe_label: str, count: int = 400,
+    ) -> Tuple[List[logic.Candle], Optional[logic.Candle], str]:
+        closed, forming, err, _meta = self.fetch_rates(symbol, timeframe_label, count)
+        return closed, forming, err
 
     def count_open_positions(self, symbol: str, magic: int) -> int:
         if not self.is_connected:
@@ -345,6 +461,72 @@ class MT5Broker:
                 )
         return sl_n, tp_n, None
 
+    def _coerce_stops_to_broker(
+        self,
+        sym_info,
+        direction: logic.TradeDirection,
+        ref_price: float,
+        sl: float,
+        tp: float,
+    ) -> Tuple[float, float]:
+        """Widen SL/TP outward to satisfy trade_stops_level (avoids MT5 retcode 10016)."""
+        sl_n = self._normalize_price(sym_info, float(sl)) if sl else 0.0
+        tp_n = self._normalize_price(sym_info, float(tp)) if tp else 0.0
+        ref = float(ref_price)
+        point = float(getattr(sym_info, "point", 0.0) or 0.0)
+        stops_level = int(getattr(sym_info, "trade_stops_level", 0) or 0)
+        if point <= 0 or stops_level <= 0:
+            return sl_n, tp_n
+        min_dist = stops_level * point + point * 2
+        if direction == logic.TradeDirection.BUY:
+            if sl_n > 0 and (ref - sl_n) < min_dist:
+                sl_n = self._normalize_price(sym_info, ref - min_dist)
+            if tp_n > 0 and (tp_n - ref) < min_dist:
+                tp_n = self._normalize_price(sym_info, ref + min_dist)
+        else:
+            if sl_n > 0 and (sl_n - ref) < min_dist:
+                sl_n = self._normalize_price(sym_info, ref + min_dist)
+            if tp_n > 0 and (ref - tp_n) < min_dist:
+                tp_n = self._normalize_price(sym_info, ref - min_dist)
+        return sl_n, tp_n
+
+    def _attach_sl_tp_to_position(
+        self,
+        symbol: str,
+        magic: int,
+        sl: float,
+        tp: float,
+    ) -> Tuple[bool, str]:
+        if not self.is_connected:
+            return False, "Not connected."
+        positions = self._mt5.positions_get(symbol=symbol)
+        if not positions:
+            return False, "No open position to attach SL/TP."
+        ticket = None
+        for p in positions:
+            if int(p.magic) == int(magic):
+                ticket = int(p.ticket)
+                break
+        if ticket is None:
+            return False, "No position with this magic number."
+        sym_info = self._mt5.symbol_info(symbol)
+        if sym_info is None:
+            return False, "Symbol info unavailable."
+        request = {
+            "action": self._mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": symbol,
+            "sl": float(sl),
+            "tp": float(tp),
+            "magic": int(magic),
+        }
+        result = self._mt5.order_send(request)
+        if result is None:
+            return False, f"SLTP modify failed: {self._mt5.last_error()}"
+        if result.retcode == self._mt5.TRADE_RETCODE_DONE:
+            return True, f"SL/TP set on position #{ticket}"
+        return False, f"SLTP rejected: {result.retcode} — {result.comment}"
+
     def _compute_limit_price(
         self,
         sym_info,
@@ -357,6 +539,24 @@ class MT5Broker:
         if direction == logic.TradeDirection.BUY:
             return self._normalize_price(sym_info, entry_price - offset)
         return self._normalize_price(sym_info, entry_price + offset)
+
+    def limit_price_with_offset(
+        self,
+        symbol: str,
+        direction: logic.TradeDirection,
+        base_price: float,
+        offset_points: float,
+    ) -> Tuple[Optional[float], str]:
+        if not self.is_connected:
+            return None, "Not connected."
+        ok, msg, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return None, msg
+        sym_info = self._mt5.symbol_info(resolved)
+        if sym_info is None:
+            return None, f"Symbol {resolved} unavailable."
+        price = self._compute_limit_price(sym_info, direction, float(base_price), offset_points)
+        return price, resolved
 
     def send_trade_order(
         self,
@@ -442,11 +642,15 @@ class MT5Broker:
 
         sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
         if stop_err:
-            return False, stop_err, None
+            sl, tp = self._coerce_stops_to_broker(sym_info, direction, price, sl, tp)
+            sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
+            if stop_err:
+                return False, stop_err, None
 
         filling_modes = self._filling_modes_for_symbol(sym_info)
         last_err = "No filling mode available"
         retcode_unsupported = getattr(self._mt5, "TRADE_RETCODE_INVALID_FILL", 10030)
+        retcode_invalid_stops = getattr(self._mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
 
         for type_filling in filling_modes:
             request = {
@@ -471,9 +675,27 @@ class MT5Broker:
 
             if result.retcode == self._mt5.TRADE_RETCODE_DONE:
                 order_id = int(getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
-                return True, f"Order placed #{order_id} vol={volume} @ {price}", order_id or None
+                return True, f"Order placed #{order_id} vol={volume} @ {price} SL={sl} TP={tp}", order_id or None
 
             last_err = f"Order rejected: {result.retcode} — {result.comment}"
+            if result.retcode == retcode_invalid_stops:
+                sl2, tp2 = self._coerce_stops_to_broker(sym_info, direction, price, sl, tp)
+                request["sl"] = float(sl2)
+                request["tp"] = float(tp2)
+                request["type_filling"] = type_filling
+                result2 = self._mt5.order_send(request)
+                if result2 and result2.retcode == self._mt5.TRADE_RETCODE_DONE:
+                    oid = int(getattr(result2, "order", 0) or getattr(result2, "deal", 0) or 0)
+                    return True, f"Order placed #{oid} @ {price} (widened SL/TP)", oid or None
+                request["sl"] = 0.0
+                request["tp"] = 0.0
+                result3 = self._mt5.order_send(request)
+                if result3 and result3.retcode == self._mt5.TRADE_RETCODE_DONE:
+                    oid = int(getattr(result3, "order", 0) or getattr(result3, "deal", 0) or 0)
+                    ok_sl, msg_sl = self._attach_sl_tp_to_position(symbol, magic, sl2, tp2)
+                    if ok_sl:
+                        return True, f"Order #{oid} @ {price}; {msg_sl}", oid or None
+                    return True, f"Order #{oid} @ {price} (SL/TP attach failed: {msg_sl})", oid or None
             if result.retcode != retcode_unsupported:
                 return False, last_err, None
 
@@ -539,11 +761,15 @@ class MT5Broker:
 
         sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
         if stop_err:
-            return False, stop_err, None
+            sl, tp = self._coerce_stops_to_broker(sym_info, direction, price, sl, tp)
+            sl, tp, stop_err = self._prepare_sl_tp(sym_info, direction, price, sl, tp)
+            if stop_err:
+                return False, stop_err, None
 
         filling_modes = self._filling_modes_for_symbol(sym_info)
         last_err = "No filling mode available"
         retcode_unsupported = getattr(self._mt5, "TRADE_RETCODE_INVALID_FILL", 10030)
+        retcode_invalid_stops = getattr(self._mt5, "TRADE_RETCODE_INVALID_STOPS", 10016)
 
         for type_filling in filling_modes:
             request = {
@@ -566,8 +792,16 @@ class MT5Broker:
                 continue
             if result.retcode == self._mt5.TRADE_RETCODE_DONE:
                 order_id = int(getattr(result, "order", 0) or 0)
-                return True, f"Limit order placed #{order_id} @ {price} vol={volume}", order_id or None
+                return True, f"Limit order placed #{order_id} @ {price} vol={volume} SL={sl} TP={tp}", order_id or None
             last_err = f"Limit rejected: {result.retcode} — {result.comment}"
+            if result.retcode == retcode_invalid_stops:
+                sl2, tp2 = self._coerce_stops_to_broker(sym_info, direction, price, sl, tp)
+                request["sl"] = float(sl2)
+                request["tp"] = float(tp2)
+                result2 = self._mt5.order_send(request)
+                if result2 and result2.retcode == self._mt5.TRADE_RETCODE_DONE:
+                    oid = int(getattr(result2, "order", 0) or 0)
+                    return True, f"Limit placed #{oid} @ {price} (widened SL/TP)", oid or None
             if result.retcode != retcode_unsupported:
                 return False, last_err, None
 

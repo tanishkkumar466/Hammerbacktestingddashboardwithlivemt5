@@ -94,6 +94,19 @@ class LiveRunConfig:
     price_deviation_points: int = 20
     order_comment: str = "HammerDashboard"
     fallback_to_market_on_limit_fail: bool = False
+    # If strategy entry (candle open) is farther than this from bid/ask, use market + re-anchored SL/TP
+    max_entry_deviation_points: float = 200.0
+    # limit_offset: base limit price on current bid/ask instead of strategy entry (live-friendly)
+    limit_offset_from_market: bool = True
+
+
+def reanchor_sl_tp_to_fill(
+    sig: logic.TradeSignal,
+    fill_price: float,
+) -> Tuple[float, float]:
+    """Keep the same $ risk/reward distances as the signal, anchored to the actual fill price."""
+    delta = float(fill_price) - float(sig.entry_price)
+    return float(sig.stop_loss) + delta, float(sig.target) + delta
 
 
 def validate_risk_config(cfg: LiveRunConfig, *, real_money: bool) -> Optional[str]:
@@ -206,6 +219,8 @@ class LiveTradingEngine:
         self._broker_lock = threading.RLock()
         self._consecutive_errors = 0
         self.last_heartbeat_mono: float = time.monotonic()
+        self._poll_ticks: int = 0
+        self._last_watch_log_mono: float = 0.0
         self._executor: Optional[ThreadPoolExecutor] = None
         self._ray_remote = None
         if live_config.use_thread_pool_signal_cpu:
@@ -215,6 +230,7 @@ class LiveTradingEngine:
 
     def _try_init_ray(self):
         try:
+            import psutil  # noqa: F401 — required by Ray; bundled in frozen exe
             import ray  # type: ignore
 
             if not ray.is_initialized():
@@ -228,6 +244,8 @@ class LiveTradingEngine:
 
             self._ray_remote = _ray_find
             self.log("[LIVE] Ray optional CPU worker enabled (falls back to threads if Ray fails).")
+        except ImportError as e:
+            self.log(f"[WARN] Ray not used (missing dependency, e.g. psutil): {e}")
         except Exception as e:
             self.log(f"[WARN] Ray not used: {e}")
 
@@ -449,6 +467,72 @@ class LiveTradingEngine:
 
         return find_actionable_signal(*args)
 
+    def _resolve_live_order(
+        self,
+        sig: logic.TradeSignal,
+        sym: str,
+    ) -> Optional[Tuple[str, Optional[float], float, float]]:
+        """
+        Returns (order_mode, limit_price_or_none, sl, tp) for MT5.
+        Re-anchors SL/TP to the actual fill/limit price; uses market when strategy entry is far from tick.
+        """
+        cfg = self.live_config
+        with self._broker_lock:
+            ticks = self.broker.get_tick_prices(sym)
+            point = self.broker.symbol_point(sym)
+        if not ticks:
+            self.log("[ORDER] No tick data — cannot send order.")
+            return None
+        bid, ask = ticks
+        is_buy = sig.direction == logic.TradeDirection.BUY
+        market = ask if is_buy else bid
+        strat_entry = float(sig.entry_price)
+        pt = point or 0.01
+        dev_pts = abs(strat_entry - market) / pt
+
+        order_mode = (cfg.order_mode or "market").strip().lower()
+        effective_mode = order_mode
+        limit_price: Optional[float] = strat_entry
+
+        if order_mode == "market" or dev_pts > cfg.max_entry_deviation_points:
+            if order_mode != "market":
+                self.log(
+                    f"[LIVE] Strategy entry {strat_entry:.2f} vs "
+                    f"{'ask' if is_buy else 'bid'} {market:.2f} ({dev_pts:.0f} pts) — "
+                    f"using MARKET (max deviation {cfg.max_entry_deviation_points:.0f} pts)."
+                )
+            effective_mode = "market"
+            fill_ref = market
+            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            limit_price = None
+        elif order_mode == "limit_offset":
+            base = market if cfg.limit_offset_from_market else strat_entry
+            with self._broker_lock:
+                lp, _resolved = self.broker.limit_price_with_offset(
+                    sym, sig.direction, base, cfg.limit_offset_points,
+                )
+            if lp is None:
+                self.log("[ORDER] Could not compute limit price.")
+                return None
+            limit_price = lp
+            fill_ref = limit_price
+            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            effective_mode = "limit_entry"
+        else:
+            fill_ref = strat_entry
+            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            limit_price = strat_entry
+
+        side = "ask" if is_buy else "bid"
+        self.log(
+            f"[LIVE] Tick bid={bid:.2f} ask={ask:.2f} | strategy entry={strat_entry:.2f} | "
+            f"exec @ {side} {market:.2f} → SL={sl:.2f} TP={tp:.2f}"
+        )
+        if effective_mode != "market" and limit_price is not None:
+            self.log(f"[LIVE] Limit price {limit_price:.2f} (mode={effective_mode})")
+
+        return effective_mode, limit_price, sl, tp
+
     def _poll_once(self, config_timeframe_label: str):
         """config_timeframe_label: dashboard TF key (1m, 1h, …) matching strategy timeframe_settings."""
         cfg = self.live_config
@@ -457,7 +541,7 @@ class LiveTradingEngine:
             return
         sym = self._active_symbol or cfg.symbol
         with self._broker_lock:
-            closed, forming, err = self.broker.fetch_rates(
+            closed, forming, err, rate_meta = self.broker.fetch_rates(
                 sym, cfg.timeframe_label, cfg.history_bars,
             )
         if err:
@@ -465,6 +549,27 @@ class LiveTradingEngine:
             return
         if not closed:
             return
+
+        self._poll_ticks += 1
+        stale = rate_meta.get("stale_warning")
+        if stale:
+            self.log(f"[WARN] {stale}")
+
+        now_mono = time.monotonic()
+        if now_mono - self._last_watch_log_mono >= 30.0:
+            self._last_watch_log_mono = now_mono
+            bid = rate_meta.get("bid")
+            ask = rate_meta.get("ask")
+            f_close = rate_meta.get("forming_close")
+            lc = rate_meta.get("last_closed_close")
+            lc_t = rate_meta.get("last_closed_time")
+            tick_part = ""
+            if bid is not None and ask is not None:
+                tick_part = f" | tick bid={bid:.2f} ask={ask:.2f}"
+            self.log(
+                f"[LIVE] Data watch | last closed {lc_t} close={lc} | "
+                f"forming close≈{f_close}{tick_part}"
+            )
 
         last_ts = closed[-1].timestamp
         if self._last_closed_bar_ts is None:
@@ -518,17 +623,22 @@ class LiveTradingEngine:
         if cfg.max_lot_size > 0:
             volume = min(volume, cfg.max_lot_size)
 
-        self.log(f"[ORDER] Sending {sig.direction.value} {volume} lot(s) via {cfg.order_mode} on {sym}…")
+        resolved = self._resolve_live_order(sig, sym)
+        if resolved is None:
+            return
+        order_mode, limit_price, sl, tp = resolved
+
+        self.log(f"[ORDER] Sending {sig.direction.value} {volume} lot(s) via {order_mode} on {sym}…")
         with self._broker_lock:
             ok, msg, order_id = self.broker.send_trade_order(
                 sym,
                 sig.direction,
                 volume,
-                sig.stop_loss,
-                sig.target,
+                sl,
+                tp,
                 cfg.magic,
-                order_mode=cfg.order_mode,
-                limit_price=sig.entry_price,
+                order_mode=order_mode,
+                limit_price=limit_price if limit_price is not None else sig.entry_price,
                 limit_offset_points=cfg.limit_offset_points,
                 comment=cfg.order_comment,
                 deviation=cfg.price_deviation_points,
@@ -537,27 +647,37 @@ class LiveTradingEngine:
             self.log(f"[ORDER] {msg}")
             self._record_trade_event(
                 "ORDER", sig, volume=volume, dry_run=False,
-                mt5_order_id=order_id, mt5_message=msg,
+                mt5_order_id=order_id, mt5_message=msg, order_mode=order_mode,
             )
             self._traded_keys.add(key)
             self._trades_today += 1
             self._last_order_time = time.monotonic()
         elif (
-            cfg.order_mode != "market"
+            order_mode != "market"
             and cfg.fallback_to_market_on_limit_fail
         ):
             self.log(f"[ORDER FAIL] {msg}")
             self.log("[ORDER] Limit failed — trying one market fallback…")
             with self._broker_lock:
+                ticks = self.broker.get_tick_prices(sym)
+            if not ticks:
+                self._record_trade_event(
+                    "ORDER_FAIL", sig, volume=volume, dry_run=False, mt5_message=msg,
+                )
+                return
+            bid, ask = ticks
+            mkt = ask if sig.direction == logic.TradeDirection.BUY else bid
+            sl_m, tp_m = reanchor_sl_tp_to_fill(sig, mkt)
+            with self._broker_lock:
                 ok, msg, order_id = self.broker.send_trade_order(
                     sym,
                     sig.direction,
                     volume,
-                    sig.stop_loss,
-                    sig.target,
+                    sl_m,
+                    tp_m,
                     cfg.magic,
                     order_mode="market",
-                    limit_price=sig.entry_price,
+                    limit_price=mkt,
                     comment=cfg.order_comment,
                     deviation=cfg.price_deviation_points,
                 )

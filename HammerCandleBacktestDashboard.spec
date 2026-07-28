@@ -35,6 +35,10 @@ hiddenimports = [
     "openpyxl.workbook",
     "matplotlib.backends.backend_agg",
     "sqlite3",
+    "psutil",
+    "numpy",
+    "PIL",
+    "PIL.Image",
 ]
 
 # Bundle window / taskbar icons into the onefile extract (_MEIPASS) for get_asset_path()
@@ -57,6 +61,14 @@ tmp = collect_all("polars")
 datas += tmp[0]
 binaries += tmp[1]
 hiddenimports += tmp[2]
+
+try:
+    tmp = collect_all("psutil")
+    datas += tmp[0]
+    binaries += tmp[1]
+    hiddenimports += tmp[2]
+except Exception:
+    pass
 
 # EXE icon: prefer logo.ico (client branding), then app_icon.ico
 _exe_icon = None

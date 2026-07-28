@@ -4,6 +4,7 @@ polars>=0.20
 numpy>=1.26
 pillow>=10.0
 openpyxl>=3.1
+psutil>=5.9
 
 # Live MT5 (Windows only — install on build agent for bundling optional import):
 MetaTrader5>=5.0.45
