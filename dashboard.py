@@ -120,7 +120,7 @@ def get_asset_path(filename: str) -> str:
 
 
 APP_DIR = get_app_dir()
-DOCK_LAYOUT_VERSION = 4  # bump when dock topology changes (invalidates saved dockState)
+DOCK_LAYOUT_VERSION = 7  # client layout: Preview | Live, bottom tabs for Results/Params
 DEFAULT_DATA_DIR = os.path.join(APP_DIR, "data")
 DEFAULT_OUTPUT_DIR = os.path.join(APP_DIR, "output")
 PRESETS_DIR = os.path.join(APP_DIR, "presets")
@@ -661,7 +661,7 @@ WICK_SIDE_FIELD = [
     ("hammer_wick_side", "Hammer Wick Side", FIELD_TYPE_DROPDOWN, enum_choices(logic.WickSide)),
 ]
 
-WICK_FIELDS = WICK_SHAPE_FIELDS + WICK_SIDE_FIELD
+WICK_FIELDS = WICK_SHAPE_FIELDS
 HAMMER_SHAPE_FIELDS = BODY_FIELDS + WICK_SHAPE_FIELDS
 
 DOJI_ONLY_FIELD_NAMES = {
@@ -771,7 +771,7 @@ INDICATOR_UI_DEFAULTS = {
 }
 
 # Field names used to show/hide parameter rows when the user switches pattern.
-HAMMER_ONLY_FIELD_NAMES = {f[0] for f in HAMMER_SHAPE_FIELDS + WICK_SIDE_FIELD + DIRECTION_FIELDS + HAMMER_TYPE_FIELDS}
+HAMMER_ONLY_FIELD_NAMES = {f[0] for f in HAMMER_SHAPE_FIELDS + DIRECTION_FIELDS + HAMMER_TYPE_FIELDS}
 
 ENTRY_EXIT_FIELDS = [
     ("entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
@@ -787,7 +787,7 @@ RISK_CONTROL_FIELDS = [
 ]
 
 STRATEGY_FIELDS = (
-    WICK_SIDE_FIELD + DIRECTION_FIELDS + HAMMER_TYPE_FIELDS
+    DIRECTION_FIELDS + HAMMER_TYPE_FIELDS
     + ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS
 )
 
@@ -859,7 +859,10 @@ FIELD_HELP: Dict[str, str] = {
     "small_tol_is_symmetric": "On: one tolerance value applies both directions.\nOff: set separate lower/upper tolerances for the small wick.",
     "small_tol_lower": "Small wick % tolerance on the low side only.",
     "small_tol_upper": "Small wick % tolerance on the high side only.",
-    "hammer_wick_side": "Which side the long wick sits on: LOWER = classic hammer, UPPER = inverted hammer / shooting-star shape.",
+    "hammer_wick_side": (
+        "Preview / fallback when both hammer types are off. At run time, Classic + Inverted checkboxes "
+        "set detection: both on = EITHER shape, inverted only = UPPER wick, classic only = LOWER wick."
+    ),
     "doji_max_body_pct": "Maximum body size (% of range) for a valid doji -- body must be at or below this (+ tolerance).",
     "doji_max_body_tol": "Extra body % allowed above the max (effective ceiling = max + tolerance).",
     "doji_min_upper_wick_pct": "Minimum upper wick % for CLASSIC / LONG_LEGGED doji styles.",
@@ -878,10 +881,13 @@ FIELD_HELP: Dict[str, str] = {
     "doji_allow_green_trades": "When off, green dojis never produce a trade (CANDLE_COLOR mode).",
     "doji_allow_red_trades": "When off, red dojis never produce a trade (CANDLE_COLOR mode).",
     "indicators_combine_mode": "When two or more indicators are added: ALL = every filter must pass; ANY = at least one.",
-    "green_direction": "Trade direction to take when the signal candle closes green.",
-    "red_direction": "Trade direction to take when the signal candle closes red.",
-    "enable_classic_hammer": "Detect classic hammers (long lower wick).",
-    "enable_inverted_hammer": "Detect inverted hammers (long upper wick).",
+    "green_direction": "Trade direction when the signal candle closes green (bullish body). Default BUY.",
+    "red_direction": "Trade direction when the signal candle closes red (bearish body). Default SELL.",
+    "enable_classic_hammer": "Detect classic hammers: long lower wick, small upper wick (hammer at support).",
+    "enable_inverted_hammer": (
+        "Detect inverted hammers (long upper wick). Must be on for inverted-shaped candles to qualify; "
+        "with Classic also on, both shapes are allowed (EITHER)."
+    ),
     "classic_hammer_allow_buy": "If off, classic hammer signals never open BUY trades.",
     "classic_hammer_allow_sell": "If off, classic hammer signals never open SELL trades.",
     "inverted_hammer_allow_buy": "If off, inverted hammer signals never open BUY trades.",
@@ -1036,6 +1042,20 @@ QPushButton {
 QPushButton:hover { background-color: #2E9549; }
 QPushButton:pressed { background-color: #257A3C; }
 QPushButton:disabled { background-color: #BDC1C6; color: #F1F1F1; }
+QPushButton#previewSideToggle {
+    background-color: #FFFFFF;
+    color: #1A1A1A;
+    border: 1px solid #DADCE0;
+    padding: 6px 12px;
+    border-radius: 6px;
+}
+QPushButton#previewSideToggle:hover { background-color: #F1F3F4; }
+QPushButton#previewSideToggle:checked {
+    background-color: #E6F4EA;
+    border-color: #188038;
+    color: #188038;
+    font-weight: bold;
+}
 QPushButton#secondaryButton {
     background-color: #FFFFFF; color: #188038; border: 1.5px solid #34A853;
     font-weight: 600; padding: 8px 18px; font-size: 12px;
@@ -1218,11 +1238,12 @@ class CandleWidget(QWidget):
         margin = max(10, h * 0.08)
         usable_h = h - 2 * margin
         center_x = w // 2
-        body_width = max(20, w * 0.35)
+        # Cap body width so a wide, short dock (e.g. floated panel) does not draw a flat green bar.
+        body_width = min(max(20, w * 0.35), max(28, h * 0.5))
 
-        body_h = usable_h * body_frac
-        dominant_h = usable_h * dominant_frac
-        small_h = usable_h * small_frac
+        body_h = max(4.0, usable_h * body_frac)
+        dominant_h = max(4.0, usable_h * dominant_frac)
+        small_h = max(2.0, usable_h * small_frac)
 
         long_wick_on_bottom = (self.wick_side != "UPPER")
 
@@ -1290,6 +1311,8 @@ class PatternContextChart(QWidget):
         self.preview_st_bullish = True
         self.preview_show_vwap = False
         self.preview_price_above_vwap = True
+        self.preview_trade_side = "BUY"
+        self._context_trade_side = None
         self._overlays = []
         self._lead_candles = []
         self._trail_candles = []
@@ -1299,7 +1322,8 @@ class PatternContextChart(QWidget):
     def set_data(self, body_pct, dominant_pct, small_pct, wick_side, is_green,
                  rr_multiple, max_sl_usd, timeframe_label, is_doji=False, doji_style="",
                  preview_show_st=False, preview_st_bullish=True,
-                 preview_show_vwap=False, preview_price_above_vwap=True):
+                 preview_show_vwap=False, preview_price_above_vwap=True,
+                 preview_trade_side="BUY"):
         self.body_pct = body_pct
         self.dominant_pct = dominant_pct
         self.small_pct = small_pct
@@ -1311,28 +1335,30 @@ class PatternContextChart(QWidget):
         self.preview_st_bullish = preview_st_bullish
         self.preview_show_vwap = preview_show_vwap
         self.preview_price_above_vwap = preview_price_above_vwap
+        self.preview_trade_side = preview_trade_side or "BUY"
         self.rr_multiple = rr_multiple
         self.max_sl_usd = max_sl_usd
         self.timeframe_label = timeframe_label
-        # The surrounding lead-in/trail-out candles are cosmetic market
-        # context, not driven by live parameters -- generate them once
-        # per timeframe (seeded, so they're stable across repaints) and
-        # cache them, rather than reshuffling on every redraw.
-        if timeframe_label != self._context_timeframe:
-            self._regenerate_context_candles(timeframe_label)
+        if (
+            timeframe_label != self._context_timeframe
+            or self.preview_trade_side != self._context_trade_side
+        ):
+            self._regenerate_context_candles(timeframe_label, self.preview_trade_side)
         self.update()
 
-    def _regenerate_context_candles(self, timeframe_label: str):
+    def _regenerate_context_candles(self, timeframe_label: str, trade_side: str = "BUY"):
         choppiness = TIMEFRAME_CHOPPINESS.get(timeframe_label, 0.04)
-        rng = random.Random(f"pattern-context::{timeframe_label}")
-        # Lead-in: a genuine downtrend from up near resistance down toward
-        # the signal at support. Trail-out: a genuine uptrend from just
-        # above the signal back up toward resistance/profit -- fixing the
-        # earlier version, where the trail candles actually drifted back
-        # down instead of climbing to the target.
+        side_key = "SELL" if trade_side == "SELL" else "BUY"
+        rng = random.Random(f"pattern-context::{timeframe_label}::{side_key}")
+        # BUY: downtrend into signal at support, then rally toward resistance (TP up).
+        # SELL: downtrend into signal, then continuation down toward support (TP down).
         self._lead_candles = self._generate_leg(rng, 0.16, 0.80, 5, choppiness)
-        self._trail_candles = self._generate_leg(rng, 0.78, 0.20, 5, choppiness)
+        if side_key == "SELL":
+            self._trail_candles = self._generate_leg(rng, 0.78, 0.92, 5, choppiness)
+        else:
+            self._trail_candles = self._generate_leg(rng, 0.78, 0.20, 5, choppiness)
         self._context_timeframe = timeframe_label
+        self._context_trade_side = side_key
 
     @staticmethod
     def _generate_leg(rng: random.Random, start_frac: float, end_frac: float,
@@ -1410,6 +1436,26 @@ class PatternContextChart(QWidget):
             painter.drawRoundedRect(style_x, 8, style_chip_w, 18, 5, 5)
             painter.setPen(QPen(QColor("#B06000")))
             painter.drawText(style_x + 7, 21, chip_text)
+            trade_x = style_x + style_chip_w + 6
+        else:
+            trade_x = 10 + chip_w + 6
+
+        side = self.preview_trade_side if self.preview_trade_side in ("BUY", "SELL") else ("BUY" if self.is_green else "SELL")
+        if self.is_doji:
+            chip2 = side
+        else:
+            variant = "Inv." if self.wick_side == "UPPER" else "Classic"
+            chip2 = f"{variant} · {side}"
+        side_font = painter.font()
+        side_font.setBold(True)
+        side_font.setPointSize(8)
+        painter.setFont(side_font)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor("#E8F0FE")))
+        chip2_w = QFontMetrics(side_font).horizontalAdvance(chip2) + 14
+        painter.drawRoundedRect(trade_x, 8, chip2_w, 18, 5, 5)
+        painter.setPen(QPen(QColor("#1A73E8")))
+        painter.drawText(trade_x + 7, 21, chip2)
 
         # ---- faint horizontal grid, purely decorative depth ----
         painter.setPen(QPen(QColor("#ECEEF1"), 1))
@@ -1526,13 +1572,20 @@ class PatternContextChart(QWidget):
             body_bottom = body_top + body_h
             small_bottom = body_bottom + small_h
 
-        # ---- key trade levels, computed before anything is drawn so the
-        # risk/reward shading can sit behind the candle ----
-        entry_y = body_top
-        sl_y = dominant_bottom if long_wick_on_bottom else small_bottom
-        risk_y_dist = sl_y - entry_y
+        # ---- key trade levels (screen Y: smaller = higher price / toward resistance)
+        is_buy = self.preview_trade_side == "BUY"
+        if long_wick_on_bottom:
+            candle_low_y = dominant_bottom
+            candle_high_y = small_top
+        else:
+            candle_low_y = small_bottom
+            candle_high_y = dominant_top
+
+        entry_y = body_top if is_buy else body_bottom
+        sl_y = candle_low_y if is_buy else candle_high_y
+        risk_y_dist = abs(sl_y - entry_y)
         reward_y_dist = risk_y_dist * max(self.rr_multiple, 0.1)
-        if self.is_green:
+        if is_buy:
             target_y = max(entry_y - reward_y_dist, resistance_y)
         else:
             target_y = min(entry_y + reward_y_dist, support_y)
@@ -1540,13 +1593,11 @@ class PatternContextChart(QWidget):
         zone_left = signal_x - candle_w * 0.9
         zone_right = signal_x + slot_w * 0.95
 
-        # ---- risk zone (entry -> SL) and reward zone (entry -> target),
-        # shaded behind the candle so the RR ratio this timeframe is set
-        # to is visible at a glance, not just stated as a number ----
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(242, 153, 0, 32)))
         painter.drawRect(QRectF(zone_left, min(entry_y, sl_y), zone_right - zone_left, abs(sl_y - entry_y)))
-        painter.setBrush(QBrush(QColor(52, 168, 83, 32)))
+        reward_fill = QColor(52, 168, 83, 32) if is_buy else QColor(234, 67, 53, 32)
+        painter.setBrush(QBrush(reward_fill))
         painter.drawRect(QRectF(zone_left, min(entry_y, target_y), zone_right - zone_left, abs(target_y - entry_y)))
 
         # soft radial "spotlight" glow behind the signal candle
@@ -1586,14 +1637,10 @@ class PatternContextChart(QWidget):
         painter.drawRoundedRect(signal_x - candle_w / 2, body_top,
                                  candle_w, max(2.0, body_bottom - body_top), 2, 2)
 
-        # ---- ENTRY / SL / TP flags -- exactly where the trade's entry
-        # price, stop-loss, and profit target sit relative to the signal
-        # candle. Entry marks the top of the real body; SL marks the far
-        # end of the long wick (where a hammer's stop naturally goes);
-        # TP is entry +/- (risk distance x this timeframe's RR multiple).
+        # ---- ENTRY / SL / TP flags (hammer + doji: SL at wick extreme per logic.py)
         entry_color = QColor("#1A73E8")
         sl_color = QColor("#F29900")
-        tp_color = up_color if self.is_green else down_color
+        tp_color = up_color if is_buy else down_color
 
         flag_font = painter.font()
         flag_font.setBold(True)
@@ -1620,9 +1667,6 @@ class PatternContextChart(QWidget):
         draw_flag(entry_y, entry_color, "ENTRY")
         draw_flag(sl_y, sl_color, "SL")
 
-        # ---- $ risk / $ reward, printed inside their own zone on the
-        # left (flags already own the right side) -- turns "RR 1.6"
-        # into concrete numbers: what you'd actually lose or make.
         reward_usd = self.max_sl_usd * self.rr_multiple
         zone_label_font = painter.font()
         zone_label_font.setBold(True)
@@ -1635,9 +1679,8 @@ class PatternContextChart(QWidget):
         painter.setPen(QPen(tp_color.darker(120)))
         painter.drawText(int(zone_left + 5), int(reward_mid_y + 3), f"+${reward_usd:,.0f}")
 
-        # ---- BUY / SELL badge under the signal candle ----
-        action_label = "BUY" if self.is_green else "SELL"
-        action_color = support_color if self.is_green else resistance_color
+        action_label = "BUY" if is_buy else "SELL"
+        action_color = support_color if is_buy else resistance_color
         bold_small = painter.font()
         bold_small.setBold(True)
         bold_small.setPointSize(8)
@@ -1664,8 +1707,12 @@ class PatternContextChart(QWidget):
         painter.setFont(bold_small)
         target_text = "PROFIT TARGET"
         target_w = fm_bold.horizontalAdvance(target_text)
-        painter.setPen(QPen(support_color))
-        painter.drawText(int(w - margin_x - target_w), int(resistance_y - 22), target_text)
+        if is_buy:
+            painter.setPen(QPen(support_color))
+            painter.drawText(int(w - margin_x - target_w), int(resistance_y - 22), target_text)
+        else:
+            painter.setPen(QPen(resistance_color))
+            painter.drawText(int(w - margin_x - target_w), int(support_y + 14), target_text)
 
         # ---- RR / SL caption, pill badge bottom-left -- now also
         # showing the breakeven win rate: the minimum win % this RR
@@ -2024,16 +2071,27 @@ class BacktestDashboard(QMainWindow):
 
         self._build_ui()
         self._build_shortcuts()
+        self._dock_layout_busy = False
         QTimer.singleShot(0, self._restore_saved_layout)
         self._refresh_run_history_table()
-        QTimer.singleShot(0, self._redraw_candle_preview)
         QTimer.singleShot(0, self._restore_live_settings)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not getattr(self, "_layout_sanitize_done", False):
             self._layout_sanitize_done = True
-            QTimer.singleShot(50, self._sanitize_window_and_docks)
+            QTimer.singleShot(100, self._post_show_layout_setup)
+
+    def _post_show_layout_setup(self):
+        """After the main window is visible — safe to resize docks and draw previews (macOS)."""
+        try:
+            self._apply_default_dock_sizes()
+            if hasattr(self, "live_dock"):
+                self.live_dock.raise_()
+            self._sync_preview_toolbar_for_pattern()
+            self._redraw_candle_preview()
+        except Exception:
+            pass
 
     def _frame_off_screen(self, frame, available) -> bool:
         if frame.isNull():
@@ -2050,25 +2108,19 @@ class BacktestDashboard(QMainWindow):
         return False
 
     def _sanitize_window_and_docks(self):
-        """Re-dock or clamp panels that were restored off-screen (prevents Qt segfaults)."""
+        """Re-dock panels that floated off (Windows). macOS docks are not floatable."""
+        if sys.platform == "darwin":
+            return
         try:
             self._clamp_window_to_screen()
-            screen = self.screen() or QApplication.primaryScreen()
-            if screen is None:
-                return
-            available = screen.availableGeometry()
+            any_floating = False
             for dock in self.findChildren(QDockWidget):
-                if not dock.isFloating():
-                    continue
-                if self._frame_off_screen(dock.frameGeometry(), available):
+                if dock.isFloating():
+                    any_floating = True
                     dock.setFloating(False)
-                else:
-                    g = dock.geometry()
-                    w = min(max(g.width(), 320), available.width())
-                    h = min(max(g.height(), 220), available.height())
-                    x = max(available.x(), min(g.x(), available.x() + available.width() - w))
-                    y = max(available.y(), min(g.y(), available.y() + available.height() - h))
-                    dock.setGeometry(x, y, w, h)
+            if any_floating:
+                self._place_docks_default_layout()
+                self._apply_default_dock_sizes()
         except Exception:
             pass
 
@@ -2136,7 +2188,6 @@ class BacktestDashboard(QMainWindow):
                 if geometry is not None:
                     self.restoreGeometry(geometry)
                 self._clamp_window_to_screen()
-                self._place_docks_default_layout()
                 return
 
             saved_ver = self._settings.value("window/dockLayoutVersion", 0, type=int)
@@ -2156,6 +2207,7 @@ class BacktestDashboard(QMainWindow):
                 self.restoreState(self._default_dock_state)
 
             QTimer.singleShot(0, self._sanitize_window_and_docks)
+            QTimer.singleShot(100, self._ensure_pattern_preview_linked)
         except Exception:
             if getattr(self, "_default_dock_state", None) is not None:
                 try:
@@ -2205,27 +2257,23 @@ class BacktestDashboard(QMainWindow):
                 | QMainWindow.GroupedDragging
             )
             self.setDockOptions(dock_opts)
-        # Let the top dock area claim both corners, so Preview/Results
-        # (left/right docks) sit BELOW the full-width Parameters dock
-        # instead of squeezing in beside it.
-        self.setCorner(Qt.TopLeftCorner, Qt.TopDockWidgetArea)
-        self.setCorner(Qt.TopRightCorner, Qt.TopDockWidgetArea)
 
-        # No central widget: Run Backtest now lives inline in the
-        # Parameters panel next to the Candle Pattern dropdown, so the
-        # dock areas can use the full window instead of leaving a
-        # dedicated top-bar strip.
         self.params_dock = self._make_dock("Backtest Parameters", self._build_parameter_panel())
         self.preview_dock = self._make_dock("Pattern & Preview", self._build_preview_panel())
         self.results_dock = self._make_dock("Results", self._build_results_panel())
         self.live_dock = self._make_dock("Live Trading", self._build_live_panel())
 
-        self.addDockWidget(Qt.TopDockWidgetArea, self.params_dock)
+        # Client layout (reference): Pattern & Preview left | Live Trading right;
+        # Results + Backtest Parameters as tabs on the bottom of the right stack.
+        self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+        self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+
         self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.results_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.live_dock)
-        self.splitDockWidget(self.preview_dock, self.results_dock, Qt.Horizontal)
-        self.splitDockWidget(self.results_dock, self.live_dock, Qt.Vertical)
+        self.splitDockWidget(self.preview_dock, self.live_dock, Qt.Horizontal)
+        self.tabifyDockWidget(self.live_dock, self.results_dock)
+        self.tabifyDockWidget(self.live_dock, self.params_dock)
+        self.live_dock.raise_()
 
         self._apply_default_dock_sizes()
 
@@ -2234,6 +2282,47 @@ class BacktestDashboard(QMainWindow):
         # it after panels get dragged around / floated out.
         self._default_dock_state = self.saveState()
         self._setup_status_bar()
+
+    def _on_preview_dock_visibility_changed(self, visible: bool):
+        if visible:
+            self._sync_preview_toolbar_for_pattern()
+            self._redraw_candle_preview()
+
+    def _ensure_pattern_preview_linked(self):
+        """Keep Pattern & Preview visible beside Results (Windows float recovery)."""
+        if not hasattr(self, "preview_dock"):
+            return
+        if sys.platform == "darwin":
+            if not self.preview_dock.isVisible():
+                self.preview_dock.show()
+            self._apply_default_dock_sizes()
+            self._sync_preview_toolbar_for_pattern()
+            QTimer.singleShot(0, self._redraw_candle_preview)
+            return
+        floating = any(
+            d.isFloating()
+            for d in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock)
+            if d is not None
+        )
+        if floating:
+            self._place_docks_default_layout()
+        else:
+            for dock in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock):
+                if dock is not None and not dock.isVisible():
+                    dock.show()
+            self._apply_default_dock_sizes()
+        self._sync_preview_toolbar_for_pattern()
+        QTimer.singleShot(0, self._redraw_candle_preview)
+
+    def _on_dock_top_level_changed(self, floating: bool):
+        """Detached dock window (Windows only — macOS has no floatable docks)."""
+        if sys.platform == "darwin":
+            return
+        if not floating:
+            return
+        QTimer.singleShot(0, self._place_docks_default_layout)
+        QTimer.singleShot(30, self._apply_default_dock_sizes)
+        QTimer.singleShot(50, self._redraw_candle_preview)
 
     def _setup_status_bar(self):
         bar = self.statusBar()
@@ -2253,39 +2342,72 @@ class BacktestDashboard(QMainWindow):
 
     def _apply_default_dock_sizes(self):
         try:
-            self.resizeDocks([self.params_dock], [430], Qt.Vertical)
-            self.resizeDocks([self.preview_dock, self.results_dock], [420, 900], Qt.Horizontal)
-            self.resizeDocks([self.results_dock, self.live_dock], [520, 400], Qt.Vertical)
+            # Preview column ~400px; right stack (Live / Results / Params tabs) gets the rest.
+            self.resizeDocks([self.preview_dock, self.live_dock], [400, 960], Qt.Horizontal)
         except Exception:
             pass
 
     def _place_docks_default_layout(self):
-        """Re-attach all panels in the standard grid (Parameters top, Preview left, etc.)."""
-        for dock in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock):
-            try:
-                self.removeDockWidget(dock)
-            except Exception:
-                pass
-            dock.setFloating(False)
-            dock.show()
+        """Re-attach panels: Preview left | Live right; Results & Params tabbed with Live."""
+        if getattr(self, "_dock_layout_busy", False):
+            return
+        if sys.platform == "darwin" and not self.isVisible():
+            QTimer.singleShot(50, self._place_docks_default_layout)
+            return
+        self._dock_layout_busy = True
+        docks = (self.params_dock, self.preview_dock, self.results_dock, self.live_dock)
+        try:
+            for dock in docks:
+                if dock is None:
+                    continue
+                dock.blockSignals(True)
+            for dock in docks:
+                if dock is None:
+                    continue
+                try:
+                    self.removeDockWidget(dock)
+                except Exception:
+                    pass
+                # Never setFloating on macOS — DockWidgetFloatable is off and it bus-errors.
+                if sys.platform != "darwin" and dock.isFloating():
+                    dock.setFloating(False)
+                dock.show()
 
-        self.addDockWidget(Qt.TopDockWidgetArea, self.params_dock)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.results_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.live_dock)
-        self.splitDockWidget(self.preview_dock, self.results_dock, Qt.Horizontal)
-        self.splitDockWidget(self.results_dock, self.live_dock, Qt.Vertical)
-        self._apply_default_dock_sizes()
+            self.setCorner(Qt.BottomLeftCorner, Qt.LeftDockWidgetArea)
+            self.setCorner(Qt.BottomRightCorner, Qt.RightDockWidgetArea)
+            self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_dock)
+            self.addDockWidget(Qt.RightDockWidgetArea, self.live_dock)
+            self.splitDockWidget(self.preview_dock, self.live_dock, Qt.Horizontal)
+            self.tabifyDockWidget(self.live_dock, self.results_dock)
+            self.tabifyDockWidget(self.live_dock, self.params_dock)
+            self.live_dock.raise_()
+            self._apply_default_dock_sizes()
+        finally:
+            for dock in docks:
+                if dock is not None:
+                    dock.blockSignals(False)
+            self._dock_layout_busy = False
 
     def _make_dock(self, title: str, content: QWidget) -> QDockWidget:
         dock = QDockWidget(title, self)
         dock.setObjectName(title.replace(" ", "").replace("&", "And"))
-        features = QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable
-        if sys.platform != "darwin":
-            features |= QDockWidget.DockWidgetFloatable
+        if sys.platform == "darwin":
+            # Movable tabs inside the main window only — no float (separate windows break layout/preview).
+            features = QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetClosable
+        else:
+            features = (
+                QDockWidget.DockWidgetMovable
+                | QDockWidget.DockWidgetClosable
+                | QDockWidget.DockWidgetFloatable
+            )
         dock.setFeatures(features)
-        dock.setAllowedAreas(Qt.AllDockWidgetAreas)
-        dock.setMinimumSize(320, 220)
+        dock.setAllowedAreas(
+            Qt.LeftDockWidgetArea
+            | Qt.RightDockWidgetArea
+            | Qt.TopDockWidgetArea
+            | Qt.BottomDockWidgetArea
+        )
+        dock.setMinimumSize(320, 280)
         dock.setWidget(content)
         if sys.platform != "darwin":
             dock.topLevelChanged.connect(self._on_dock_float_changed)
@@ -2412,12 +2534,15 @@ class BacktestDashboard(QMainWindow):
 
     def _reset_dock_layout(self):
         self._place_docks_default_layout()
-        if getattr(self, "_default_dock_state", None) is not None:
+        if sys.platform != "darwin" and getattr(self, "_default_dock_state", None) is not None:
             try:
                 self.restoreState(self._default_dock_state)
             except Exception:
                 pass
         QTimer.singleShot(0, self._apply_default_dock_sizes)
+        if hasattr(self, "live_dock"):
+            QTimer.singleShot(0, self.live_dock.raise_)
+        QTimer.singleShot(0, self._ensure_pattern_preview_linked)
 
     # ------------------------------------------------------------------
     # KEYBOARD SHORTCUTS -- function keys for the actions you'd
@@ -2507,10 +2632,9 @@ class BacktestDashboard(QMainWindow):
             self,
             "Keyboard Shortcuts",
             "F2   Snap all panels back to the default layout\n"
-            "        (use this if panels look stacked wrong or won't dock)\n\n"
-            "Arrange panels: drag a panel title bar onto another to tab them; "
-            "drag to the window edge to split side-by-side. "
-            "On Mac, panels stay inside this window (no separate float window).\n\n"
+            "        (use if Pattern & Preview opened in its own window)\n\n"
+            "Arrange panels: drag a panel title onto another to tab them; "
+            "on Mac, panels stay inside this window (no separate float window).\n\n"
             "F5   Run Backtest\n"
             "F6   Open Output Folder\n"
             "F7   Open Charts Folder\n"
@@ -2618,11 +2742,40 @@ class BacktestDashboard(QMainWindow):
             DIRECTION_FIELDS + HAMMER_TYPE_FIELDS,
             defaults_strategy, live_preview=True,
         ), "Direction")
+        dir_hint = QLabel(
+            "<b>Hammer rules (same in backtest and live):</b><br>"
+            "1) <b>Shape</b> — classic = long lower wick; inverted = long upper wick "
+            "(enable each type below; both on = either shape).<br>"
+            "2) <b>Color → trade</b> — green candle uses Green direction; red candle uses Red direction "
+            "(defaults: green→BUY, red→SELL). Applies to classic <i>and</i> inverted.<br>"
+            "3) Use <b>Pattern & Preview</b> BUY / SELL toggles to show green vs red examples."
+        )
+        dir_hint.setObjectName("sectionHint")
+        dir_hint.setWordWrap(True)
+        dir_tab_idx = self._param_tab_hammer_direction
+        dir_tab = self.parameter_tabs.widget(dir_tab_idx)
+        if isinstance(dir_tab, QScrollArea):
+            inner = dir_tab.widget()
+            if inner is not None and inner.layout() is not None:
+                inner.layout().addWidget(dir_hint)
         self._param_tab_doji_direction = tabs.count()
         tabs.addTab(self._make_field_tab(
             DOJI_DIRECTION_FIELDS + DOJI_CANDLE_COLOR_FIELDS,
             defaults_doji_strategy, live_preview=True,
         ), "Doji Direction")
+        doji_hint = QLabel(
+            "<b>Doji rules (same in backtest and live):</b><br>"
+            "1) <b>Style</b> — ANY, Classic, Dragonfly, Gravestone, or Long-legged (shape on Body/Wicks tabs).<br>"
+            "2) <b>Direction mode</b> — wick bias, candle color, fixed buy/sell, or next candle color.<br>"
+            "3) Use <b>Pattern & Preview</b> BUY / SELL toggles; Pattern In Context follows the same preview."
+        )
+        doji_hint.setObjectName("sectionHint")
+        doji_hint.setWordWrap(True)
+        doji_tab = self.parameter_tabs.widget(self._param_tab_doji_direction)
+        if isinstance(doji_tab, QScrollArea):
+            inner = doji_tab.widget()
+            if inner is not None and inner.layout() is not None:
+                inner.layout().addWidget(doji_hint)
         tabs.addTab(self._make_indicator_tab(), "Indicators")
         tabs.addTab(self._make_field_tab(ENTRY_EXIT_FIELDS, defaults_strategy), "Entry / Exit")
         tabs.addTab(self._make_field_tab(RISK_CONTROL_FIELDS, defaults_strategy), "Risk")
@@ -2636,6 +2789,7 @@ class BacktestDashboard(QMainWindow):
         self._apply_pattern_field_visibility()
         if self.pattern_combo.currentText() == "Doji":
             self._fill_empty_doji_widget_defaults()
+        self._sync_preview_toolbar_for_pattern()
         self._redraw_candle_preview()
         self._sync_live_pattern_from_dashboard()
         self._refresh_live_strategy_summary()
@@ -2899,13 +3053,169 @@ class BacktestDashboard(QMainWindow):
         layout = QVBoxLayout(wrap)
         layout.setContentsMargins(10, 10, 10, 10)
 
+        self._preview_trade_side = "BUY"
+        self._preview_hammer_shape = "CLASSIC"
+        layout.addWidget(self._build_preview_toolbar())
+
         sub_tabs = QTabWidget()
-        layout.addWidget(sub_tabs)
+        layout.addWidget(sub_tabs, 1)
 
         sub_tabs.addTab(self._build_signal_shape_tab(), "Signal Shape")
         sub_tabs.addTab(self._build_pattern_context_tab(), "Pattern In Context")
 
         return wrap
+
+    def _build_preview_toolbar(self) -> QWidget:
+        """BUY vs SELL and classic vs inverted preview toggles (hammer + context charts)."""
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 6)
+        outer_layout.setSpacing(6)
+
+        intro = QLabel(
+            "Use the toggles to preview how a valid signal looks for a BUY vs SELL and "
+            "for classic (long lower wick) vs inverted (long upper wick). "
+            "This mirrors logic.py: shape first, then candle color → direction from Parameters → Direction."
+        )
+        intro.setObjectName("sectionHint")
+        intro.setWordWrap(True)
+        self.preview_toolbar_intro = intro
+        outer_layout.addWidget(intro)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Preview trade:"))
+        self.preview_side_buy_btn = QPushButton("BUY (green)")
+        self.preview_side_sell_btn = QPushButton("SELL (red)")
+        for btn in (self.preview_side_buy_btn, self.preview_side_sell_btn):
+            btn.setCheckable(True)
+            btn.setObjectName("previewSideToggle")
+        self.preview_side_buy_btn.setChecked(True)
+        self.preview_side_buy_btn.clicked.connect(lambda: self._set_preview_trade_side("BUY"))
+        self.preview_side_sell_btn.clicked.connect(lambda: self._set_preview_trade_side("SELL"))
+        row.addWidget(self.preview_side_buy_btn)
+        row.addWidget(self.preview_side_sell_btn)
+
+        row.addSpacing(16)
+        self.preview_hammer_shape_row = QWidget()
+        shape_row = QHBoxLayout(self.preview_hammer_shape_row)
+        shape_row.setContentsMargins(0, 0, 0, 0)
+        shape_row.addWidget(QLabel("Preview shape:"))
+        self.preview_shape_classic_btn = QPushButton("Classic hammer")
+        self.preview_shape_inverted_btn = QPushButton("Inverted hammer")
+        for btn in (self.preview_shape_classic_btn, self.preview_shape_inverted_btn):
+            btn.setCheckable(True)
+            btn.setObjectName("previewSideToggle")
+        self.preview_shape_classic_btn.setChecked(True)
+        self.preview_shape_classic_btn.clicked.connect(lambda: self._set_preview_hammer_shape("CLASSIC"))
+        self.preview_shape_inverted_btn.clicked.connect(lambda: self._set_preview_hammer_shape("INVERTED"))
+        shape_row.addWidget(self.preview_shape_classic_btn)
+        shape_row.addWidget(self.preview_shape_inverted_btn)
+        row.addWidget(self.preview_hammer_shape_row)
+        row.addStretch()
+        outer_layout.addLayout(row)
+
+        self.preview_summary_label = QLabel("")
+        self.preview_summary_label.setWordWrap(True)
+        self.preview_summary_label.setObjectName("sectionHint")
+        outer_layout.addWidget(self.preview_summary_label)
+
+        self._sync_preview_toolbar_for_pattern()
+        return outer
+
+    def _sync_preview_toolbar_for_pattern(self):
+        """Hammer vs Doji: show the right preview controls and refresh summary."""
+        if not hasattr(self, "preview_toolbar_intro"):
+            return
+        pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
+        is_doji = pattern == "Doji"
+        if hasattr(self, "preview_hammer_shape_row"):
+            self.preview_hammer_shape_row.setVisible(not is_doji)
+        if is_doji:
+            self.preview_toolbar_intro.setText(
+                "Preview how a doji signal looks for BUY (green) vs SELL (red). "
+                "Shape comes from Parameters → Doji Style and wick/body fields; "
+                "direction comes from Doji Direction (same rules as backtest and live). "
+                "Pattern In Context updates with these toggles."
+            )
+        else:
+            self.preview_toolbar_intro.setText(
+                "Preview hammer signals: BUY vs SELL candle color, classic vs inverted wick shape. "
+                "Matches logic.py and Parameters → Direction. Pattern In Context uses the same settings."
+            )
+            self._sync_preview_shape_toggle_enabled()
+
+    def _set_preview_trade_side(self, side: str):
+        self._preview_trade_side = "SELL" if side == "SELL" else "BUY"
+        self.preview_side_buy_btn.setChecked(self._preview_trade_side == "BUY")
+        self.preview_side_sell_btn.setChecked(self._preview_trade_side == "SELL")
+        self._redraw_candle_preview()
+
+    def _set_preview_hammer_shape(self, shape: str):
+        self._preview_hammer_shape = "INVERTED" if shape == "INVERTED" else "CLASSIC"
+        self.preview_shape_classic_btn.setChecked(self._preview_hammer_shape == "CLASSIC")
+        self.preview_shape_inverted_btn.setChecked(self._preview_hammer_shape == "INVERTED")
+        self._redraw_candle_preview()
+
+    def _sync_preview_shape_toggle_enabled(self):
+        if not hasattr(self, "preview_shape_classic_btn"):
+            return
+        eff = self._effective_hammer_wick_side_value()
+        if eff == "EITHER":
+            self.preview_shape_classic_btn.setEnabled(True)
+            self.preview_shape_inverted_btn.setEnabled(True)
+        elif eff == "UPPER":
+            self._preview_hammer_shape = "INVERTED"
+            self.preview_shape_classic_btn.setEnabled(False)
+            self.preview_shape_inverted_btn.setEnabled(True)
+            self.preview_shape_classic_btn.setChecked(False)
+            self.preview_shape_inverted_btn.setChecked(True)
+        else:
+            self._preview_hammer_shape = "CLASSIC"
+            self.preview_shape_classic_btn.setEnabled(True)
+            self.preview_shape_inverted_btn.setEnabled(False)
+            self.preview_shape_inverted_btn.setChecked(False)
+            self.preview_shape_classic_btn.setChecked(True)
+
+    def _hammer_preview_trade_direction(self) -> logic.TradeDirection:
+        side = getattr(self, "_preview_trade_side", "BUY")
+        return logic.TradeDirection.SELL if side == "SELL" else logic.TradeDirection.BUY
+
+    def _update_preview_summary_label(
+        self,
+        *,
+        pattern: str,
+        variant: str,
+        is_green: bool,
+        trade_side: str,
+        detection_line: str,
+    ):
+        if not hasattr(self, "preview_summary_label"):
+            return
+        color_word = "Green" if is_green else "Red"
+        if pattern == "Doji":
+            self.preview_summary_label.setText(
+                f"Preview: {color_word} doji · {trade_side} trade · {detection_line}"
+            )
+        else:
+            allowed = self._hammer_preview_direction_allowed(variant, trade_side)
+            allow_note = "" if allowed else " (blocked by Direction allow flags)"
+            self.preview_summary_label.setText(
+                f"Preview: {variant} hammer · {color_word} candle · {trade_side} trade · "
+                f"{detection_line}{allow_note}"
+            )
+
+    def _hammer_preview_direction_allowed(self, variant: str, trade_side: str) -> bool:
+        cfg = self._build_hammer_strategy_config()
+        td = logic.TradeDirection.SELL if trade_side == "SELL" else logic.TradeDirection.BUY
+        if variant == logic.HammerVariant.CLASSIC.value:
+            if td == logic.TradeDirection.BUY:
+                return cfg.classic_hammer_allow_buy
+            return cfg.classic_hammer_allow_sell
+        if variant == logic.HammerVariant.INVERTED.value:
+            if td == logic.TradeDirection.BUY:
+                return cfg.inverted_hammer_allow_buy
+            return cfg.inverted_hammer_allow_sell
+        return True
 
     def _build_signal_shape_tab(self) -> QWidget:
         scroll = QScrollArea()
@@ -2917,10 +3227,15 @@ class BacktestDashboard(QMainWindow):
 
         preview_box = QGroupBox("Live Candle Preview")
         preview_layout = QVBoxLayout(preview_box)
+        candle_row = QHBoxLayout()
+        candle_row.addStretch(1)
         self.candle_widget = CandleWidget()
-        self.candle_widget.setMinimumHeight(150)
-        self.candle_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        preview_layout.addWidget(self.candle_widget, 1)
+        self.candle_widget.setMinimumSize(120, 180)
+        self.candle_widget.setMaximumWidth(240)
+        self.candle_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        candle_row.addWidget(self.candle_widget)
+        candle_row.addStretch(1)
+        preview_layout.addLayout(candle_row, 1)
         layout.addWidget(preview_box, 1)
 
         tolerance_box = QGroupBox("Tolerance Range Preview")
@@ -2975,11 +3290,9 @@ class BacktestDashboard(QMainWindow):
         # answers "does everything I'm setting actually line up" --
         # not just an isolated candle shape.
         context_hint = QLabel(
-            "How the current signal candle sits inside a trade idea, per "
-            "timeframe -- entry, stop distance, and profit target scale "
-            "with that timeframe's RR multiple / Max SL settings. Grey "
-            "candles are illustrative context, not real data -- only the "
-            "green/red signal candle reflects your actual settings."
+            "Trade idea per timeframe: ENTRY / SL / TP follow logic.py (BUY: SL at candle low, TP above; "
+            "SELL: SL at candle high, TP below). Uses the Pattern & Preview BUY/SELL toggle — same for "
+            "hammer and doji. Grey candles are illustration only."
         )
         context_hint.setObjectName("sectionHint")
         context_hint.setWordWrap(True)
@@ -3079,20 +3392,30 @@ class BacktestDashboard(QMainWindow):
             self._redraw_hammer_candle_preview()
 
     def _redraw_hammer_candle_preview(self):
+        self._sync_preview_shape_toggle_enabled()
         body_pct = self._get_field_float("body_pct")
         body_tol = self._get_field_float("body_tol")
         dominant_pct = self._get_field_float("dominant_wick_pct")
         dominant_tol = self._get_field_float("dominant_wick_tol")
         small_pct = self._get_field_float("small_wick_pct")
         small_tol = self._get_field_float("small_wick_tol")
-        wick_side = self._get_field_str("hammer_wick_side") or "LOWER"
-        green_direction = self._get_field_str("green_direction") or "BUY"
 
         if None in (body_pct, body_tol, dominant_pct, dominant_tol, small_pct, small_tol):
             return
 
-        is_green = (green_direction == "BUY")
-        self.candle_widget.set_shape(body_pct, dominant_pct, small_pct, wick_side, is_green)
+        try:
+            cfg = self._build_hammer_strategy_config()
+        except Exception:
+            cfg = logic.StrategyConfig()
+
+        trade_dir = self._hammer_preview_trade_direction()
+        trade_side = trade_dir.value
+        is_green = logic.preview_candle_is_green(trade_dir, cfg)
+        shape_choice = getattr(self, "_preview_hammer_shape", "CLASSIC")
+        draw_wick = logic.preview_draw_wick_side(cfg, shape_choice)
+        variant = logic.variant_name_for_draw_wick(draw_wick)
+
+        self.candle_widget.set_shape(body_pct, dominant_pct, small_pct, draw_wick, is_green)
 
         def clamp(v):
             return max(0.0, min(100.0, v))
@@ -3104,13 +3427,30 @@ class BacktestDashboard(QMainWindow):
         small_lo = clamp(small_pct - small_tol)
         small_hi = clamp(small_pct + small_tol)
 
-        self.tolerance_widget_min.set_shape(body_hi, dominant_lo, small_hi, wick_side, is_green)
+        self.tolerance_widget_min.set_shape(body_hi, dominant_lo, small_hi, draw_wick, is_green)
         self.tolerance_label_min.setText(f"Loosest valid shape\nBody: {body_hi:.0f}%  Wick: {dominant_lo:.0f}%")
 
-        self.tolerance_widget_max.set_shape(body_lo, dominant_hi, small_lo, wick_side, is_green)
+        self.tolerance_widget_max.set_shape(body_lo, dominant_hi, small_lo, draw_wick, is_green)
         self.tolerance_label_max.setText(f"Tightest valid shape\nBody: {body_lo:.0f}%  Wick: {dominant_hi:.0f}%")
 
-        self._update_context_charts(body_pct, dominant_pct, small_pct, wick_side, is_green, is_doji=False)
+        if hasattr(self, "tolerance_hint_label"):
+            self.tolerance_hint_label.setText(
+                f"Tolerance band for a valid {variant.lower()} hammer ({draw_wick.lower()} dominant wick). "
+                f"Engine: {logic.describe_hammer_detection(cfg)}"
+            )
+
+        self._update_preview_summary_label(
+            pattern="Hammer",
+            variant=variant,
+            is_green=is_green,
+            trade_side=trade_side,
+            detection_line=logic.describe_hammer_detection(cfg),
+        )
+
+        self._update_context_charts(
+            body_pct, dominant_pct, small_pct, draw_wick, is_green, is_doji=False,
+            hammer_variant=variant, preview_trade_side=trade_side,
+        )
 
     def _doji_preview_is_green(self, lower_wick_pct: float, upper_wick_pct: float) -> bool:
         """Preview BUY/SELL colouring from doji direction settings."""
@@ -3183,6 +3523,14 @@ class BacktestDashboard(QMainWindow):
             body_pct, dominant_pct, small_pct, wick_side, is_green, doji_style,
         ) = self._compute_doji_preview_shape()
 
+        trade_side = getattr(self, "_preview_trade_side", "BUY")
+        trade_dir = logic.TradeDirection.SELL if trade_side == "SELL" else logic.TradeDirection.BUY
+        try:
+            doji_cfg = self._build_doji_strategy_config()
+            is_green = doji_logic.preview_candle_is_green(trade_dir, doji_cfg)
+        except Exception:
+            is_green = trade_side == "BUY"
+
         max_body = self._get_field_float("doji_max_body_pct", shape_defaults.max_body_pct)
         max_body_tol = self._get_field_float("doji_max_body_tol", shape_defaults.max_body_tol)
         min_upper = self._get_field_float("doji_min_upper_wick_pct", shape_defaults.min_upper_wick_pct)
@@ -3229,11 +3577,31 @@ class BacktestDashboard(QMainWindow):
         self._update_context_charts(
             body_pct, dominant_pct, small_pct, wick_side, is_green,
             is_doji=True, doji_style=doji_style,
+            preview_trade_side=trade_side,
         )
+        mode = self._get_field_str("doji_direction_mode") or "WICK_BIAS"
+        try:
+            det = doji_logic.describe_doji_detection(self._build_doji_strategy_config())
+        except Exception:
+            det = f"Doji direction mode: {mode}"
+        self._update_preview_summary_label(
+            pattern="Doji",
+            variant=doji_style or "ANY",
+            is_green=is_green,
+            trade_side=trade_side,
+            detection_line=det,
+        )
+
+        if hasattr(self, "tolerance_hint_label"):
+            self.tolerance_hint_label.setText(
+                f"Tolerance band for doji style {doji_style}. {det}"
+            )
 
     def _update_context_charts(
         self, body_pct, dominant_pct, small_pct, wick_side, is_green, is_doji: bool = False,
         doji_style: str = "",
+        hammer_variant: str = "CLASSIC",
+        preview_trade_side: str = "BUY",
     ):
         defaults = logic.DEFAULT_TIMEFRAME_SETTINGS
         for tf, chart in getattr(self, "context_charts", {}).items():
@@ -3247,24 +3615,50 @@ class BacktestDashboard(QMainWindow):
             except (ValueError, KeyError, AttributeError):
                 max_sl_usd = defaults[tf].max_sl_usd
 
-            ind = self._indicator_preview_state(is_green, wick_side, is_doji)
+            ind = self._indicator_preview_state(
+                is_green, wick_side, is_doji,
+                hammer_variant=hammer_variant,
+                preview_trade_side=preview_trade_side,
+            )
             chart.set_data(
                 body_pct, dominant_pct, small_pct, wick_side, is_green,
                 rr_multiple, max_sl_usd, tf, is_doji=is_doji, doji_style=doji_style,
+                preview_trade_side=preview_trade_side,
                 **ind,
             )
 
-    def _indicator_preview_state(self, is_green: bool, wick_side: str, is_doji: bool) -> dict:
-        """Illustrative ST/VWAP lines for Pattern In Context (matches added indicators)."""
+    def _indicator_preview_state(
+        self,
+        is_green: bool,
+        wick_side: str,
+        is_doji: bool,
+        *,
+        hammer_variant: str = "CLASSIC",
+        preview_trade_side: str = "BUY",
+    ) -> dict:
+        """Illustrative ST/VWAP lines for Pattern In Context (aligned with indicators/filter.py)."""
         show_st = "supertrend" in self.added_indicator_ids
         show_vwap = "vwap" in self.added_indicator_ids
-        inverted = wick_side == "UPPER"
+        direction = (
+            logic.TradeDirection.SELL if preview_trade_side == "SELL" else logic.TradeDirection.BUY
+        )
         if is_doji:
             st_bullish = is_green
             above_vwap = is_green
         else:
-            st_bullish = (not inverted and is_green) or (inverted and not is_green)
-            above_vwap = not inverted
+            variant = hammer_variant or ("INVERTED" if wick_side == "UPPER" else "CLASSIC")
+            if variant == "CLASSIC" and direction == logic.TradeDirection.BUY:
+                st_bullish = True
+                above_vwap = True
+            elif variant == "INVERTED" and direction == logic.TradeDirection.SELL:
+                st_bullish = False
+                above_vwap = False
+            elif variant == "INVERTED" and direction == logic.TradeDirection.BUY:
+                st_bullish = True
+                above_vwap = False
+            else:
+                st_bullish = is_green
+                above_vwap = is_green
         return {
             "preview_show_st": show_st,
             "preview_st_bullish": st_bullish,
@@ -3940,15 +4334,21 @@ class BacktestDashboard(QMainWindow):
             if pattern == "Doji":
                 mode = self._get_field_str("doji_direction_mode") or "WICK_BIAS"
                 style = self._get_field_str("doji_style") or "ANY"
-                detail = f"Doji <b>{style}</b> · direction <b>{mode}</b>"
+                try:
+                    det = doji_logic.describe_doji_detection(self._build_doji_strategy_config())
+                except Exception:
+                    det = f"Doji {style} · {mode}"
+                detail = det
             else:
                 gd = self._get_field_str("green_direction") or "BUY"
                 rd = self._get_field_str("red_direction") or "SELL"
-                classic = self.field_widgets.get("enable_classic_hammer")
-                inverted = self.field_widgets.get("enable_inverted_hammer")
-                c_on = classic.isChecked() if isinstance(classic, QCheckBox) else True
-                i_on = inverted.isChecked() if isinstance(inverted, QCheckBox) else False
-                detail = f"Green→<b>{gd}</b> Red→<b>{rd}</b> · Classic={c_on} Inverted={i_on}"
+                try:
+                    det = logic.describe_hammer_detection(self._build_hammer_strategy_config())
+                except Exception:
+                    det = ""
+                detail = f"Green→<b>{gd}</b> Red→<b>{rd}</b>"
+                if det:
+                    detail += f"<br><span style='color:#5f6368;'>{det}</span>"
         except Exception:
             detail = ""
         tf = self.live_timeframe.currentText() if hasattr(self, "live_timeframe") else "1h"
@@ -4583,6 +4983,21 @@ class BacktestDashboard(QMainWindow):
             kwargs[name] = self._read_ui_field(name, default_val, ftype)
         return logic.HammerRatioConfig(**kwargs)
 
+    def _effective_hammer_wick_side_value(self) -> str:
+        """Wick side used for hammer detection (matches backtest / live)."""
+        defaults = logic.StrategyConfig()
+        classic = self._read_ui_field(
+            "enable_classic_hammer", defaults.enable_classic_hammer, FIELD_TYPE_CHECK,
+        )
+        inverted = self._read_ui_field(
+            "enable_inverted_hammer", defaults.enable_inverted_hammer, FIELD_TYPE_CHECK,
+        )
+        ui_wick = self._read_ui_field(
+            "hammer_wick_side", defaults.hammer_wick_side, FIELD_TYPE_DROPDOWN,
+        )
+        resolved = logic.resolve_hammer_wick_side(classic, inverted, ui_wick)
+        return resolved.value
+
     def _build_hammer_strategy_config(self) -> logic.StrategyConfig:
         hammer_ratios = self._build_hammer_ratio_config()
         kwargs = {"hammer_ratios": hammer_ratios}
@@ -4613,14 +5028,17 @@ class BacktestDashboard(QMainWindow):
             timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
         kwargs["timeframe_settings"] = timeframe_settings
 
-        classic = kwargs.get("enable_classic_hammer", True)
-        inverted = kwargs.get("enable_inverted_hammer", False)
-        if classic and inverted:
-            kwargs["hammer_wick_side"] = logic.WickSide.EITHER
-        elif inverted:
-            kwargs["hammer_wick_side"] = logic.WickSide.UPPER
-        else:
-            kwargs["hammer_wick_side"] = logic.WickSide.LOWER
+        classic = bool(kwargs.get("enable_classic_hammer", True))
+        inverted = bool(kwargs.get("enable_inverted_hammer", True))
+        ui_wick = self._read_ui_field(
+            "hammer_wick_side", defaults.hammer_wick_side, FIELD_TYPE_DROPDOWN,
+        )
+        if isinstance(ui_wick, str):
+            try:
+                ui_wick = logic.WickSide(ui_wick)
+            except ValueError:
+                ui_wick = logic.WickSide.LOWER
+        kwargs["hammer_wick_side"] = logic.resolve_hammer_wick_side(classic, inverted, ui_wick)
 
         return logic.StrategyConfig(**kwargs)
 

@@ -7,11 +7,22 @@ in this file is a named field inside StrategyConfig (Section 2). Nothing
 that affects a trading decision is hardcoded inside a function body.
 Change a config field -> behavior changes. That's it.
 
-DIRECTION RULE:
-    GREEN (bullish, close > open) hammer -> BUY
-    RED   (bearish, close < open) hammer -> SELL
-    (This mapping itself is also a config switch -- see `color_direction_map`
-    if you ever want to flip it or test the opposite mapping.)
+DIRECTION RULE (shape vs color — read both):
+    SHAPE (two independent patterns):
+        CLASSIC  = long LOWER wick (hammer at support)
+        INVERTED = long UPPER wick (inverted hammer / shooting star)
+        Controlled by enable_classic_hammer / enable_inverted_hammer and
+        resolve_hammer_wick_side() -> LOWER | UPPER | EITHER for detection.
+
+    COLOR -> TRADE (same for classic and inverted):
+        GREEN candle (close > open) -> config.green_direction  (default BUY)
+        RED   candle (close < open) -> config.red_direction    (default SELL)
+
+    Example: inverted hammer + red candle -> SELL if red_direction is SELL.
+    Example: classic hammer + green candle -> BUY if green_direction is BUY.
+
+    Per-variant allow flags (classic_hammer_allow_buy/sell, inverted_hammer_allow_*)
+    can block a matched shape without changing detection.
 
 --------------------------------------------------------------------------
 STEP-BY-STEP LOGIC (matches your numbered steps + flowchart)
@@ -327,6 +338,77 @@ class StrategyConfig:
     min_range: float = 1e-9   # floor to avoid divide-by-zero on flat candles
 
 
+def resolve_hammer_wick_side(
+    enable_classic: bool,
+    enable_inverted: bool,
+    ui_wick: WickSide = WickSide.LOWER,
+) -> WickSide:
+    """
+    Map Classic / Inverted toggles to which shapes check_hammer() accepts.
+    When both types are enabled, EITHER (long lower or long upper wick).
+    """
+    if enable_classic and enable_inverted:
+        return WickSide.EITHER
+    if enable_inverted and not enable_classic:
+        return WickSide.UPPER
+    if enable_classic and not enable_inverted:
+        return WickSide.LOWER
+    return ui_wick
+
+
+def describe_hammer_detection(config: StrategyConfig) -> str:
+    """Human-readable summary of which hammer shapes the engine will detect."""
+    enabled: List[str] = []
+    if config.enable_classic_hammer:
+        enabled.append("classic (long lower wick)")
+    if config.enable_inverted_hammer:
+        enabled.append("inverted (long upper wick)")
+    if not enabled:
+        return "No hammer types enabled — no hammer signals."
+    ws = config.hammer_wick_side
+    if not isinstance(ws, WickSide):
+        try:
+            ws = WickSide(str(ws))
+        except ValueError:
+            ws = WickSide.LOWER
+    return f"Detects {' and '.join(enabled)} · wick mode {ws.value}"
+
+
+def preview_candle_is_green(trade_side: TradeDirection, config: StrategyConfig) -> bool:
+    """
+    For UI preview: candle color that would produce trade_side under
+    green_direction / red_direction mapping.
+    """
+    if trade_side == TradeDirection.BUY:
+        if config.green_direction == TradeDirection.BUY:
+            return True
+        if config.red_direction == TradeDirection.BUY:
+            return False
+        return True
+    if config.red_direction == TradeDirection.SELL:
+        return False
+    if config.green_direction == TradeDirection.SELL:
+        return True
+    return False
+
+
+def preview_draw_wick_side(config: StrategyConfig, shape_choice: str) -> str:
+    """LOWER or UPPER string for dashboard candle widgets (shape_choice: CLASSIC | INVERTED)."""
+    ws = config.hammer_wick_side
+    if not isinstance(ws, WickSide):
+        try:
+            ws = WickSide(str(ws))
+        except ValueError:
+            ws = WickSide.LOWER
+    if ws == WickSide.EITHER:
+        return "LOWER" if shape_choice == "CLASSIC" else "UPPER"
+    return ws.value
+
+
+def variant_name_for_draw_wick(draw_wick: str) -> str:
+    return HammerVariant.CLASSIC.value if draw_wick == "LOWER" else HammerVariant.INVERTED.value
+
+
 # ============================================================================
 # SECTION 3: RESULT STRUCTURES
 # ============================================================================
@@ -384,7 +466,9 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
     which wick must be the dominant one (LOWER / UPPER / EITHER).
 
     COLOR -> DIRECTION MAPPING (editable via config.green_direction /
-    config.red_direction, default GREEN->BUY, RED->SELL).
+    config.red_direction, default GREEN->BUY, RED->SELL). Same mapping for
+    CLASSIC and INVERTED shapes — variant only affects shape filters and
+    optional indicator rules (pattern_variant on TradeSignal).
     """
     body_pct, upper_pct, lower_pct = calculate_candle_metrics(candle, config)
 

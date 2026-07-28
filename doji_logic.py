@@ -151,6 +151,44 @@ class DojiStrategyConfig:
     min_range: float = 1e-9
 
 
+def describe_doji_detection(config: DojiStrategyConfig) -> str:
+    """Human-readable doji rules summary (backtest, live log, preview)."""
+    style = config.doji_style
+    mode = config.doji_direction_mode
+    if isinstance(style, DojiStyle):
+        style = style.value
+    if isinstance(mode, DojiDirectionMode):
+        mode = mode.value
+    return f"Doji style {style} · direction mode {mode}"
+
+
+def preview_candle_is_green(trade_side: logic.TradeDirection, config: DojiStrategyConfig) -> bool:
+    """
+    UI preview: candle color that would correspond to trade_side under current doji direction rules.
+    Falls back to green=BUY / red=SELL for WICK_BIAS and similar modes.
+    """
+    mode = config.doji_direction_mode
+    if not isinstance(mode, DojiDirectionMode):
+        try:
+            mode = DojiDirectionMode(str(mode))
+        except ValueError:
+            mode = DojiDirectionMode.WICK_BIAS
+
+    if mode == DojiDirectionMode.CANDLE_COLOR:
+        return logic.preview_candle_is_green(
+            trade_side,
+            logic.StrategyConfig(
+                green_direction=config.green_direction,
+                red_direction=config.red_direction,
+            ),
+        )
+    if mode == DojiDirectionMode.FIXED_BUY:
+        return trade_side == logic.TradeDirection.BUY
+    if mode == DojiDirectionMode.FIXED_SELL:
+        return trade_side == logic.TradeDirection.SELL
+    return trade_side == logic.TradeDirection.BUY
+
+
 # ============================================================================
 # SECTION 4: RESULT STRUCTURE
 # ============================================================================

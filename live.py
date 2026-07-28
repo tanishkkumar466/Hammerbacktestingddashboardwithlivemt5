@@ -57,15 +57,14 @@ def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_typ
     ]
 
     if pattern_type == "doji":
-        parts.append(
-            f"doji_style={getattr(strategy_config, 'doji_style', '—')} "
-            f"dir={getattr(strategy_config, 'doji_direction_mode', '—')}"
-        )
+        parts.append(doji_logic.describe_doji_detection(strategy_config))
     else:
         parts.append(
-            f"green→{getattr(strategy_config, 'green_direction', '—')} "
-            f"red→{getattr(strategy_config, 'red_direction', '—')}"
+            f"green→{getattr(getattr(strategy_config, 'green_direction', None), 'value', getattr(strategy_config, 'green_direction', '—'))} "
+            f"red→{getattr(getattr(strategy_config, 'red_direction', None), 'value', getattr(strategy_config, 'red_direction', '—'))}"
         )
+        if hasattr(strategy_config, "enable_classic_hammer"):
+            parts.append(logic.describe_hammer_detection(strategy_config))
     return " | ".join(str(p) for p in parts)
 
 
@@ -142,20 +141,20 @@ def _signal_key(sig: logic.TradeSignal) -> Tuple:
     return (sig.hammer_candle.timestamp, sig.direction.value, sig.timeframe)
 
 
-def find_actionable_signal(
+def find_bar_signal_outcome(
     closed: List[logic.Candle],
     forming: logic.Candle,
     timeframe_logic_label: str,
     pattern_type: str,
     strategy_config,
     indicator_stack,
-) -> Optional[logic.TradeSignal]:
-    """Signal on last closed bar with entry on the forming bar.
-
-    timeframe_logic_label must match strategy config keys (1m, 1h, …), not MT5 folder names (1min, 1hour).
+) -> Tuple[Optional[logic.TradeSignal], Optional[logic.TradeSignal]]:
+    """
+    Returns (actionable_signal, ignored_on_this_bar).
+    ignored_on_this_bar is set when a pattern matched the last closed bar but was filtered.
     """
     if len(closed) < 3:
-        return None
+        return None, None
 
     extended = closed + [forming]
     if pattern_type == "doji":
@@ -174,15 +173,35 @@ def find_actionable_signal(
     signal_bar_ts = closed[-1].timestamp
     entry_bar_ts = forming.timestamp
 
+    ignored_match: Optional[logic.TradeSignal] = None
     for sig in reversed(signals):
-        if sig.ignored:
-            continue
         if sig.hammer_candle.timestamp != signal_bar_ts:
             continue
         if sig.entry_candle.timestamp != entry_bar_ts:
             continue
-        return sig
-    return None
+        if sig.ignored:
+            ignored_match = sig
+            continue
+        return sig, None
+    return None, ignored_match
+
+
+def find_actionable_signal(
+    closed: List[logic.Candle],
+    forming: logic.Candle,
+    timeframe_logic_label: str,
+    pattern_type: str,
+    strategy_config,
+    indicator_stack,
+) -> Optional[logic.TradeSignal]:
+    """Signal on last closed bar with entry on the forming bar.
+
+    timeframe_logic_label must match strategy config keys (1m, 1h, …), not MT5 folder names (1min, 1hour).
+    """
+    actionable, _ignored = find_bar_signal_outcome(
+        closed, forming, timeframe_logic_label, pattern_type, strategy_config, indicator_stack,
+    )
+    return actionable
 
 
 class LiveTradingEngine:
@@ -238,7 +257,7 @@ class LiveTradingEngine:
 
             @ray.remote
             def _ray_find(closed, forming, logic_tf, pattern_type, strategy_config, indicator_stack):
-                return find_actionable_signal(
+                return find_bar_signal_outcome(
                     closed, forming, logic_tf, pattern_type, strategy_config, indicator_stack,
                 )
 
@@ -439,12 +458,12 @@ class LiveTradingEngine:
 
         return None
 
-    def _compute_signal(
+    def _compute_signal_outcome(
         self,
         closed: List[logic.Candle],
         forming: logic.Candle,
         logic_tf: str,
-    ) -> Optional[logic.TradeSignal]:
+    ) -> Tuple[Optional[logic.TradeSignal], Optional[logic.TradeSignal]]:
         args = (
             closed, forming, logic_tf, self.pattern_type,
             self.strategy_config, self.indicator_stack,
@@ -458,14 +477,23 @@ class LiveTradingEngine:
                 self.log(f"[WARN] Ray signal step failed, using thread pool: {e}")
 
         if self._executor is not None:
-            fut = self._executor.submit(find_actionable_signal, *args)
+            fut = self._executor.submit(find_bar_signal_outcome, *args)
             try:
                 return fut.result(timeout=SIGNAL_COMPUTE_TIMEOUT_SEC)
             except FuturesTimeoutError:
                 self.log("[ERROR] Signal computation timed out.")
-                return None
+                return None, None
 
-        return find_actionable_signal(*args)
+        return find_bar_signal_outcome(*args)
+
+    def _compute_signal(
+        self,
+        closed: List[logic.Candle],
+        forming: logic.Candle,
+        logic_tf: str,
+    ) -> Optional[logic.TradeSignal]:
+        sig, _ignored = self._compute_signal_outcome(closed, forming, logic_tf)
+        return sig
 
     def _resolve_live_order(
         self,
@@ -586,9 +614,15 @@ class LiveTradingEngine:
         self._last_closed_bar_ts = last_ts
         self.log(f"[LIVE] New closed bar {last_ts}")
 
-        sig = self._compute_signal(closed, forming, config_timeframe_label)
+        sig, ignored = self._compute_signal_outcome(closed, forming, config_timeframe_label)
         if sig is None:
-            self.log("[LIVE] No new valid signal on this bar.")
+            if ignored is not None and ignored.ignore_reason:
+                variant = getattr(ignored, "pattern_variant", None) or "—"
+                self.log(
+                    f"[LIVE] Pattern on bar but not traded ({variant}): {ignored.ignore_reason}"
+                )
+            else:
+                self.log("[LIVE] No new valid signal on this bar.")
             return
 
         key = _signal_key(sig)
