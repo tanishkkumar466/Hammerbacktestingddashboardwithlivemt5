@@ -258,6 +258,7 @@ class MT5Broker:
             high=hi,
             low=lo,
             close=last,
+            volume=forming.volume,
         )
 
     @staticmethod
@@ -350,12 +351,17 @@ class MT5Broker:
 
         def _to_candle(r) -> logic.Candle:
             ts = self._rate_bar_time(r)
+            try:
+                vol = float(r["tick_volume"])
+            except (KeyError, ValueError, IndexError):
+                vol = 0.0
             return logic.Candle(
                 timestamp=ts,
                 open=float(r["open"]),
                 high=float(r["high"]),
                 low=float(r["low"]),
                 close=float(r["close"]),
+                volume=vol,
             )
 
         try:

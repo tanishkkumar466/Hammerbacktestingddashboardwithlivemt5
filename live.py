@@ -132,9 +132,24 @@ def _candles_to_polars(closed: List[logic.Candle], forming: logic.Candle) -> pl.
             "high": c.high,
             "low": c.low,
             "close": c.close,
-            "volume": 0.0,
+            # Real MT5 tick volume — VWAP is wrong without it.
+            "volume": float(getattr(c, "volume", 0.0) or 0.0),
         })
     return pl.DataFrame(rows)
+
+
+def describe_candle(c: logic.Candle) -> str:
+    """Human-readable bar snapshot for the live log (color decides BUY/SELL)."""
+    if c.close > c.open:
+        color = "GREEN"
+    elif c.close < c.open:
+        color = "RED"
+    else:
+        color = "DOJI"
+    return (
+        f"{c.timestamp} O={c.open:.2f} H={c.high:.2f} L={c.low:.2f} "
+        f"C={c.close:.2f} ({color})"
+    )
 
 
 def _signal_key(sig: logic.TradeSignal) -> Tuple:
@@ -373,7 +388,13 @@ class LiveTradingEngine:
         self._session_start_equity = float(info.get("equity") or info.get("balance") or 0.0)
         self._reset_daily_counters_if_needed()
 
-        inds = ", ".join(self.indicator_stack.enabled_indicator_ids()) or "none"
+        enabled_inds = self.indicator_stack.enabled_indicator_ids()
+        inds = ", ".join(enabled_inds) or "none"
+        if not enabled_inds:
+            self.log(
+                "[WARN] No indicator filters active — SuperTrend/VWAP will NOT gate trades. "
+                "To use them: Backtest Parameters → Indicators → Add, then Stop and Start live again."
+            )
         if self._journal_dir:
             self.log(f"[LIVE] Journal folder: {self._journal_dir}")
             self.log(f"[LIVE] Session log: {session_log_path(self._journal_dir)}")
@@ -612,7 +633,9 @@ class LiveTradingEngine:
             return
 
         self._last_closed_bar_ts = last_ts
-        self.log(f"[LIVE] New closed bar {last_ts}")
+        # Log the broker's bar explicitly: this is the candle signals are based
+        # on. It can differ from TradingView (different feed / bar boundaries).
+        self.log(f"[LIVE] New closed bar (broker feed): {describe_candle(closed[-1])}")
 
         sig, ignored = self._compute_signal_outcome(closed, forming, config_timeframe_label)
         if sig is None:
@@ -636,8 +659,10 @@ class LiveTradingEngine:
             self.log(f"[LIVE] Max open positions ({cfg.max_open_positions}) — skip.")
             return
 
+        variant = getattr(sig, "pattern_variant", None) or "—"
         self.log(
-            f"[SIGNAL] {sig.direction.value} entry≈{sig.entry_price:.2f} "
+            f"[SIGNAL] {sig.direction.value} ({variant}) on bar "
+            f"{describe_candle(sig.hammer_candle)} | entry≈{sig.entry_price:.2f} "
             f"SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"
         )
         self._record_trade_event("SIGNAL", sig, volume=cfg.volume, dry_run=cfg.dry_run)

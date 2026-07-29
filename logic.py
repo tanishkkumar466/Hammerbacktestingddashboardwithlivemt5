@@ -102,12 +102,14 @@ class Candle:
     A single OHLC candle.
     timestamp : any identifier (datetime, string, index...)
     open, high, low, close : prices
+    volume    : bar volume (MT5 tick_volume in live) — needed for real VWAP
     """
     timestamp: object
     open: float
     high: float
     low: float
     close: float
+    volume: float = 0.0
 
     @property
     def range_(self) -> float:

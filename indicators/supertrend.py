@@ -47,12 +47,15 @@ def compute_supertrend(
     for i in range(1, n):
         if np.isnan(atr[i]):
             continue
-        if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+        # First bar after ATR warmup has NaN previous bands — start fresh
+        # from the basic bands (otherwise NaN propagates through the whole
+        # series and the SuperTrend filter silently never fires).
+        if np.isnan(final_upper[i - 1]) or basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
             final_upper[i] = basic_upper[i]
         else:
             final_upper[i] = final_upper[i - 1]
 
-        if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+        if np.isnan(final_lower[i - 1]) or basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
             final_lower[i] = basic_lower[i]
         else:
             final_lower[i] = final_lower[i - 1]

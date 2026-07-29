@@ -33,56 +33,50 @@ def _build_series(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
 
 
 def _supertrend_passes(
-    variant: str,
     direction: logic.TradeDirection,
     close: float,
     st_line: float,
     st_dir: int,
 ) -> Tuple[bool, str]:
+    """
+    Direction-based rule, applied to EVERY trade (classic, inverted, doji):
+      BUY  -> SuperTrend must be bullish (green) AND close above the line.
+      SELL -> SuperTrend must be bearish (red)  AND close below the line.
+    A SELL while SuperTrend is green is always rejected.
+    """
     if np.isnan(st_line):
         return True, ""
 
-    if variant == "CLASSIC" and direction == logic.TradeDirection.BUY:
+    if direction == logic.TradeDirection.BUY:
         if st_dir != 1:
-            return False, "SuperTrend filter: classic BUY requires bullish (green) SuperTrend."
+            return False, "SuperTrend filter: BUY requires bullish (green) SuperTrend — it is bearish."
         if close <= st_line:
-            return False, "SuperTrend filter: classic BUY requires close above SuperTrend line."
+            return False, "SuperTrend filter: BUY requires close above the SuperTrend line."
         return True, ""
 
-    if variant == "INVERTED" and direction == logic.TradeDirection.SELL:
+    if direction == logic.TradeDirection.SELL:
         if st_dir != -1:
-            return False, "SuperTrend filter: inverted SELL requires bearish (red) SuperTrend."
+            return False, "SuperTrend filter: SELL requires bearish (red) SuperTrend — it is bullish."
         if close >= st_line:
-            return False, "SuperTrend filter: inverted SELL requires close below SuperTrend line."
+            return False, "SuperTrend filter: SELL requires close below the SuperTrend line."
         return True, ""
 
-    # Other variant/direction combos: no extra ST rule (pass)
     return True, ""
 
 
-def _vwap_passes(variant: str, direction: logic.TradeDirection, close: float, vwap: float) -> Tuple[bool, str]:
+def _vwap_passes(direction: logic.TradeDirection, close: float, vwap: float) -> Tuple[bool, str]:
+    """
+    Direction-based rule, applied to EVERY trade:
+      BUY  -> close must be above VWAP.
+      SELL -> close must be below VWAP.
+    """
     if np.isnan(vwap):
         return True, ""
 
-    above = close > vwap
-    below = close < vwap
-
-    if variant == "CLASSIC":
-        if direction == logic.TradeDirection.BUY:
-            if not above:
-                return False, "VWAP filter: classic hammer BUY requires close above VWAP."
-            return True, ""
-        return True, ""
-
-    if variant == "INVERTED":
-        if direction == logic.TradeDirection.SELL:
-            if not below:
-                return False, "VWAP filter: inverted hammer SELL requires close below VWAP."
-            return True, ""
-        if above:
-            return False, "VWAP filter: inverted hammer above VWAP — no trade."
-        return True, ""
-
+    if direction == logic.TradeDirection.BUY and close <= vwap:
+        return False, "VWAP filter: BUY requires close above VWAP."
+    if direction == logic.TradeDirection.SELL and close >= vwap:
+        return False, "VWAP filter: SELL requires close below VWAP."
     return True, ""
 
 
@@ -101,7 +95,7 @@ def apply_indicator_filters(
         atr_period=stack.supertrend.atr_period,
         multiplier=stack.supertrend.multiplier,
     )
-    vwap = compute_vwap(high, low, close, vol)
+    vwap = compute_vwap(high, low, close, vol, timestamps=timestamps)
 
     out: List[logic.TradeSignal] = []
     for sig in signals:
@@ -114,18 +108,17 @@ def apply_indicator_filters(
             out.append(sig)
             continue
 
-        variant = getattr(sig, "pattern_variant", None) or "CLASSIC"
         c = float(close[idx])
         checks: List[Tuple[bool, str]] = []
 
         if stack.supertrend.enabled and stack.supertrend.apply_trade_filter:
             ok, reason = _supertrend_passes(
-                variant, sig.direction, c, float(st_line[idx]), int(st_dir[idx]),
+                sig.direction, c, float(st_line[idx]), int(st_dir[idx]),
             )
             checks.append((ok, reason))
 
         if stack.vwap.enabled and stack.vwap.apply_trade_filter:
-            ok, reason = _vwap_passes(variant, sig.direction, c, float(vwap[idx]))
+            ok, reason = _vwap_passes(sig.direction, c, float(vwap[idx]))
             checks.append((ok, reason))
 
         if not checks:
