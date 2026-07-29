@@ -191,8 +191,14 @@ def indicator_snapshot_text(
                 parts.append(f"SuperTrend({st_cfg.atr_period},{st_cfg.multiplier}): warmup (not enough bars)")
             else:
                 state = "GREEN (bullish)" if d == 1 else "RED (bearish)"
+                # Walk back to the last flip so users can compare the flip
+                # time with their chart (feeds can flip minutes apart).
+                flip_i = idx
+                while flip_i > 0 and st_dir[flip_i - 1] == d:
+                    flip_i -= 1
+                since = f" since {ts[flip_i]}" if flip_i > 0 else ""
                 parts.append(
-                    f"SuperTrend({st_cfg.atr_period},{st_cfg.multiplier})={state} "
+                    f"SuperTrend({st_cfg.atr_period},{st_cfg.multiplier})={state}{since} "
                     f"line={line:.2f} close={'above' if c > line else 'below'}"
                 )
 
@@ -448,6 +454,16 @@ class LiveTradingEngine:
             self.log(
                 "[WARN] No indicator filters active — SuperTrend/VWAP will NOT gate trades. "
                 "To use them: Backtest Parameters → Indicators → Add, then Stop and Start live again."
+            )
+        if self.indicator_stack.supertrend.enabled and not self.indicator_stack.supertrend.apply_trade_filter:
+            self.log(
+                "[WARN] SuperTrend is added but 'Apply trade filter' is UNCHECKED — "
+                "it will NOT block any trades. Check the box in Indicators and restart live."
+            )
+        if self.indicator_stack.vwap.enabled and not self.indicator_stack.vwap.apply_trade_filter:
+            self.log(
+                "[WARN] VWAP is added but 'Apply trade filter' is UNCHECKED — "
+                "it will NOT block any trades. Check the box in Indicators and restart live."
             )
         if self._journal_dir:
             self.log(f"[LIVE] Journal folder: {self._journal_dir}")
@@ -732,6 +748,10 @@ class LiveTradingEngine:
             f"{describe_candle(sig.hammer_candle)} | entry≈{sig.entry_price:.2f} "
             f"SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"
         )
+        # Record WHY this trade was allowed: indicator values at decision time.
+        allow_snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
+        if allow_snapshot:
+            self.log(f"[SIGNAL] Allowed by indicators ({sym} {cfg.timeframe_label}): {allow_snapshot}")
         self._record_trade_event("SIGNAL", sig, volume=cfg.volume, dry_run=cfg.dry_run)
 
         if cfg.dry_run:

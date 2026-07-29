@@ -720,10 +720,10 @@ INDICATOR_WIDGET_GROUPS: Dict[str, List[tuple]] = {
     "supertrend": [
         ("indicators_st_atr_period", "ATR period", FIELD_TYPE_TEXT, None),
         ("indicators_st_multiplier", "Multiplier", FIELD_TYPE_TEXT, None),
-        ("indicators_st_apply_filter", "Apply trade filter in backtest", FIELD_TYPE_CHECK, None),
+        ("indicators_st_apply_filter", "Apply trade filter (backtest + live)", FIELD_TYPE_CHECK, None),
     ],
     "vwap": [
-        ("indicators_vwap_apply_filter", "Apply trade filter in backtest", FIELD_TYPE_CHECK, None),
+        ("indicators_vwap_apply_filter", "Apply trade filter (backtest + live)", FIELD_TYPE_CHECK, None),
     ],
 }
 
