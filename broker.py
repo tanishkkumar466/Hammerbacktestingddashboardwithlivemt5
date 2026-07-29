@@ -49,6 +49,11 @@ class MT5Broker:
     def __init__(self):
         self._mt5: Any = None
         self._connected = False
+        # Last tick-merged forming bar per (symbol, timeframe) — used to fix MT5
+        # history lag when a bar closes (copy_rates often lags; ticks do not).
+        self._forming_cache: Dict[Tuple[str, str], logic.Candle] = {}
+        # Completed bars built from tick stream (authoritative OHLC on rollover).
+        self._finalized_bars: Dict[Tuple[str, str], Dict[datetime, logic.Candle]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -100,6 +105,8 @@ class MT5Broker:
                 pass
         self._mt5 = None
         self._connected = False
+        self._forming_cache.clear()
+        self._finalized_bars.clear()
 
     def account_info_dict(self) -> Dict[str, Any]:
         if not self.is_connected:
@@ -276,6 +283,129 @@ class MT5Broker:
         closed_rs = by_time[:-1]
         return forming_r, closed_rs
 
+    def _copy_rates_live(
+        self,
+        sym: str,
+        tf_const: Any,
+        count: int,
+        tick: Any,
+        _to_candle_fn,
+    ) -> Tuple[Any, str]:
+        """
+        Pull history two ways and pick the series whose forming bar best matches
+        the live tick (MT5 from_pos cache often lags copy_rates_from(now)).
+        """
+        candidates: List[Tuple[str, Any]] = []
+        now_utc = datetime.now(timezone.utc)
+        r_from = self._mt5.copy_rates_from(sym, tf_const, now_utc, count)
+        if r_from is not None and len(r_from) > 0:
+            candidates.append(("copy_rates_from", r_from))
+        r_pos = self._mt5.copy_rates_from_pos(sym, tf_const, 0, count)
+        if r_pos is not None and len(r_pos) > 0:
+            candidates.append(("copy_rates_from_pos", r_pos))
+
+        if not candidates:
+            return None, "none"
+
+        bid = 0.0
+        if tick is not None:
+            bid = float(getattr(tick, "bid", 0) or 0)
+            if bid <= 0:
+                bid = float(getattr(tick, "ask", 0) or 0)
+
+        best_rates = candidates[0][1]
+        best_src = candidates[0][0]
+        best_score = float("inf")
+
+        for src, rates in candidates:
+            try:
+                forming_r, _ = self._split_mt5_rates(rates)
+                forming_c = _to_candle_fn(forming_r)
+                forming_c = self._merge_tick_into_forming(forming_c, tick)
+                score = abs(forming_c.close - bid) if bid > 0 else 0.0
+            except (ValueError, TypeError, KeyError):
+                score = float("inf")
+            if score < best_score:
+                best_score = score
+                best_rates = rates
+                best_src = src
+
+        return best_rates, best_src
+
+    def _apply_finalized_bars(
+        self,
+        sym: str,
+        timeframe_label: str,
+        closed: List[logic.Candle],
+        meta: Dict[str, Any],
+    ) -> List[logic.Candle]:
+        key = (sym, timeframe_label)
+        fin = self._finalized_bars.get(key)
+        if not fin:
+            return closed
+        out: List[logic.Candle] = []
+        for c in closed:
+            alt = fin.get(c.timestamp)
+            if alt is not None and (
+                abs(alt.close - c.close) > 0.009
+                or abs(alt.high - c.high) > 0.009
+                or abs(alt.low - c.low) > 0.009
+            ):
+                meta.setdefault("finalized_overlays", []).append(c.timestamp)
+                out.append(alt)
+            else:
+                out.append(c)
+        return out
+
+    def _patch_closed_with_cached_forming(
+        self,
+        sym: str,
+        timeframe_label: str,
+        closed: List[logic.Candle],
+        forming: logic.Candle,
+        meta: Dict[str, Any],
+    ) -> List[logic.Candle]:
+        key = (sym, timeframe_label)
+        prev = self._forming_cache.get(key)
+        self._forming_cache[key] = forming
+
+        if prev is None or prev.timestamp == forming.timestamp:
+            return closed
+
+        # Bar rolled — previous tick-merged forming is the true finalized OHLC.
+        fin = self._finalized_bars.setdefault(key, {})
+        fin[prev.timestamp] = prev
+        if len(fin) > 600:
+            for ts in sorted(fin.keys())[:-600]:
+                fin.pop(ts, None)
+
+        patched = list(closed)
+        replaced = False
+        for i in range(len(patched) - 1, -1, -1):
+            if patched[i].timestamp == prev.timestamp:
+                meta["bar_cache_patched"] = True
+                meta["bar_cache_patched_time"] = prev.timestamp
+                meta["mt5_closed_close_before"] = patched[i].close
+                meta["tick_merged_close_after"] = prev.close
+                patched[i] = prev
+                replaced = True
+                break
+
+        if not replaced:
+            if not patched or patched[-1].timestamp < prev.timestamp:
+                meta["bar_cache_appended"] = True
+                meta["bar_cache_patched_time"] = prev.timestamp
+                patched.append(prev)
+            elif patched[-1].timestamp == prev.timestamp:
+                meta["bar_cache_patched"] = True
+                meta["bar_cache_patched_time"] = prev.timestamp
+                meta["mt5_closed_close_before"] = patched[-1].close
+                meta["tick_merged_close_after"] = prev.close
+                patched[-1] = prev
+
+        patched.sort(key=lambda c: c.timestamp)
+        return patched
+
     def fetch_rates(
         self,
         symbol: str,
@@ -310,45 +440,6 @@ class MT5Broker:
                 int(getattr(tick, "time", 0) or 0), tz=timezone.utc,
             ).replace(tzinfo=None)
 
-        rates = self._mt5.copy_rates_from_pos(sym, tf_const, 0, count)
-        if rates is None or len(rates) == 0:
-            err = self._mt5.last_error()
-            return [], None, f"No rates for {sym} {timeframe_label}: {err}", meta
-
-        try:
-            forming_r_probe, _ = self._split_mt5_rates(rates)
-            forming_ts = self._rate_bar_time(forming_r_probe)
-        except ValueError:
-            forming_ts = self._rate_bar_time(rates[-1])
-        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-        forming_age = (now_naive - forming_ts).total_seconds()
-        meta["forming_bar_time"] = forming_ts
-        meta["forming_age_sec"] = forming_age
-
-        if forming_age > tf_sec * 2.5 or forming_age < -tf_sec:
-            rates_alt = self._mt5.copy_rates_from(
-                sym, tf_const, datetime.now(timezone.utc), count,
-            )
-            if rates_alt is not None and len(rates_alt) > 0:
-                try:
-                    _f_alt, _c_alt = self._split_mt5_rates(rates_alt)
-                    alt_ts = self._rate_bar_time(_f_alt)
-                    alt_age = (now_naive - alt_ts).total_seconds()
-                    if abs(alt_age) < abs(forming_age):
-                        rates = rates_alt
-                        meta["rates_source"] = "copy_rates_from"
-                        forming_ts = alt_ts
-                        meta["forming_bar_time"] = forming_ts
-                        meta["forming_age_sec"] = alt_age
-                        forming_age = alt_age
-                except ValueError:
-                    pass
-            if forming_age > tf_sec * 3:
-                meta["stale_warning"] = (
-                    f"Forming bar time {forming_ts} looks stale vs clock "
-                    f"(age {forming_age:.0f}s). Check MT5 quotes / symbol {sym}."
-                )
-
         def _to_candle(r) -> logic.Candle:
             ts = self._rate_bar_time(r)
             try:
@@ -364,6 +455,29 @@ class MT5Broker:
                 volume=vol,
             )
 
+        rates, rates_source = self._copy_rates_live(sym, tf_const, count, tick, _to_candle)
+        meta["rates_source"] = rates_source
+        if rates is None or len(rates) == 0:
+            err = self._mt5.last_error()
+            return [], None, f"No rates for {sym} {timeframe_label}: {err}", meta
+
+        try:
+            forming_r_probe, _ = self._split_mt5_rates(rates)
+            forming_ts = self._rate_bar_time(forming_r_probe)
+        except ValueError:
+            forming_ts = self._rate_bar_time(rates[-1])
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        forming_age = (now_naive - forming_ts).total_seconds()
+        meta["forming_bar_time"] = forming_ts
+        meta["forming_age_sec"] = forming_age
+        meta["server_now_utc"] = now_naive
+
+        if forming_age > tf_sec * 3:
+            meta["stale_warning"] = (
+                f"Forming bar time {forming_ts} looks stale vs UTC now "
+                f"(age {forming_age:.0f}s). Check MT5 quotes / symbol {sym}."
+            )
+
         try:
             forming_r, closed_rs = self._split_mt5_rates(rates)
         except ValueError:
@@ -373,9 +487,14 @@ class MT5Broker:
         forming = self._merge_tick_into_forming(forming, tick)
         meta["forming_close"] = forming.close
         closed = [_to_candle(r) for r in closed_rs]
+        closed = self._patch_closed_with_cached_forming(sym, timeframe_label, closed, forming, meta)
+        closed = self._apply_finalized_bars(sym, timeframe_label, closed, meta)
         if closed:
             meta["last_closed_time"] = closed[-1].timestamp
             meta["last_closed_close"] = closed[-1].close
+        bid = meta.get("bid")
+        if bid is not None and closed:
+            meta["tick_vs_last_closed"] = float(bid) - float(closed[-1].close)
         return closed, forming, "", meta
 
     def fetch_rates_legacy(
