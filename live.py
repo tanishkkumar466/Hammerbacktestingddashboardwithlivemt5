@@ -702,7 +702,11 @@ class LiveTradingEngine:
                     f"[LIVE] Pattern on bar but not traded ({variant}): {ignored.ignore_reason}"
                 )
             else:
-                self.log("[LIVE] No new valid signal on this bar.")
+                self.log(
+                    f"[LIVE] No {self.pattern_label} pattern on this closed bar — no trade. "
+                    "(Indicators only FILTER pattern signals; SuperTrend/VWAP being bullish "
+                    "never opens a trade by itself.)"
+                )
             return
 
         key = _signal_key(sig)
