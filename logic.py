@@ -87,6 +87,8 @@ FLOWCHART (unchanged, exactly as given)
     Place BUY Order (GREEN hammer)  /  Place SELL Order (RED hammer)
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Dict, List, Tuple
