@@ -3820,9 +3820,9 @@ class BacktestDashboard(QMainWindow):
         outer.setContentsMargins(12, 12, 12, 12)
 
         hint = QLabel(
-            "Add indicators from the dropdown, tune parameters below, and turn on "
-            "“Apply trade filter in backtest” to enforce rules after hammer signals. "
-            "Pattern In Context shows illustrative ST/VWAP lines only."
+            "Add indicators from the dropdown (required — adding alone enables them), tune parameters, "
+            "and keep “Apply trade filter (backtest + live)” checked to block trades that fail "
+            "SuperTrend/VWAP on the same timeframe as live trading. Stop and Start live after changes."
         )
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
@@ -4292,6 +4292,32 @@ class BacktestDashboard(QMainWindow):
         notes.append(f"Journal: {session_log_path(live_cfg.journal_dir)}")
         return notes
 
+    def _live_indicator_preflight_lines(self, stack: IndicatorStackConfig) -> List[str]:
+        lines: List[str] = []
+        enabled = stack.enabled_indicator_ids()
+        if not enabled:
+            lines.append(
+                "⚠ No indicators added (Parameters → Indicators → Add). "
+                "SuperTrend/VWAP will NOT block trades until you add them and restart live."
+            )
+            return lines
+        if stack.supertrend.enabled:
+            filt = "ON" if stack.supertrend.apply_trade_filter else "OFF — will NOT block trades"
+            lines.append(
+                f"SuperTrend filter {filt} (ATR={stack.supertrend.atr_period}, "
+                f"mult={stack.supertrend.multiplier}) on live timeframe only."
+            )
+        if stack.vwap.enabled:
+            filt = "ON" if stack.vwap.apply_trade_filter else "OFF — will NOT block trades"
+            lines.append(f"VWAP session filter {filt} on live timeframe only.")
+        if len(enabled) >= 2:
+            lines.append(f"Combine mode: {stack.combine_mode.value}")
+        lines.append(
+            "Indicators use MT5 broker bars for the selected live timeframe "
+            "(may differ slightly from TradingView feed)."
+        )
+        return lines
+
     def _live_order_mode_value(self) -> str:
         if not hasattr(self, "live_order_mode"):
             return "market"
@@ -4635,6 +4661,7 @@ class BacktestDashboard(QMainWindow):
             return
 
         preflight = self._live_preflight_notes(live_cfg)
+        preflight.extend(self._live_indicator_preflight_lines(indicator_stack))
         tf_set = tf_settings.get(live_tf)
         if tf_set is not None:
             preflight.append(

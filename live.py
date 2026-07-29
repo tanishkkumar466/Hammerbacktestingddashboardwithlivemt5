@@ -21,7 +21,7 @@ import polars as pl
 import doji_logic
 import logic
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
-from indicators.filter import apply_indicator_filters
+from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
 
 
@@ -740,6 +740,24 @@ class LiveTradingEngine:
             open_count = self.broker.count_open_positions(sym, cfg.magic)
         if open_count >= cfg.max_open_positions:
             self.log(f"[LIVE] Max open positions ({cfg.max_open_positions}) — skip.")
+            return
+
+        # Hard gate (fail-closed): never send an order if indicators reject this bar.
+        signal_bar_index = len(closed) - 1
+        df_bars = _candles_to_polars(closed, forming)
+        ind_ok, ind_reason = verify_signal_passes_indicators_at_bar(
+            df_bars,
+            signal_bar_index,
+            sig.direction,
+            self.indicator_stack,
+        )
+        if not ind_ok:
+            self.log(
+                f"[LIVE] Order blocked on {cfg.timeframe_label} — {ind_reason}"
+            )
+            allow_snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
+            if allow_snapshot:
+                self.log(f"[LIVE] Indicators at signal bar: {allow_snapshot}")
             return
 
         variant = getattr(sig, "pattern_variant", None) or "—"
