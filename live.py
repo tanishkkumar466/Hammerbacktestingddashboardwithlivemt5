@@ -680,7 +680,13 @@ class LiveTradingEngine:
         last_ts = closed[-1].timestamp
         if self._last_closed_bar_ts is None:
             self._last_closed_bar_ts = last_ts
-            self.log(f"[LIVE] Watching bars — last closed {last_ts}")
+            self.log(f"[LIVE] Watching bars — last closed {describe_candle(closed[-1])}")
+            snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
+            if snapshot:
+                self.log(
+                    f"[LIVE] Indicators right now ({cfg.timeframe_label}, broker feed): {snapshot} — "
+                    "compare these numbers with YOUR chart on the SAME timeframe."
+                )
             return
 
         if last_ts == self._last_closed_bar_ts:

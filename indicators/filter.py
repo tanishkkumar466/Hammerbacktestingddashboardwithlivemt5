@@ -49,16 +49,28 @@ def _supertrend_passes(
 
     if direction == logic.TradeDirection.BUY:
         if st_dir != 1:
-            return False, "SuperTrend filter: BUY requires bullish (green) SuperTrend — it is bearish."
+            return False, (
+                f"SuperTrend filter: BUY requires bullish (green) SuperTrend — computed state is "
+                f"bearish here (line={st_line:.2f}, close={close:.2f})."
+            )
         if close <= st_line:
-            return False, "SuperTrend filter: BUY requires close above the SuperTrend line."
+            return False, (
+                f"SuperTrend filter: BUY requires close above the SuperTrend line "
+                f"(line={st_line:.2f}, close={close:.2f})."
+            )
         return True, ""
 
     if direction == logic.TradeDirection.SELL:
         if st_dir != -1:
-            return False, "SuperTrend filter: SELL requires bearish (red) SuperTrend — it is bullish."
+            return False, (
+                f"SuperTrend filter: SELL requires bearish (red) SuperTrend — computed state is "
+                f"bullish here (line={st_line:.2f}, close={close:.2f})."
+            )
         if close >= st_line:
-            return False, "SuperTrend filter: SELL requires close below the SuperTrend line."
+            return False, (
+                f"SuperTrend filter: SELL requires close below the SuperTrend line "
+                f"(line={st_line:.2f}, close={close:.2f})."
+            )
         return True, ""
 
     return True, ""
@@ -74,9 +86,9 @@ def _vwap_passes(direction: logic.TradeDirection, close: float, vwap: float) -> 
         return True, ""
 
     if direction == logic.TradeDirection.BUY and close <= vwap:
-        return False, "VWAP filter: BUY requires close above VWAP."
+        return False, f"VWAP filter: BUY requires close above VWAP (VWAP={vwap:.2f}, close={close:.2f})."
     if direction == logic.TradeDirection.SELL and close >= vwap:
-        return False, "VWAP filter: SELL requires close below VWAP."
+        return False, f"VWAP filter: SELL requires close below VWAP (VWAP={vwap:.2f}, close={close:.2f})."
     return True, ""
 
 
