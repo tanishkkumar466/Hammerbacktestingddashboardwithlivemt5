@@ -152,6 +152,60 @@ def describe_candle(c: logic.Candle) -> str:
     )
 
 
+def indicator_snapshot_text(
+    closed: List[logic.Candle],
+    forming: logic.Candle,
+    indicator_stack,
+) -> str:
+    """
+    SuperTrend / VWAP values on the LAST CLOSED bar, exactly as the filter
+    sees them. Logged each bar so users can compare with their MT5 chart
+    (TradingView uses a different data feed and may disagree).
+    """
+    if not indicator_stack.enabled_indicator_ids() or len(closed) < 3:
+        return ""
+    try:
+        import numpy as np
+
+        from indicators.supertrend import compute_supertrend
+        from indicators.vwap import compute_vwap
+
+        df = _candles_to_polars(closed, forming)
+        high = df["high"].to_numpy()
+        low = df["low"].to_numpy()
+        close = df["close"].to_numpy()
+        vol = df["volume"].to_numpy()
+        ts = df["datetime"].to_list()
+        idx = len(closed) - 1  # last closed bar (signal bar)
+        c = float(close[idx])
+        parts: List[str] = []
+
+        st_cfg = indicator_stack.supertrend
+        if st_cfg.enabled:
+            st_line, st_dir = compute_supertrend(
+                high, low, close,
+                atr_period=st_cfg.atr_period, multiplier=st_cfg.multiplier,
+            )
+            line, d = float(st_line[idx]), int(st_dir[idx])
+            if np.isnan(line):
+                parts.append(f"SuperTrend({st_cfg.atr_period},{st_cfg.multiplier}): warmup (not enough bars)")
+            else:
+                state = "GREEN (bullish)" if d == 1 else "RED (bearish)"
+                parts.append(
+                    f"SuperTrend({st_cfg.atr_period},{st_cfg.multiplier})={state} "
+                    f"line={line:.2f} close={'above' if c > line else 'below'}"
+                )
+
+        if indicator_stack.vwap.enabled:
+            v = float(compute_vwap(high, low, close, vol, timestamps=ts)[idx])
+            if not np.isnan(v):
+                parts.append(f"VWAP={v:.2f} close={'above' if c > v else 'below'}")
+
+        return " | ".join(parts)
+    except Exception:
+        return ""
+
+
 def _signal_key(sig: logic.TradeSignal) -> Tuple:
     return (sig.hammer_candle.timestamp, sig.direction.value, sig.timeframe)
 
@@ -636,6 +690,9 @@ class LiveTradingEngine:
         # Log the broker's bar explicitly: this is the candle signals are based
         # on. It can differ from TradingView (different feed / bar boundaries).
         self.log(f"[LIVE] New closed bar (broker feed): {describe_candle(closed[-1])}")
+        snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
+        if snapshot:
+            self.log(f"[LIVE] Indicators on this bar ({cfg.timeframe_label}): {snapshot}")
 
         sig, ignored = self._compute_signal_outcome(closed, forming, config_timeframe_label)
         if sig is None:
