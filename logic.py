@@ -89,7 +89,7 @@ FLOWCHART (unchanged, exactly as given)
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 
 # ============================================================================
@@ -356,6 +356,113 @@ def resolve_hammer_wick_side(
     if enable_classic and not enable_inverted:
         return WickSide.LOWER
     return ui_wick
+
+
+def candle_color_label(candle: Candle) -> str:
+    if candle.is_green:
+        return "GREEN"
+    if candle.is_red:
+        return "RED"
+    return "DOJI"
+
+
+def explain_hammer_signal_direction(
+    hammer_candle: Candle,
+    direction: TradeDirection,
+    config: StrategyConfig,
+    variant: Optional[str] = None,
+) -> str:
+    """
+    Plain-language direction line for live logs.
+    Direction comes from the HAMMER (signal) bar color only — not the entry bar.
+    """
+    color = candle_color_label(hammer_candle)
+    shape = variant or "—"
+    if color == "GREEN":
+        mapped = config.green_direction.value
+    elif color == "RED":
+        mapped = config.red_direction.value
+    else:
+        mapped = "—"
+    return (
+        f"Direction: signal bar {color} → settings {color.lower()}→{mapped} "
+        f"→ {direction.value} | hammer shape={shape}"
+    )
+
+
+def expected_direction_for_signal_candle(
+    candle: Candle,
+    config: StrategyConfig,
+) -> Optional[TradeDirection]:
+    """Color → trade mapping from StrategyConfig (hammer / same color rule as doji CANDLE_COLOR)."""
+    if candle.is_green:
+        return config.green_direction
+    if candle.is_red:
+        return config.red_direction
+    return None
+
+
+def verify_hammer_trade_signal(
+    sig: TradeSignal,
+    config: StrategyConfig,
+) -> Tuple[bool, str]:
+    """
+    Ensures signal direction matches green_direction / red_direction on the hammer bar.
+    Returns (False, reason) if settings were not applied correctly to this signal.
+    """
+    expected = expected_direction_for_signal_candle(sig.hammer_candle, config)
+    if expected is None:
+        return True, ""
+    if sig.direction != expected:
+        return False, (
+            f"Parameter check failed: {candle_color_label(sig.hammer_candle)} signal bar must "
+            f"→ {expected.value} (your green/red direction settings) but signal is "
+            f"{sig.direction.value}. Stop live, fix Direction tab or preset, Start live again."
+        )
+    return True, ""
+
+
+def run_hammer_direction_self_test(config: StrategyConfig) -> List[str]:
+    """
+    Quick proof that check_hammer + color mapping match green_direction / red_direction.
+    Uses synthetic OHLC that satisfy default hammer shape bands.
+    """
+    lines: List[str] = [
+        f"Settings: GREEN → {config.green_direction.value}, RED → {config.red_direction.value}",
+        f"Detection: {describe_hammer_detection(config)}",
+    ]
+    # Classic-shaped green hammer (long lower wick, small body, small upper wick)
+    green_bar = Candle("selftest-green", 100.0, 100.5, 90.0, 100.4)
+    red_bar = Candle("selftest-red", 100.4, 100.5, 90.0, 99.6)
+    for label, bar in (("GREEN test bar", green_bar), ("RED test bar", red_bar)):
+        hr = check_hammer(bar, config)
+        color = candle_color_label(bar)
+        if not hr.is_valid_shape or hr.direction is None:
+            lines.append(f"  {label}: shape did not pass (tune Body/Wicks or hammer type toggles).")
+            continue
+        ok, msg = verify_hammer_trade_signal(
+            TradeSignal(
+                direction=hr.direction,
+                hammer_candle=bar,
+                entry_candle=bar,
+                entry_price=0.0,
+                stop_loss=0.0,
+                risk=1.0,
+                rr_multiple=1.0,
+                target=0.0,
+                timeframe="test",
+                pattern_variant=hr.hammer_variant.value if hr.hammer_variant else None,
+            ),
+            config,
+        )
+        if ok:
+            lines.append(
+                f"  {label}: OK — {color} → {hr.direction.value} "
+                f"({hr.hammer_variant.value if hr.hammer_variant else '—'})"
+            )
+        else:
+            lines.append(f"  {label}: FAIL — {msg}")
+    return lines
 
 
 def describe_hammer_detection(config: StrategyConfig) -> str:

@@ -257,6 +257,25 @@ def find_bar_signal_outcome(
         if sig.ignored:
             ignored_match = sig
             continue
+        if pattern_type != "doji":
+            ok, vmsg = logic.verify_hammer_trade_signal(sig, strategy_config)
+            if not ok:
+                sig = logic.TradeSignal(
+                    direction=sig.direction,
+                    hammer_candle=sig.hammer_candle,
+                    entry_candle=sig.entry_candle,
+                    entry_price=sig.entry_price,
+                    stop_loss=sig.stop_loss,
+                    risk=sig.risk,
+                    rr_multiple=sig.rr_multiple,
+                    target=sig.target,
+                    timeframe=sig.timeframe,
+                    ignored=True,
+                    ignore_reason=vmsg,
+                    pattern_variant=getattr(sig, "pattern_variant", None),
+                )
+                ignored_match = sig
+                continue
         return sig, None
     return None, ignored_match
 
@@ -345,6 +364,27 @@ class LiveTradingEngine:
 
     def request_stop(self):
         self._stop = True
+
+    def update_runtime_strategy(
+        self,
+        strategy_config,
+        indicator_stack,
+        pattern_type: str,
+        pattern_label: str,
+    ) -> None:
+        """Call from the UI thread after parameter changes — no need to Stop/Start live."""
+        self.strategy_config = strategy_config
+        self.indicator_stack = indicator_stack
+        self.pattern_type = pattern_type
+        self.pattern_label = pattern_label
+        g = getattr(strategy_config, "green_direction", None)
+        r = getattr(strategy_config, "red_direction", None)
+        gv = getattr(g, "value", g)
+        rv = getattr(r, "value", r)
+        self.log(
+            f"[LIVE] Parameters refreshed — {pattern_label} | GREEN→{gv} RED→{rv} | "
+            f"indicators: {', '.join(indicator_stack.enabled_indicator_ids()) or 'none'}"
+        )
 
     def _record_trade_event(
         self,
@@ -486,6 +526,14 @@ class LiveTradingEngine:
             f"Indicators: {inds} | {self._active_symbol} {cfg.timeframe_label} | "
             f"lots={cfg.volume} | dry_run={cfg.dry_run} | order={cfg.order_mode}"
         )
+        g = getattr(self.strategy_config, "green_direction", None)
+        r = getattr(self.strategy_config, "red_direction", None)
+        if self.pattern_type != "doji" and g is not None and r is not None:
+            self.log(
+                f"[LIVE] Direction locked for this session: GREEN→{getattr(g, 'value', g)} "
+                f"RED→{getattr(r, 'value', r)} (signal bar color only; entry is next bar open). "
+                f"Change Parameters then use 'Apply to live' or Stop/Start live."
+            )
         self.log(summarize_strategy_params(
             self.strategy_config, cfg.timeframe_label, self.pattern_type,
         ))
@@ -721,7 +769,19 @@ class LiveTradingEngine:
             if ignored is not None and ignored.ignore_reason:
                 variant = getattr(ignored, "pattern_variant", None) or "—"
                 self.log(
-                    f"[LIVE] Pattern on bar but not traded ({variant}): {ignored.ignore_reason}"
+                    f"[LIVE] Pattern on signal bar but not traded ({variant}): {ignored.ignore_reason}"
+                )
+                if self.pattern_type != "doji":
+                    self.log(
+                        logic.explain_hammer_signal_direction(
+                            ignored.hammer_candle,
+                            ignored.direction,
+                            self.strategy_config,
+                            variant,
+                        )
+                    )
+                self.log(
+                    f"[LIVE] Entry would be on next bar: {describe_candle(forming)}"
                 )
             else:
                 self.log(
@@ -762,9 +822,27 @@ class LiveTradingEngine:
 
         variant = getattr(sig, "pattern_variant", None) or "—"
         self.log(
-            f"[SIGNAL] {sig.direction.value} ({variant}) on bar "
-            f"{describe_candle(sig.hammer_candle)} | entry≈{sig.entry_price:.2f} "
-            f"SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"
+            f"[SIGNAL] {sig.direction.value} ({variant}) — hammer/signal bar: "
+            f"{describe_candle(sig.hammer_candle)}"
+        )
+        if self.pattern_type != "doji":
+            self.log(logic.explain_hammer_signal_direction(
+                sig.hammer_candle, sig.direction, self.strategy_config, variant,
+            ))
+            hc = sig.hammer_candle
+            if hc.is_green and sig.direction == logic.TradeDirection.SELL:
+                self.log(
+                    "[WARN] GREEN signal bar → SELL: check Parameters → Direction "
+                    f"(green_direction={getattr(self.strategy_config.green_direction, 'value', self.strategy_config.green_direction)})."
+                )
+            elif hc.is_red and sig.direction == logic.TradeDirection.BUY:
+                self.log(
+                    "[WARN] RED signal bar → BUY: check Parameters → Direction "
+                    f"(red_direction={getattr(self.strategy_config.red_direction, 'value', self.strategy_config.red_direction)})."
+                )
+        self.log(
+            f"[SIGNAL] Entry bar (next candle): {describe_candle(sig.entry_candle)} | "
+            f"entry≈{sig.entry_price:.2f} SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"
         )
         # Record WHY this trade was allowed: indicator values at decision time.
         allow_snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)

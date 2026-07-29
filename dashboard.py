@@ -881,8 +881,14 @@ FIELD_HELP: Dict[str, str] = {
     "doji_allow_green_trades": "When off, green dojis never produce a trade (CANDLE_COLOR mode).",
     "doji_allow_red_trades": "When off, red dojis never produce a trade (CANDLE_COLOR mode).",
     "indicators_combine_mode": "When two or more indicators are added: ALL = every filter must pass; ANY = at least one.",
-    "green_direction": "Trade direction when the signal candle closes green (bullish body). Default BUY.",
-    "red_direction": "Trade direction when the signal candle closes red (bearish body). Default SELL.",
+    "green_direction": (
+        "Trade direction when the HAMMER (signal) candle closes green — not the next entry bar. "
+        "Default BUY. Classic and inverted hammers both use this same color rule."
+    ),
+    "red_direction": (
+        "Trade direction when the HAMMER (signal) candle closes red — not the next entry bar. "
+        "Default SELL. Classic and inverted hammers both use this same color rule."
+    ),
     "enable_classic_hammer": "Detect classic hammers: long lower wick, small upper wick (hammer at support).",
     "enable_inverted_hammer": (
         "Detect inverted hammers (long upper wick). Must be on for inverted-shaped candles to qualify; "
@@ -906,7 +912,13 @@ FIELD_HELP: Dict[str, str] = {
     "start_date": "Only include candles on/after this date. Leave blank to use all available history.",
     "end_date": "Only include candles on/before this date. Leave blank to use all available history.",
     "max_forward_candles": "How many candles forward the backtest scans looking for the trade's exit before giving up.",
-    "position_sizing_mode": "How trade size is calculated: fixed unit size, fixed $ risk per trade, or % of equity risked per trade.",
+    "position_sizing_mode": (
+        "Backtest only — pick how lot size / $ P&L is simulated:\n"
+        "• FIXED_UNITS — uses Position Size (lots/units).\n"
+        "• FIXED_RISK_USD — risks Fixed Risk per Trade ($) each trade (recommended for many trades).\n"
+        "• PERCENT_OF_EQUITY — risks % of current equity; uses Starting Capital, Equity Floor, Max Equity Multiple.\n"
+        "Live MT5 uses the lot size on the Live panel, not these fields."
+    ),
     "position_size": "Units traded per position (used when Position Sizing Mode is Fixed Units).",
     "fixed_risk_usd": "$ risked per trade, position size solved backwards from this (used when Position Sizing Mode is Fixed Risk).",
     "risk_pct_of_equity": "% of current equity risked per trade (used when Position Sizing Mode is % of Equity).",
@@ -917,6 +929,45 @@ FIELD_HELP: Dict[str, str] = {
     "commission_per_trade": "Flat $ commission charged per trade, subtracted from P&L.",
     "slippage_usd": "Flat $ slippage assumed on entry and exit, subtracted from P&L.",
 }
+
+# Which Run Settings fields matter for each position sizing mode (UI highlight only).
+SIZING_MODE_ACTIVE_FIELDS: Dict[str, List[str]] = {
+    "FIXED_UNITS": ["position_size"],
+    "fixed_units": ["position_size"],
+    "FIXED_RISK_USD": ["fixed_risk_usd"],
+    "fixed_risk_usd": ["fixed_risk_usd"],
+    "PERCENT_OF_EQUITY": [
+        "risk_pct_of_equity", "starting_capital", "equity_floor_usd", "max_equity_multiple",
+    ],
+    "percent_of_equity": [
+        "risk_pct_of_equity", "starting_capital", "equity_floor_usd", "max_equity_multiple",
+    ],
+}
+
+PARAMETERS_GUIDE_TEXT = """
+<b>Project goal</b><br>
+Find hammer/doji setups on historical data, filter with indicators, compare position-sizing and RR/SL — then run the same signal rules live on MT5 (Windows).<br><br>
+
+<b>What affects a trade signal</b> (backtest + live)<br>
+• <b>Body / Wicks</b> — hammer shape percentages.<br>
+• <b>Direction</b> — GREEN signal bar → green_direction (default BUY); RED → red_direction (default SELL). Entry is the <i>next</i> bar.<br>
+• <b>Hammer types</b> — classic / inverted enable flags; shape does not flip BUY/SELL by itself.<br>
+• <b>Entry / Exit</b> — entry price rule, SL buffer, RR from Timeframes tab.<br>
+• <b>Risk</b> — max $ SL per timeframe (logic); can disable to see all signals in backtest.<br>
+• <b>Timeframes</b> — RR and max SL per TF; checkboxes choose which TFs to include in a backtest run.<br>
+• <b>Indicators</b> — add SuperTrend/VWAP; “Apply trade filter” must be on to block trades live/backtest.<br><br>
+
+<b>Backtest only</b> (Run Settings tab)<br>
+• <b>Position sizing</b> — FIXED_UNITS | FIXED_RISK_USD | PERCENT_OF_EQUITY (compare strategies).<br>
+• Starting capital, equity floor, max equity multiple, overlap, commission, slippage, date range, max forward scan.<br>
+• Outputs: CSV ledger with position_size, risk_usd, pnl_usd per exit model.<br><br>
+
+<b>Live only</b> (Live panel + Live settings)<br>
+• Symbol, timeframe, lots, magic, dry run, daily loss/trade caps — not backtest sizing fields.<br><br>
+
+<b>Presets (v2 JSON)</b><br>
+Save/load includes trade_rules, backtest block, indicators, all field widgets, and timeframe RR/SL — use for client sign-off.
+"""
 
 # Results table row/column tints (BUY / SELL / candle_bias exit model).
 RESULT_BG_BUY = QColor("#D7F5DD")
@@ -2604,6 +2655,10 @@ class BacktestDashboard(QMainWindow):
         export_action.triggered.connect(self._export_run_history_to_excel)
         run_menu.addAction(export_action)
 
+        verify_dir_action = QAction("Verify hammer direction rules (self-test)", self)
+        verify_dir_action.triggered.connect(self._verify_hammer_direction_rules)
+        run_menu.addAction(verify_dir_action)
+
         # F2 snaps every panel -- docked, floated, or closed -- back to
         # its default docked position. This is the answer to "how do I
         # get a detached window back": press F2 from anywhere.
@@ -2636,9 +2691,24 @@ class BacktestDashboard(QMainWindow):
         about_action.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_action)
 
+        guide_action = QAction("Parameter Guide (what each tab does)", self)
+        guide_action.triggered.connect(self._show_parameters_guide)
+        help_menu.addAction(guide_action)
+
         # Keep references so the actions (and their shortcuts) aren't
         # garbage-collected once this method returns.
-        self._shortcut_actions = [run_action, output_action, charts_action, export_action, shortcuts_action, about_action]
+        self._shortcut_actions = [
+            run_action, output_action, charts_action, export_action,
+            shortcuts_action, about_action, guide_action, verify_dir_action,
+        ]
+
+    def _show_parameters_guide(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("Parameter guide")
+        box.setTextFormat(Qt.RichText)
+        box.setText(PARAMETERS_GUIDE_TEXT)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec()
 
     def _show_shortcuts_help(self):
         QMessageBox.information(
@@ -2658,6 +2728,7 @@ class BacktestDashboard(QMainWindow):
             "F9   Toggle Live Trading panel\n"
             "Live → Performance   Dry run, thread pool, Ray (advanced)\n"
             "F1   This help\n\n"
+            "Help → Parameter Guide — which tabs affect signals vs backtest sizing vs live.\n\n"
             "All shortcuts work while the app has focus.",
         )
 
@@ -2988,9 +3059,69 @@ class BacktestDashboard(QMainWindow):
         preset_layout.addLayout(preset_row)
         layout.addWidget(preset_box)
 
+        run_hint = QLabel(
+            "Backtest execution: symbol, data folder, date range, position sizing (compare Fixed $ risk vs % equity vs fixed lots), "
+            "overlap, commission/slippage. Signal rules come from the other parameter tabs + Timeframes. "
+            "Bold labels below = fields used by the current Position Sizing Mode."
+        )
+        run_hint.setObjectName("sectionHint")
+        run_hint.setWordWrap(True)
+        layout.addWidget(run_hint)
+
         layout.addWidget(self._make_field_tab(BACKTEST_FIELDS, defaults_backtest), 1)
         QTimer.singleShot(0, lambda: self._refresh_preset_combo(keep_selection=False))
+        QTimer.singleShot(0, self._wire_sizing_mode_highlights)
         return wrap
+
+    def _wire_sizing_mode_highlights(self):
+        combo = self.field_widgets.get("position_sizing_mode")
+        if isinstance(combo, QComboBox):
+            combo.currentTextChanged.connect(lambda _t: self._refresh_sizing_field_highlights())
+        self._refresh_sizing_field_highlights()
+
+    def _refresh_sizing_field_highlights(self):
+        """Bold labels for sizing fields that apply to the selected mode (all fields stay editable)."""
+        normal = "font-weight: normal; color: #3C4043;"
+        active = "font-weight: bold; color: #137333;"
+        mode_raw = ""
+        combo = self.field_widgets.get("position_sizing_mode")
+        if isinstance(combo, QComboBox):
+            mode_raw = combo.currentText() or ""
+        active_names = set(SIZING_MODE_ACTIVE_FIELDS.get(mode_raw, []))
+        backtest_names = {n for n, _, _, _ in BACKTEST_FIELDS}
+        for name, label in self.field_labels.items():
+            if name not in backtest_names:
+                continue
+            if label is None:
+                continue
+            label.setStyleSheet(active if name in active_names else normal)
+
+    def _collect_preset_backtest_settings(self) -> Dict[str, Any]:
+        """Snapshot Run Settings for preset JSON (client can compare sizing setups)."""
+        out: Dict[str, Any] = {}
+        for name, _, ftype, _ in BACKTEST_FIELDS:
+            widget = self.field_widgets.get(name)
+            if widget is None:
+                continue
+            val = self._widget_value(widget)
+            if ftype == FIELD_TYPE_CHECK:
+                out[name] = bool(val)
+            else:
+                out[name] = "" if val is None else str(val)
+        mode = str(out.get("position_sizing_mode", "FIXED_RISK_USD"))
+        if mode == "FIXED_UNITS":
+            out["plain_english"] = f"Backtest sizes each trade at {out.get('position_size', '?')} units/lots."
+        elif mode == "PERCENT_OF_EQUITY":
+            out["plain_english"] = (
+                f"Backtest risks {out.get('risk_pct_of_equity', '?')}% of equity per trade "
+                f"(start ${out.get('starting_capital', '?')}, cap {out.get('max_equity_multiple', '?')}×)."
+            )
+        else:
+            out["plain_english"] = (
+                f"Backtest risks ${out.get('fixed_risk_usd', '?')} per trade (fixed $ risk mode)."
+            )
+        out["applies_to"] = "backtest_only — live uses Live panel lot size"
+        return out
 
     def _make_combined_timeframes_tab(self) -> QWidget:
         """RR / max SL per timeframe plus include-in-run checkboxes in one place."""
@@ -4009,6 +4140,21 @@ class BacktestDashboard(QMainWindow):
         refresh_strat_btn.setFixedWidth(88)
         refresh_strat_btn.clicked.connect(self._refresh_live_strategy_summary)
         pat_row.addWidget(refresh_strat_btn)
+        apply_live_btn = QPushButton("Apply to live")
+        apply_live_btn.setObjectName("secondaryButton")
+        apply_live_btn.setFixedWidth(100)
+        apply_live_btn.setToolTip(
+            "Push current Parameters (direction, shape, indicators, RR/SL) to a running live loop "
+            "without Stop/Start. Use after you change the Direction tab or load a preset."
+        )
+        apply_live_btn.clicked.connect(self._apply_parameters_to_live)
+        pat_row.addWidget(apply_live_btn)
+        verify_btn = QPushButton("Verify rules")
+        verify_btn.setObjectName("secondaryButton")
+        verify_btn.setFixedWidth(96)
+        verify_btn.setToolTip("Self-test: green bar → Green direction, red bar → Red direction.")
+        verify_btn.clicked.connect(self._verify_hammer_direction_rules)
+        pat_row.addWidget(verify_btn)
         strat_layout.addLayout(pat_row)
         strat_layout.addWidget(self.live_strategy_summary)
         root.addWidget(strat_box)
@@ -4146,6 +4292,50 @@ class BacktestDashboard(QMainWindow):
         QTimer.singleShot(0, self._sync_live_pattern_from_dashboard)
         QTimer.singleShot(0, self._refresh_live_strategy_summary)
         QTimer.singleShot(0, self._refresh_live_config_summary)
+
+    def _verify_hammer_direction_rules(self):
+        if self.pattern_combo.currentText() == "Doji":
+            QMessageBox.information(
+                self,
+                "Verify rules",
+                "Switch Pattern to Hammer to run green/red direction self-test, "
+                "or backtest Doji with its Direction mode.",
+            )
+            return
+        try:
+            cfg = self._build_hammer_strategy_config()
+        except Exception as e:
+            QMessageBox.critical(self, "Verify rules", f"Could not read parameters:\n{e}")
+            return
+        lines = logic.run_hammer_direction_self_test(cfg)
+        body = "\n".join(lines)
+        failed = any("FAIL" in ln for ln in lines)
+        if failed:
+            QMessageBox.warning(self, "Direction self-test — fix parameters", body)
+        else:
+            QMessageBox.information(self, "Direction self-test — OK", body)
+
+    def _apply_parameters_to_live(self):
+        if self._live_engine is None or self._live_thread is None or not self._live_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Apply to live",
+                "Start live first, then change Parameters and click Apply to live "
+                "(or Stop live → fix settings → Start live).",
+            )
+            return
+        try:
+            pattern, pattern_type, strategy_config, indicator_stack = (
+                self._collect_live_strategy_from_parameters()
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Apply to live", str(e))
+            return
+        self._live_engine.update_runtime_strategy(
+            strategy_config, indicator_stack, pattern_type, pattern,
+        )
+        self._refresh_live_strategy_summary()
+        self._live_log("Dashboard parameters pushed to live loop.")
 
     def _open_live_settings(self):
         if self._live_thread is not None and self._live_thread.isRunning():
@@ -4626,6 +4816,22 @@ class BacktestDashboard(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Invalid parameters", f"Could not read strategy settings:\n{e}")
             return
+
+        if pattern_type == "hammer":
+            test_lines = logic.run_hammer_direction_self_test(strategy_config)
+            if any("FAIL" in ln for ln in test_lines):
+                ans = QMessageBox.warning(
+                    self,
+                    "Direction rules failed self-test",
+                    "\n".join(test_lines)
+                    + "\n\nStart live anyway? (Not recommended — fix Direction tab first.)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ans != QMessageBox.Yes:
+                    return
+            else:
+                self._live_log("Direction self-test OK: " + test_lines[0])
 
         live_tf = live_cfg.timeframe_label
         tf_settings = getattr(strategy_config, "timeframe_settings", None) or {}
@@ -5733,6 +5939,48 @@ class BacktestDashboard(QMainWindow):
             self.preset_combo.setCurrentIndex(0)
         self.preset_combo.blockSignals(False)
 
+    def _collect_preset_trade_rules(self, pattern: str) -> Dict[str, Any]:
+        """Human-readable rules stored in every preset JSON for client review."""
+        if pattern == "Doji":
+            cfg = self._build_doji_strategy_config()
+            return {
+                "pattern": "Doji",
+                "direction_mode": getattr(cfg.doji_direction_mode, "value", str(cfg.doji_direction_mode)),
+                "doji_style": getattr(cfg.doji_style, "value", str(cfg.doji_style)),
+                "green_doji": getattr(cfg.green_direction, "value", "BUY"),
+                "red_doji": getattr(cfg.red_direction, "value", "SELL"),
+                "note": "Doji uses doji_direction_mode — not hammer green/red tabs unless mode is CANDLE_COLOR.",
+            }
+        cfg = self._build_hammer_strategy_config()
+        stack = self._build_indicator_stack()
+        inds = stack.enabled_indicator_ids()
+        return {
+            "pattern": "Hammer",
+            "classic_hammer_enabled": cfg.enable_classic_hammer,
+            "inverted_hammer_enabled": cfg.enable_inverted_hammer,
+            "green_candle_trade": getattr(cfg.green_direction, "value", "BUY"),
+            "red_candle_trade": getattr(cfg.red_direction, "value", "SELL"),
+            "resolved_wick_mode": getattr(cfg.hammer_wick_side, "value", str(cfg.hammer_wick_side)),
+            "classic_allow_buy": cfg.classic_hammer_allow_buy,
+            "classic_allow_sell": cfg.classic_hammer_allow_sell,
+            "inverted_allow_buy": cfg.inverted_hammer_allow_buy,
+            "inverted_allow_sell": cfg.inverted_hammer_allow_sell,
+            "entry_rule": getattr(cfg.entry_rule, "value", str(cfg.entry_rule)),
+            "indicators_added": inds,
+            "supertrend_filter": (
+                stack.supertrend.apply_trade_filter if "supertrend" in inds else None
+            ),
+            "vwap_filter": (
+                stack.vwap.apply_trade_filter if "vwap" in inds else None
+            ),
+            "plain_english": (
+                f"Hammer signal bar GREEN → {getattr(cfg.green_direction, 'value', 'BUY')}, "
+                f"RED → {getattr(cfg.red_direction, 'value', 'SELL')}. "
+                "Shape classic/inverted only picks wick geometry; color picks BUY/SELL. "
+                "Entry is on the NEXT bar after the signal bar closes."
+            ),
+        }
+
     def _collect_preset_snapshot(self) -> dict:
         fields: Dict[str, Any] = {}
         for name, widget in self.field_widgets.items():
@@ -5750,13 +5998,30 @@ class BacktestDashboard(QMainWindow):
                 "sl": edits["sl"].text(),
                 "enabled": cb.isChecked() if cb else True,
             }
+        pattern = self.pattern_combo.currentText()
+        stack = self._build_indicator_stack()
         return {
-            "version": 1,
+            "version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "pattern": self.pattern_combo.currentText(),
+            "pattern": pattern,
+            "trade_rules": self._collect_preset_trade_rules(pattern),
+            "backtest": self._collect_preset_backtest_settings(),
             "fields": fields,
             "timeframes": timeframes,
             "indicators_added": sorted(self.added_indicator_ids),
+            "indicators": {
+                "combine_mode": stack.combine_mode.value,
+                "supertrend": {
+                    "enabled": "supertrend" in self.added_indicator_ids,
+                    "atr_period": fields.get("indicators_st_atr_period", "10"),
+                    "multiplier": fields.get("indicators_st_multiplier", "3.0"),
+                    "apply_trade_filter": fields.get("indicators_st_apply_filter", True),
+                },
+                "vwap": {
+                    "enabled": "vwap" in self.added_indicator_ids,
+                    "apply_trade_filter": fields.get("indicators_vwap_apply_filter", True),
+                },
+            },
         }
 
     def _set_field_widget_value(self, name: str, value: Any):
@@ -5794,9 +6059,15 @@ class BacktestDashboard(QMainWindow):
             self._remove_indicator(ind_id)
         for ind_id in data.get("indicators_added") or []:
             self._add_indicator(ind_id)
+        for name, value in (data.get("backtest") or {}).items():
+            if name in ("plain_english", "applies_to"):
+                continue
+            self._set_field_widget_value(name, value)
         if pattern == "Doji":
             self._fill_empty_doji_widget_defaults()
         self._redraw_candle_preview()
+        self._refresh_sizing_field_highlights()
+        self._refresh_live_strategy_summary()
 
     def _save_preset_dialog(self):
         name, ok = QInputDialog.getText(
