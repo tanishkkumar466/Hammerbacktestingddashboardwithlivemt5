@@ -20,7 +20,7 @@ import polars as pl
 
 import doji_logic
 import logic
-from broker import MT5Broker, TIMEFRAME_MT5_MAP, TIMEFRAME_SECONDS
+from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
 
@@ -710,8 +710,8 @@ class LiveTradingEngine:
         count: int,
     ):
         """
-        Fetch OHLC with extra refresh when a new closed bar appears — MT5 history
-        often lags ticks for a few hundred ms right after bar close.
+        Fetch OHLC from MT5. On a new closed bar, re-pull once after a short
+        delay so MT5 can finalize the bar — closed history is never tick-merged.
         """
         with self._broker_lock:
             closed, forming, err, meta = self.broker.fetch_rates(sym, timeframe_label, count)
@@ -720,53 +720,20 @@ class LiveTradingEngine:
 
         prev_ts = self._last_closed_bar_ts
         last_ts = closed[-1].timestamp
-        new_bar = prev_ts is not None and last_ts != prev_ts
-        if not new_bar:
-            return closed, forming, err, meta
-        if meta.get("bar_cache_patched") or meta.get("finalized_overlays"):
+        if prev_ts is None or last_ts == prev_ts:
             return closed, forming, err, meta
 
-        tf_sec = TIMEFRAME_SECONDS.get(timeframe_label, 180)
-        best_closed, best_forming, best_meta = closed, forming, meta
-        for attempt in range(3):
-            time.sleep(0.1 + 0.08 * attempt)
-            with self._broker_lock:
-                c2, f2, e2, m2 = self.broker.fetch_rates(sym, timeframe_label, count)
-            if e2 or not c2:
-                continue
-            if c2[-1].timestamp != last_ts:
-                best_closed, best_forming, best_meta = c2, f2, m2
-                last_ts = c2[-1].timestamp
-                break
-            score = 0
-            if m2.get("bar_cache_patched") or m2.get("finalized_overlays"):
-                score += 100
-            if m2.get("bar_cache_appended"):
-                score += 50
-            prev_score = 0
-            if best_meta.get("bar_cache_patched") or best_meta.get("finalized_overlays"):
-                prev_score += 100
-            if best_meta.get("bar_cache_appended"):
-                prev_score += 50
-            if score > prev_score:
-                best_closed, best_forming, best_meta = c2, f2, m2
-            elif score == prev_score and c2[-1].close != best_closed[-1].close:
-                # Same bar timestamp but MT5 revised OHLC — keep latest pull.
-                best_closed, best_forming, best_meta = c2, f2, m2
-            forming_age = float(m2.get("forming_age_sec") or tf_sec)
-            if forming_age > 8.0 and (
-                m2.get("bar_cache_patched") or m2.get("finalized_overlays")
-            ):
-                break
-
-        if best_meta is not meta and (
-            best_meta.get("bar_cache_patched") or best_meta.get("finalized_overlays")
-        ):
+        time.sleep(0.15)
+        with self._broker_lock:
+            c2, f2, e2, m2 = self.broker.fetch_rates(sym, timeframe_label, count)
+        if e2 or not c2 or c2[-1].timestamp != last_ts:
+            return closed, forming, err, meta
+        if abs(c2[-1].close - closed[-1].close) > 0.009:
             self.log(
-                "[LIVE] Refreshed closed-bar OHLC after new bar "
-                f"(attempts={attempt + 1}, last closed close={best_closed[-1].close:.2f})."
+                "[LIVE] Refreshed last closed bar from MT5 "
+                f"(close {closed[-1].close:.2f} → {c2[-1].close:.2f})."
             )
-        return best_closed, best_forming, err, best_meta
+        return c2, f2, e2, m2
 
     def _poll_once(self, config_timeframe_label: str):
         """config_timeframe_label: dashboard TF key (1m, 1h, …) matching strategy timeframe_settings."""
@@ -788,24 +755,10 @@ class LiveTradingEngine:
         stale = rate_meta.get("stale_warning")
         if stale:
             self.log(f"[WARN] {stale}")
-
-        if rate_meta.get("bar_cache_patched"):
+        if rate_meta.get("forming_tick_merge_skipped"):
             self.log(
-                "[LIVE] Closed-bar OHLC updated from tick-merged cache "
-                f"@ {rate_meta.get('bar_cache_patched_time')} "
-                f"(MT5 history had close={rate_meta.get('mt5_closed_close_before', '?')} → "
-                f"merged close={rate_meta.get('tick_merged_close_after', '?')})."
-            )
-        elif rate_meta.get("bar_cache_appended"):
-            self.log(
-                "[LIVE] Appended finalized bar from tick-merged cache "
-                f"@ {rate_meta.get('bar_cache_patched_time')} (MT5 had not listed it yet)."
-            )
-        overlays = rate_meta.get("finalized_overlays") or []
-        if overlays:
-            self.log(
-                "[LIVE] Applied tick-merged OHLC to "
-                f"{len(overlays)} closed bar(s): {overlays[-3:]}."
+                "[WARN] Skipped tick merge on forming bar — bar time is stale "
+                "(market break or no quotes). Waiting for fresh bars."
             )
 
         now_mono = time.monotonic()
@@ -847,9 +800,17 @@ class LiveTradingEngine:
             return
 
         self._last_closed_bar_ts = last_ts
+        signal_bar = closed[-1]
+        if not logic.candle_ohlc_valid(signal_bar):
+            self.log(
+                f"[WARN] Invalid OHLC on last closed bar — skipping signal check: "
+                f"{describe_candle(signal_bar)}"
+            )
+            return
+
         # Log the broker's bar explicitly: this is the candle signals are based
         # on. It can differ from TradingView (different feed / bar boundaries).
-        self.log(f"[LIVE] New closed bar (broker feed): {describe_candle(closed[-1])}")
+        self.log(f"[LIVE] New closed bar (broker feed): {describe_candle(signal_bar)}")
         snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
         if snapshot:
             self.log(f"[LIVE] Indicators on this bar ({cfg.timeframe_label}): {snapshot}")
@@ -879,6 +840,11 @@ class LiveTradingEngine:
                     "(Indicators only FILTER pattern signals; SuperTrend/VWAP being bullish "
                     "never opens a trade by itself.)"
                 )
+                if self.pattern_type != "doji":
+                    self.log(
+                        f"[LIVE] Hammer probe: "
+                        f"{logic.describe_hammer_probe(signal_bar, self.strategy_config)}"
+                    )
             return
 
         key = _signal_key(sig)

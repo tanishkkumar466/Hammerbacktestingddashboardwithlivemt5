@@ -49,11 +49,6 @@ class MT5Broker:
     def __init__(self):
         self._mt5: Any = None
         self._connected = False
-        # Last tick-merged forming bar per (symbol, timeframe) — used to fix MT5
-        # history lag when a bar closes (copy_rates often lags; ticks do not).
-        self._forming_cache: Dict[Tuple[str, str], logic.Candle] = {}
-        # Completed bars built from tick stream (authoritative OHLC on rollover).
-        self._finalized_bars: Dict[Tuple[str, str], Dict[datetime, logic.Candle]] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -105,8 +100,6 @@ class MT5Broker:
                 pass
         self._mt5 = None
         self._connected = False
-        self._forming_cache.clear()
-        self._finalized_bars.clear()
 
     def account_info_dict(self) -> Dict[str, Any]:
         if not self.is_connected:
@@ -246,9 +239,21 @@ class MT5Broker:
         return datetime.fromtimestamp(int(r["time"]), tz=timezone.utc).replace(tzinfo=None)
 
     @staticmethod
-    def _merge_tick_into_forming(forming: logic.Candle, tick) -> logic.Candle:
-        """Update forming bar OHLC from the latest tick (MT5 bar cache can lag ticks)."""
+    def _merge_tick_into_forming(
+        forming: logic.Candle,
+        tick,
+        *,
+        forming_age_sec: float,
+        tf_sec: int,
+    ) -> logic.Candle:
+        """
+        Update ONLY the open forming bar from the latest tick.
+        Never applied to closed/historical bars. Skipped when the forming bar
+        timestamp is stale (e.g. market closed) to avoid monster candles.
+        """
         if tick is None:
+            return forming
+        if forming_age_sec > tf_sec * 2:
             return forming
         bid = float(getattr(tick, "bid", 0) or 0)
         ask = float(getattr(tick, "ask", 0) or 0)
@@ -282,129 +287,6 @@ class MT5Broker:
         forming_r = by_time[-1]
         closed_rs = by_time[:-1]
         return forming_r, closed_rs
-
-    def _copy_rates_live(
-        self,
-        sym: str,
-        tf_const: Any,
-        count: int,
-        tick: Any,
-        _to_candle_fn,
-    ) -> Tuple[Any, str]:
-        """
-        Pull history two ways and pick the series whose forming bar best matches
-        the live tick (MT5 from_pos cache often lags copy_rates_from(now)).
-        """
-        candidates: List[Tuple[str, Any]] = []
-        now_utc = datetime.now(timezone.utc)
-        r_from = self._mt5.copy_rates_from(sym, tf_const, now_utc, count)
-        if r_from is not None and len(r_from) > 0:
-            candidates.append(("copy_rates_from", r_from))
-        r_pos = self._mt5.copy_rates_from_pos(sym, tf_const, 0, count)
-        if r_pos is not None and len(r_pos) > 0:
-            candidates.append(("copy_rates_from_pos", r_pos))
-
-        if not candidates:
-            return None, "none"
-
-        bid = 0.0
-        if tick is not None:
-            bid = float(getattr(tick, "bid", 0) or 0)
-            if bid <= 0:
-                bid = float(getattr(tick, "ask", 0) or 0)
-
-        best_rates = candidates[0][1]
-        best_src = candidates[0][0]
-        best_score = float("inf")
-
-        for src, rates in candidates:
-            try:
-                forming_r, _ = self._split_mt5_rates(rates)
-                forming_c = _to_candle_fn(forming_r)
-                forming_c = self._merge_tick_into_forming(forming_c, tick)
-                score = abs(forming_c.close - bid) if bid > 0 else 0.0
-            except (ValueError, TypeError, KeyError):
-                score = float("inf")
-            if score < best_score:
-                best_score = score
-                best_rates = rates
-                best_src = src
-
-        return best_rates, best_src
-
-    def _apply_finalized_bars(
-        self,
-        sym: str,
-        timeframe_label: str,
-        closed: List[logic.Candle],
-        meta: Dict[str, Any],
-    ) -> List[logic.Candle]:
-        key = (sym, timeframe_label)
-        fin = self._finalized_bars.get(key)
-        if not fin:
-            return closed
-        out: List[logic.Candle] = []
-        for c in closed:
-            alt = fin.get(c.timestamp)
-            if alt is not None and (
-                abs(alt.close - c.close) > 0.009
-                or abs(alt.high - c.high) > 0.009
-                or abs(alt.low - c.low) > 0.009
-            ):
-                meta.setdefault("finalized_overlays", []).append(c.timestamp)
-                out.append(alt)
-            else:
-                out.append(c)
-        return out
-
-    def _patch_closed_with_cached_forming(
-        self,
-        sym: str,
-        timeframe_label: str,
-        closed: List[logic.Candle],
-        forming: logic.Candle,
-        meta: Dict[str, Any],
-    ) -> List[logic.Candle]:
-        key = (sym, timeframe_label)
-        prev = self._forming_cache.get(key)
-        self._forming_cache[key] = forming
-
-        if prev is None or prev.timestamp == forming.timestamp:
-            return closed
-
-        # Bar rolled — previous tick-merged forming is the true finalized OHLC.
-        fin = self._finalized_bars.setdefault(key, {})
-        fin[prev.timestamp] = prev
-        if len(fin) > 600:
-            for ts in sorted(fin.keys())[:-600]:
-                fin.pop(ts, None)
-
-        patched = list(closed)
-        replaced = False
-        for i in range(len(patched) - 1, -1, -1):
-            if patched[i].timestamp == prev.timestamp:
-                meta["bar_cache_patched"] = True
-                meta["bar_cache_patched_time"] = prev.timestamp
-                meta["mt5_closed_close_before"] = patched[i].close
-                meta["tick_merged_close_after"] = prev.close
-                patched[i] = prev
-                replaced = True
-                break
-
-        if not replaced:
-            if not patched or patched[-1].timestamp < prev.timestamp:
-                meta["bar_cache_appended"] = True
-                meta["bar_cache_patched_time"] = prev.timestamp
-                patched.append(prev)
-            elif patched[-1].timestamp == prev.timestamp:
-                meta["bar_cache_patched"] = True
-                meta["bar_cache_patched_time"] = prev.timestamp
-                meta["mt5_closed_close_before"] = patched[-1].close
-                meta["tick_merged_close_after"] = prev.close
-                patched[-1] = prev
-
-        patched.sort(key=lambda c: c.timestamp)
-        return patched
 
     def fetch_rates(
         self,
@@ -455,7 +337,12 @@ class MT5Broker:
                 volume=vol,
             )
 
-        rates, rates_source = self._copy_rates_live(sym, tf_const, count, tick, _to_candle)
+        rates = self._mt5.copy_rates_from_pos(sym, tf_const, 0, count)
+        rates_source = "copy_rates_from_pos"
+        if rates is None or len(rates) == 0:
+            now_utc = datetime.now(timezone.utc)
+            rates = self._mt5.copy_rates_from(sym, tf_const, now_utc, count)
+            rates_source = "copy_rates_from"
         meta["rates_source"] = rates_source
         if rates is None or len(rates) == 0:
             err = self._mt5.last_error()
@@ -484,11 +371,25 @@ class MT5Broker:
             return [], None, f"No rates for {sym} {timeframe_label}.", meta
 
         forming = _to_candle(forming_r)
-        forming = self._merge_tick_into_forming(forming, tick)
+        forming = self._merge_tick_into_forming(
+            forming, tick, forming_age_sec=forming_age, tf_sec=tf_sec,
+        )
+        if forming_age > tf_sec * 2:
+            meta["forming_tick_merge_skipped"] = True
         meta["forming_close"] = forming.close
         closed = [_to_candle(r) for r in closed_rs]
-        closed = self._patch_closed_with_cached_forming(sym, timeframe_label, closed, forming, meta)
-        closed = self._apply_finalized_bars(sym, timeframe_label, closed, meta)
+        invalid = [c.timestamp for c in closed if not logic.candle_ohlc_valid(c)]
+        if invalid:
+            meta["invalid_closed_bars"] = invalid[-5:]
+        if closed and not logic.candle_ohlc_valid(closed[-1]):
+            return (
+                [],
+                forming,
+                f"Last closed bar has invalid OHLC ({closed[-1].timestamp}) — skipped.",
+                meta,
+            )
+        if not logic.candle_ohlc_valid(forming):
+            meta["invalid_forming_bar"] = True
         if closed:
             meta["last_closed_time"] = closed[-1].timestamp
             meta["last_closed_close"] = closed[-1].close

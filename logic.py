@@ -570,6 +570,37 @@ def calculate_candle_metrics(candle: Candle, config: StrategyConfig):
     return body_pct, upper_wick_pct, lower_wick_pct
 
 
+def candle_ohlc_valid(candle: Candle, tol: float = 1e-4) -> bool:
+    """True when open/close lie within [low, high] (guards corrupted broker feeds)."""
+    if candle.high < candle.low - tol:
+        return False
+    lo, hi = candle.low - tol, candle.high + tol
+    return lo <= candle.open <= hi and lo <= candle.close <= hi
+
+
+def describe_hammer_probe(candle: Candle, config: StrategyConfig) -> str:
+    """Human-readable hammer shape metrics for live debugging."""
+    body_pct, upper_pct, lower_pct = calculate_candle_metrics(candle, config)
+    rng = candle.range_
+    body = candle.body
+    uw = candle.upper_wick
+    lw = candle.lower_wick
+    dom_lo, dom_hi = config.hammer_ratios.dominant_wick_bounds()
+    small_lo, small_hi = config.hammer_ratios.small_wick_bounds()
+    body_lo, body_hi = config.hammer_ratios.body_bounds()
+    body_range_ratio = (body / rng * 100.0) if rng > config.min_range else 0.0
+    lw_body = (lw / body) if body > config.min_range else 0.0
+    uw_body = (uw / body) if body > config.min_range else 0.0
+    color = candle_color_label(candle)
+    return (
+        f"O={candle.open:.2f} H={candle.high:.2f} L={candle.low:.2f} C={candle.close:.2f} ({color}) | "
+        f"range={rng:.2f} body={body:.2f} ({body_range_ratio:.1f}% of range, need {body_lo:.0f}-{body_hi:.0f}%) | "
+        f"lower_wick={lw:.2f} ({lower_pct:.1f}%, dom band {dom_lo:.0f}-{dom_hi:.0f}%) | "
+        f"upper_wick={uw:.2f} ({upper_pct:.1f}%, small band {small_lo:.0f}-{small_hi:.0f}%) | "
+        f"lower/body={lw_body:.2f} upper/body={uw_body:.2f}"
+    )
+
+
 def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
     """
     STEP 2: Validate hammer SHAPE using the fully editable wick/body bounds
