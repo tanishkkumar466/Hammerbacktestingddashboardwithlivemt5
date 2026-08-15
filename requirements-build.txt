@@ -1,3 +1,11 @@
-# Windows CI / local PyInstaller build (install on top of runtime deps)
+# Hammer Candle Dashboard — Python 3.11 build / PyInstaller
+# GitHub Actions and local Windows packaging must use 3.11.
+#
+#   python3.11 -m pip install -r requirements-build.txt
+#   pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
+
 -r requirements.txt
+
+setuptools>=69
+wheel>=0.43
 pyinstaller>=6.3,<7

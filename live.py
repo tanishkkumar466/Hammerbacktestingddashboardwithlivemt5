@@ -51,20 +51,17 @@ def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_typ
     parts = [
         "[PARAMS]",
         tf_part,
-        f"entry={entry_rule} offset=${entry_off}",
-        f"SL buffer={buf_mode} ({sl_pct}%)" if sl_pct is not None else f"SL buffer={buf_mode}",
         f"risk_limit={'on' if risk_on else 'off'}",
     ]
 
     if pattern_type == "doji":
         parts.append(doji_logic.describe_doji_detection(strategy_config))
+        parts.append(f"entry={entry_rule} offset=${entry_off}")
+        parts.append(f"SL buffer={buf_mode} ({sl_pct}%)" if sl_pct is not None else f"SL buffer={buf_mode}")
     else:
-        parts.append(
-            f"green→{getattr(getattr(strategy_config, 'green_direction', None), 'value', getattr(strategy_config, 'green_direction', '—'))} "
-            f"red→{getattr(getattr(strategy_config, 'red_direction', None), 'value', getattr(strategy_config, 'red_direction', '—'))}"
-        )
-        if hasattr(strategy_config, "enable_classic_hammer"):
-            parts.append(logic.describe_hammer_detection(strategy_config))
+        parts.append(logic.describe_hammer_direction_matrix(strategy_config))
+        parts.append(logic.describe_hammer_detection(strategy_config))
+        parts.append(logic.describe_hammer_entry_exit(strategy_config))
     return " | ".join(str(p) for p in parts)
 
 
@@ -377,14 +374,19 @@ class LiveTradingEngine:
         self.indicator_stack = indicator_stack
         self.pattern_type = pattern_type
         self.pattern_label = pattern_label
-        g = getattr(strategy_config, "green_direction", None)
-        r = getattr(strategy_config, "red_direction", None)
-        gv = getattr(g, "value", g)
-        rv = getattr(r, "value", r)
+        extra = ""
+        if hasattr(strategy_config, "classic_green"):
+            extra = (
+                f"{logic.describe_hammer_direction_matrix(strategy_config)} | "
+                f"{logic.describe_hammer_entry_exit(strategy_config)} | "
+            )
         self.log(
-            f"[LIVE] Parameters refreshed — {pattern_label} | GREEN→{gv} RED→{rv} | "
+            f"[LIVE] Parameters refreshed — {pattern_label} | {extra}"
             f"indicators: {', '.join(indicator_stack.enabled_indicator_ids()) or 'none'}"
         )
+        self.log(summarize_strategy_params(
+            strategy_config, self.live_config.timeframe_label, pattern_type,
+        ))
 
     def _record_trade_event(
         self,
@@ -526,12 +528,11 @@ class LiveTradingEngine:
             f"Indicators: {inds} | {self._active_symbol} {cfg.timeframe_label} | "
             f"lots={cfg.volume} | dry_run={cfg.dry_run} | order={cfg.order_mode}"
         )
-        g = getattr(self.strategy_config, "green_direction", None)
-        r = getattr(self.strategy_config, "red_direction", None)
-        if self.pattern_type != "doji" and g is not None and r is not None:
+        if self.pattern_type != "doji":
             self.log(
-                f"[LIVE] Direction locked for this session: GREEN→{getattr(g, 'value', g)} "
-                f"RED→{getattr(r, 'value', r)} (signal bar color only; entry is next bar open). "
+                f"[LIVE] Direction locked for this session: "
+                f"{logic.describe_hammer_direction_matrix(self.strategy_config)} "
+                f"(signal bar shape+color; entry is next bar). "
                 f"Change Parameters then use 'Apply to live' or Stop/Start live."
             )
         self.log(summarize_strategy_params(
@@ -845,6 +846,20 @@ class LiveTradingEngine:
                         f"[LIVE] Hammer probe: "
                         f"{logic.describe_hammer_probe(signal_bar, self.strategy_config)}"
                     )
+                    hr = logic.check_hammer(signal_bar, self.strategy_config)
+                    if (
+                        hr.hammer_variant is not None
+                        and hr.direction is None
+                        and hr.color in (logic.CandleColor.GREEN, logic.CandleColor.RED)
+                    ):
+                        action = logic.hammer_trade_action(
+                            self.strategy_config, hr.hammer_variant, hr.color,
+                        )
+                        if action == logic.TradeAction.NO:
+                            self.log(
+                                f"[LIVE] {hr.hammer_variant.value} {hr.color.value} matched shape "
+                                f"but Direction tab is NO — no order."
+                            )
             return
 
         key = _signal_key(sig)
@@ -885,17 +900,10 @@ class LiveTradingEngine:
             self.log(logic.explain_hammer_signal_direction(
                 sig.hammer_candle, sig.direction, self.strategy_config, variant,
             ))
-            hc = sig.hammer_candle
-            if hc.is_green and sig.direction == logic.TradeDirection.SELL:
-                self.log(
-                    "[WARN] GREEN signal bar → SELL: check Parameters → Direction "
-                    f"(green_direction={getattr(self.strategy_config.green_direction, 'value', self.strategy_config.green_direction)})."
-                )
-            elif hc.is_red and sig.direction == logic.TradeDirection.BUY:
-                self.log(
-                    "[WARN] RED signal bar → BUY: check Parameters → Direction "
-                    f"(red_direction={getattr(self.strategy_config.red_direction, 'value', self.strategy_config.red_direction)})."
-                )
+            self.log(
+                f"[SIGNAL] Entry/SL from {'inverted' if variant == 'INVERTED' else 'classic'} "
+                f"row: {logic.entry_rule_label_for_variant(self.strategy_config, variant)}"
+            )
         self.log(
             f"[SIGNAL] Entry bar (next candle): {describe_candle(sig.entry_candle)} | "
             f"entry≈{sig.entry_price:.2f} SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"

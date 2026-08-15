@@ -160,6 +160,13 @@ class TradeDirection(Enum):
     SELL = "SELL"
 
 
+class TradeAction(Enum):
+    """Per hammer-type × candle-color choice on the Direction tab."""
+    BUY = "BUY"
+    SELL = "SELL"
+    NO = "NO"
+
+
 class WickSide(Enum):
     """Which wick is checked as the 'dominant' (long) wick for the hammer shape."""
     LOWER = "LOWER"   # classic hammer: long lower wick        (default)
@@ -298,6 +305,146 @@ DEFAULT_TIMEFRAME_SETTINGS: Dict[str, TimeframeSetting] = {
 }
 
 
+def coerce_trade_action(value, default: "TradeAction" = None) -> "TradeAction":
+    """Accept TradeAction, TradeDirection, or BUY/SELL/NO strings."""
+    if default is None:
+        default = TradeAction.NO
+    if isinstance(value, TradeAction):
+        return value
+    if isinstance(value, TradeDirection):
+        return TradeAction.BUY if value == TradeDirection.BUY else TradeAction.SELL
+    raw = str(value or "").strip().upper()
+    if raw in ("NO", "NONE", "SKIP", "OFF", "N"):
+        return TradeAction.NO
+    if raw == "BUY":
+        return TradeAction.BUY
+    if raw == "SELL":
+        return TradeAction.SELL
+    return default
+
+
+def hammer_trade_action(
+    config: "StrategyConfig",
+    variant: Optional["HammerVariant"],
+    color: "CandleColor",
+) -> TradeAction:
+    """Look up Direction-tab action for this shape × candle color."""
+    if variant == HammerVariant.CLASSIC:
+        if color == CandleColor.GREEN:
+            return coerce_trade_action(config.classic_green, TradeAction.BUY)
+        if color == CandleColor.RED:
+            return coerce_trade_action(config.classic_red, TradeAction.SELL)
+    elif variant == HammerVariant.INVERTED:
+        if color == CandleColor.GREEN:
+            return coerce_trade_action(config.inverted_green, TradeAction.BUY)
+        if color == CandleColor.RED:
+            return coerce_trade_action(config.inverted_red, TradeAction.SELL)
+    return TradeAction.NO
+
+
+def sync_legacy_direction_flags(config: "StrategyConfig") -> None:
+    """Keep enable_*/allow_*/green_direction in sync with the four Direction-tab actions."""
+    cg = coerce_trade_action(config.classic_green, TradeAction.BUY)
+    cr = coerce_trade_action(config.classic_red, TradeAction.SELL)
+    ig = coerce_trade_action(config.inverted_green, TradeAction.BUY)
+    ir = coerce_trade_action(config.inverted_red, TradeAction.SELL)
+    config.classic_green, config.classic_red = cg, cr
+    config.inverted_green, config.inverted_red = ig, ir
+    config.enable_classic_hammer = cg != TradeAction.NO or cr != TradeAction.NO
+    config.enable_inverted_hammer = ig != TradeAction.NO or ir != TradeAction.NO
+    config.classic_hammer_allow_buy = TradeAction.BUY in (cg, cr)
+    config.classic_hammer_allow_sell = TradeAction.SELL in (cg, cr)
+    config.inverted_hammer_allow_buy = TradeAction.BUY in (ig, ir)
+    config.inverted_hammer_allow_sell = TradeAction.SELL in (ig, ir)
+    for action in (cg, ig):
+        if action != TradeAction.NO:
+            config.green_direction = (
+                TradeDirection.BUY if action == TradeAction.BUY else TradeDirection.SELL
+            )
+            break
+    for action in (cr, ir):
+        if action != TradeAction.NO:
+            config.red_direction = (
+                TradeDirection.BUY if action == TradeAction.BUY else TradeDirection.SELL
+            )
+            break
+    ui = config.hammer_wick_side
+    if not isinstance(ui, WickSide):
+        try:
+            ui = WickSide(str(ui))
+        except ValueError:
+            ui = WickSide.LOWER
+    config.hammer_wick_side = resolve_hammer_wick_side(
+        config.enable_classic_hammer,
+        config.enable_inverted_hammer,
+        ui,
+    )
+
+
+def describe_hammer_direction_matrix(config: "StrategyConfig") -> str:
+    return (
+        f"Classic green→{coerce_trade_action(config.classic_green).value} "
+        f"red→{coerce_trade_action(config.classic_red).value} | "
+        f"Inverted green→{coerce_trade_action(config.inverted_green).value} "
+        f"red→{coerce_trade_action(config.inverted_red).value}"
+    )
+
+
+def describe_hammer_entry_exit(config: "StrategyConfig") -> str:
+    """Classic vs inverted entry/SL — same string for backtest logs and live start."""
+    c_rule = coerce_entry_rule(getattr(config, "entry_rule", EntryRule.NEXT_CANDLE_OPEN))
+    i_rule = coerce_entry_rule(getattr(config, "inverted_entry_rule", c_rule))
+    c_off = float(getattr(config, "entry_offset", 0.0) or 0.0)
+    i_off = float(getattr(config, "inverted_entry_offset", 0.0) or 0.0)
+    c_buf = coerce_buffer_mode(getattr(config, "buffer_mode", BufferMode.PERCENT_OF_RANGE))
+    i_buf = coerce_buffer_mode(getattr(config, "inverted_buffer_mode", c_buf))
+    return (
+        f"Classic entry={c_rule.value} offset=${c_off:g} SL={c_buf.value} "
+        f"{float(getattr(config, 'sl_buffer_pct', 0) or 0):g}%/"
+        f"${float(getattr(config, 'sl_buffer_flat', 0) or 0):g} | "
+        f"Inverted entry={i_rule.value} offset=${i_off:g} SL={i_buf.value} "
+        f"{float(getattr(config, 'inverted_sl_buffer_pct', 0) or 0):g}%/"
+        f"${float(getattr(config, 'inverted_sl_buffer_flat', 0) or 0):g}"
+    )
+
+
+def entry_rule_label_for_variant(config: "StrategyConfig", variant=None) -> str:
+    if _is_inverted_variant(variant):
+        return coerce_entry_rule(getattr(config, "inverted_entry_rule", config.entry_rule)).value
+    return coerce_entry_rule(config.entry_rule).value
+
+
+def direction_matrix_from_legacy_fields(
+    green_direction="BUY",
+    red_direction="SELL",
+    enable_classic=True,
+    enable_inverted=True,
+    classic_allow_buy=True,
+    classic_allow_sell=True,
+    inverted_allow_buy=True,
+    inverted_allow_sell=True,
+) -> Dict[str, str]:
+    """Convert old Direction-tab presets into the four BUY/SELL/NO fields."""
+    green = coerce_trade_action(green_direction, TradeAction.BUY)
+    red = coerce_trade_action(red_direction, TradeAction.SELL)
+
+    def _slot(enabled: bool, action: TradeAction, allow_buy: bool, allow_sell: bool) -> str:
+        if not enabled or action == TradeAction.NO:
+            return TradeAction.NO.value
+        if action == TradeAction.BUY and not allow_buy:
+            return TradeAction.NO.value
+        if action == TradeAction.SELL and not allow_sell:
+            return TradeAction.NO.value
+        return action.value
+
+    return {
+        "classic_green": _slot(bool(enable_classic), green, classic_allow_buy, classic_allow_sell),
+        "classic_red": _slot(bool(enable_classic), red, classic_allow_buy, classic_allow_sell),
+        "inverted_green": _slot(bool(enable_inverted), green, inverted_allow_buy, inverted_allow_sell),
+        "inverted_red": _slot(bool(enable_inverted), red, inverted_allow_buy, inverted_allow_sell),
+    }
+
+
 @dataclass
 class StrategyConfig:
     """
@@ -308,28 +455,68 @@ class StrategyConfig:
     hammer_ratios: HammerRatioConfig = field(default_factory=HammerRatioConfig)
     hammer_wick_side: WickSide = WickSide.LOWER   # which wick must be dominant
 
-    # ---- hammer type toggles (classic vs inverted) ----
+    # ---- Direction tab: one choice per (shape × color) ----
+    # BUY / SELL / NO. NO = do not trade that combination.
+    classic_green: TradeAction = TradeAction.BUY
+    classic_red: TradeAction = TradeAction.SELL
+    inverted_green: TradeAction = TradeAction.BUY
+    inverted_red: TradeAction = TradeAction.SELL
+
+    # ---- derived / legacy (kept so old presets and code still load) ----
     enable_classic_hammer: bool = True
     enable_inverted_hammer: bool = True
     classic_hammer_allow_buy: bool = True
     classic_hammer_allow_sell: bool = True
     inverted_hammer_allow_buy: bool = True
     inverted_hammer_allow_sell: bool = True
-
-    # ---- color -> direction mapping (swap if you ever want to test inverse) ----
     green_direction: TradeDirection = TradeDirection.BUY
     red_direction: TradeDirection = TradeDirection.SELL
     allow_doji_signals: bool = False   # if True, doji candles won't auto-fail shape check
 
-    # ---- entry ----
-    entry_rule: EntryRule = EntryRule.NEXT_CANDLE_OPEN
-    entry_offset: float = 0.0   # optional flat $ nudge added to whatever entry_rule picks
-                                 # (positive = higher entry, negative = lower entry)
+    def __post_init__(self):
+        self.classic_green = coerce_trade_action(self.classic_green, TradeAction.BUY)
+        self.classic_red = coerce_trade_action(self.classic_red, TradeAction.SELL)
+        self.inverted_green = coerce_trade_action(self.inverted_green, TradeAction.BUY)
+        self.inverted_red = coerce_trade_action(self.inverted_red, TradeAction.SELL)
+        if isinstance(self.green_direction, str):
+            self.green_direction = TradeDirection(self.green_direction)
+        if isinstance(self.red_direction, str):
+            self.red_direction = TradeDirection(self.red_direction)
+        # Old constructors that only flipped enable_* : turn that type to NO.
+        if (
+            not self.enable_classic_hammer
+            and self.classic_green == TradeAction.BUY
+            and self.classic_red == TradeAction.SELL
+        ):
+            self.classic_green = TradeAction.NO
+            self.classic_red = TradeAction.NO
+        if (
+            not self.enable_inverted_hammer
+            and self.inverted_green == TradeAction.BUY
+            and self.inverted_red == TradeAction.SELL
+        ):
+            self.inverted_green = TradeAction.NO
+            self.inverted_red = TradeAction.NO
+        sync_legacy_direction_flags(self)
+        self.entry_rule = coerce_entry_rule(self.entry_rule)
+        self.inverted_entry_rule = coerce_entry_rule(self.inverted_entry_rule)
+        self.buffer_mode = coerce_buffer_mode(self.buffer_mode)
+        self.inverted_buffer_mode = coerce_buffer_mode(self.inverted_buffer_mode)
 
-    # ---- stop loss / buffer ----
+    # ---- entry (classic uses entry_rule; inverted has its own — HAMMER_HIGH
+    #      on a classic is the short-wick side, on inverted it is the long wick) ----
+    entry_rule: EntryRule = EntryRule.NEXT_CANDLE_OPEN
+    entry_offset: float = 0.0
+    inverted_entry_rule: EntryRule = EntryRule.NEXT_CANDLE_OPEN
+    inverted_entry_offset: float = 0.0
+
+    # ---- stop loss / buffer (per hammer type) ----
     buffer_mode: BufferMode = BufferMode.PERCENT_OF_RANGE
-    sl_buffer_pct: float = 5.0     # used when buffer_mode = PERCENT_OF_RANGE or PERCENT_OF_PRICE
-    sl_buffer_flat: float = 0.0    # used when buffer_mode = FLAT_AMOUNT
+    sl_buffer_pct: float = 5.0
+    sl_buffer_flat: float = 0.0
+    inverted_buffer_mode: BufferMode = BufferMode.PERCENT_OF_RANGE
+    inverted_sl_buffer_pct: float = 5.0
+    inverted_sl_buffer_flat: float = 0.0
 
     # ---- risk / target ----
     timeframe_settings: Dict[str, TimeframeSetting] = field(
@@ -376,32 +563,46 @@ def explain_hammer_signal_direction(
 ) -> str:
     """
     Plain-language direction line for live logs.
-    Direction comes from the HAMMER (signal) bar color only — not the entry bar.
+    Direction comes from the HAMMER (signal) bar color + classic/inverted shape.
     """
     color = candle_color_label(hammer_candle)
     shape = variant or "—"
-    if color == "GREEN":
-        mapped = config.green_direction.value
-    elif color == "RED":
-        mapped = config.red_direction.value
-    else:
-        mapped = "—"
+    try:
+        hv = HammerVariant(shape) if shape in ("CLASSIC", "INVERTED") else None
+    except ValueError:
+        hv = None
+    try:
+        cc = CandleColor(color)
+    except ValueError:
+        cc = CandleColor.DOJI
+    mapped = hammer_trade_action(config, hv, cc).value
     return (
-        f"Direction: signal bar {color} → settings {color.lower()}→{mapped} "
-        f"→ {direction.value} | hammer shape={shape}"
+        f"Direction: {shape} {color} → settings {mapped} "
+        f"→ {direction.value}"
     )
 
 
 def expected_direction_for_signal_candle(
     candle: Candle,
     config: StrategyConfig,
+    variant: Optional[str] = None,
 ) -> Optional[TradeDirection]:
-    """Color → trade mapping from StrategyConfig (hammer / same color rule as doji CANDLE_COLOR)."""
+    """Shape × color → BUY/SELL, or None when that combo is set to NO."""
     if candle.is_green:
-        return config.green_direction
-    if candle.is_red:
-        return config.red_direction
-    return None
+        color = CandleColor.GREEN
+    elif candle.is_red:
+        color = CandleColor.RED
+    else:
+        return None
+    hv = None
+    if isinstance(variant, HammerVariant):
+        hv = variant
+    elif variant in ("CLASSIC", "INVERTED"):
+        hv = HammerVariant(variant)
+    action = hammer_trade_action(config, hv, color)
+    if action == TradeAction.NO:
+        return None
+    return TradeDirection.BUY if action == TradeAction.BUY else TradeDirection.SELL
 
 
 def verify_hammer_trade_signal(
@@ -409,61 +610,58 @@ def verify_hammer_trade_signal(
     config: StrategyConfig,
 ) -> Tuple[bool, str]:
     """
-    Ensures signal direction matches green_direction / red_direction on the hammer bar.
-    Returns (False, reason) if settings were not applied correctly to this signal.
+    Ensures signal direction matches the Direction-tab matrix for this
+    hammer shape × candle color. Returns (False, reason) on mismatch.
     """
-    expected = expected_direction_for_signal_candle(sig.hammer_candle, config)
+    variant = getattr(sig, "pattern_variant", None)
+    expected = expected_direction_for_signal_candle(sig.hammer_candle, config, variant)
     if expected is None:
-        return True, ""
+        return False, (
+            f"Parameter check: {variant or 'hammer'} "
+            f"{candle_color_label(sig.hammer_candle)} is set to NO — should not trade."
+        )
     if sig.direction != expected:
         return False, (
-            f"Parameter check failed: {candle_color_label(sig.hammer_candle)} signal bar must "
-            f"→ {expected.value} (your green/red direction settings) but signal is "
-            f"{sig.direction.value}. Stop live, fix Direction tab or preset, Start live again."
+            f"Parameter check failed: {variant or 'hammer'} "
+            f"{candle_color_label(sig.hammer_candle)} must → {expected.value} "
+            f"but signal is {sig.direction.value}. Fix the Direction tab."
         )
     return True, ""
 
 
 def run_hammer_direction_self_test(config: StrategyConfig) -> List[str]:
-    """
-    Quick proof that check_hammer + color mapping match green_direction / red_direction.
-    Uses synthetic OHLC that satisfy default hammer shape bands.
-    """
+    """Prove each of the four Direction-tab combos maps to BUY / SELL / NO."""
     lines: List[str] = [
-        f"Settings: GREEN → {config.green_direction.value}, RED → {config.red_direction.value}",
+        f"Settings: {describe_hammer_direction_matrix(config)}",
         f"Detection: {describe_hammer_detection(config)}",
     ]
-    # Classic-shaped green hammer (long lower wick, small body, small upper wick)
-    green_bar = Candle("selftest-green", 100.0, 100.5, 90.0, 100.4)
-    red_bar = Candle("selftest-red", 100.4, 100.5, 90.0, 99.6)
-    for label, bar in (("GREEN test bar", green_bar), ("RED test bar", red_bar)):
+    # Classic: long lower wick. Inverted: long upper wick.
+    # Ratios sit inside default HammerRatioConfig bands (body ~20%,
+    # dominant ~60%, small ~20%) so the self-test proves direction, not shape.
+    samples = [
+        ("Classic GREEN", Candle("c-g", 100.0, 103.5, 90.0, 102.0), HammerVariant.CLASSIC),
+        ("Classic RED", Candle("c-r", 102.0, 103.5, 90.0, 100.0), HammerVariant.CLASSIC),
+        ("Inverted GREEN", Candle("i-g", 100.0, 108.0, 99.6, 102.0), HammerVariant.INVERTED),
+        ("Inverted RED", Candle("i-r", 102.0, 108.0, 99.6, 100.0), HammerVariant.INVERTED),
+    ]
+    for label, bar, want_variant in samples:
         hr = check_hammer(bar, config)
-        color = candle_color_label(bar)
-        if not hr.is_valid_shape or hr.direction is None:
-            lines.append(f"  {label}: shape did not pass (tune Body/Wicks or hammer type toggles).")
+        color = CandleColor.GREEN if bar.is_green else CandleColor.RED
+        action = hammer_trade_action(config, want_variant, color)
+        if action == TradeAction.NO:
+            if hr.direction is None:
+                lines.append(f"  {label}: OK — set to NO (no trade)")
+            else:
+                lines.append(f"  {label}: FAIL — set to NO but got {hr.direction.value}")
             continue
-        ok, msg = verify_hammer_trade_signal(
-            TradeSignal(
-                direction=hr.direction,
-                hammer_candle=bar,
-                entry_candle=bar,
-                entry_price=0.0,
-                stop_loss=0.0,
-                risk=1.0,
-                rr_multiple=1.0,
-                target=0.0,
-                timeframe="test",
-                pattern_variant=hr.hammer_variant.value if hr.hammer_variant else None,
-            ),
-            config,
-        )
-        if ok:
-            lines.append(
-                f"  {label}: OK — {color} → {hr.direction.value} "
-                f"({hr.hammer_variant.value if hr.hammer_variant else '—'})"
-            )
+        if not hr.is_valid_shape or hr.direction is None:
+            lines.append(f"  {label}: shape did not pass (tune Body/Wicks).")
+            continue
+        expected = TradeDirection.BUY if action == TradeAction.BUY else TradeDirection.SELL
+        if hr.direction == expected:
+            lines.append(f"  {label}: OK — {action.value}")
         else:
-            lines.append(f"  {label}: FAIL — {msg}")
+            lines.append(f"  {label}: FAIL — expected {expected.value}, got {hr.direction.value}")
     return lines
 
 
@@ -485,22 +683,24 @@ def describe_hammer_detection(config: StrategyConfig) -> str:
     return f"Detects {' and '.join(enabled)} · wick mode {ws.value}"
 
 
-def preview_candle_is_green(trade_side: TradeDirection, config: StrategyConfig) -> bool:
-    """
-    For UI preview: candle color that would produce trade_side under
-    green_direction / red_direction mapping.
-    """
-    if trade_side == TradeDirection.BUY:
-        if config.green_direction == TradeDirection.BUY:
-            return True
-        if config.red_direction == TradeDirection.BUY:
-            return False
+def preview_candle_is_green(
+    trade_side: TradeDirection,
+    config: StrategyConfig,
+    variant: str = "CLASSIC",
+) -> bool:
+    """For UI preview: candle color that produces trade_side for this hammer shape."""
+    if variant == HammerVariant.INVERTED.value or variant == "INVERTED":
+        green_a = coerce_trade_action(config.inverted_green)
+        red_a = coerce_trade_action(config.inverted_red)
+    else:
+        green_a = coerce_trade_action(config.classic_green)
+        red_a = coerce_trade_action(config.classic_red)
+    want = TradeAction.BUY if trade_side == TradeDirection.BUY else TradeAction.SELL
+    if green_a == want:
         return True
-    if config.red_direction == TradeDirection.SELL:
+    if red_a == want:
         return False
-    if config.green_direction == TradeDirection.SELL:
-        return True
-    return False
+    return trade_side == TradeDirection.BUY
 
 
 def preview_draw_wick_side(config: StrategyConfig, shape_choice: str) -> str:
@@ -607,10 +807,9 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
     in config.hammer_ratios, and using config.hammer_wick_side to decide
     which wick must be the dominant one (LOWER / UPPER / EITHER).
 
-    COLOR -> DIRECTION MAPPING (editable via config.green_direction /
-    config.red_direction, default GREEN->BUY, RED->SELL). Same mapping for
-    CLASSIC and INVERTED shapes — variant only affects shape filters and
-    optional indicator rules (pattern_variant on TradeSignal).
+    COLOR -> DIRECTION comes from the Direction tab matrix:
+        classic green / classic red / inverted green / inverted red
+        each independently BUY, SELL, or NO.
     """
     body_pct, upper_pct, lower_pct = calculate_candle_metrics(candle, config)
 
@@ -623,10 +822,17 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
     lower_is_dominant = dom_lo <= lower_pct <= dom_hi and small_lo <= upper_pct <= small_hi
     upper_is_dominant = dom_lo <= upper_pct <= dom_hi and small_lo <= lower_pct <= small_hi
 
-    if config.hammer_wick_side == WickSide.LOWER:
+    wick_side = config.hammer_wick_side
+    if not isinstance(wick_side, WickSide):
+        try:
+            wick_side = WickSide(str(wick_side))
+        except ValueError:
+            wick_side = WickSide.EITHER
+
+    if wick_side == WickSide.LOWER:
         shape_ok = body_ok and lower_is_dominant
         variant = HammerVariant.CLASSIC if shape_ok else None
-    elif config.hammer_wick_side == WickSide.UPPER:
+    elif wick_side == WickSide.UPPER:
         shape_ok = body_ok and upper_is_dominant
         variant = HammerVariant.INVERTED if shape_ok else None
     else:  # EITHER
@@ -640,16 +846,17 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
             shape_ok = False
             variant = None
 
-    if shape_ok and variant == HammerVariant.CLASSIC and not config.enable_classic_hammer:
+    classic_on = coerce_trade_action(config.classic_green) != TradeAction.NO or coerce_trade_action(config.classic_red) != TradeAction.NO
+    inverted_on = coerce_trade_action(config.inverted_green) != TradeAction.NO or coerce_trade_action(config.inverted_red) != TradeAction.NO
+    if shape_ok and variant == HammerVariant.CLASSIC and not classic_on:
         shape_ok = False
         variant = None
-    if shape_ok and variant == HammerVariant.INVERTED and not config.enable_inverted_hammer:
+    if shape_ok and variant == HammerVariant.INVERTED and not inverted_on:
         shape_ok = False
         variant = None
 
     is_valid_shape = shape_ok
 
-    # ---- decide color ----
     if candle.is_green:
         color = CandleColor.GREEN
     elif candle.is_red:
@@ -657,17 +864,18 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
     else:
         color = CandleColor.DOJI
         if not config.allow_doji_signals:
-            is_valid_shape = False  # doji has no color signal -> ignored by default
+            is_valid_shape = False
 
-    # ---- decide direction from color (fully editable mapping) ----
     direction = None
-    if is_valid_shape:
-        if color == CandleColor.GREEN:
-            direction = config.green_direction
-        elif color == CandleColor.RED:
-            direction = config.red_direction
-        # DOJI stays None unless allow_doji_signals AND you extend this
-        # mapping yourself (left as None here since a doji has no color).
+    if is_valid_shape and variant is not None and color != CandleColor.DOJI:
+        action = hammer_trade_action(config, variant, color)
+        if action == TradeAction.BUY:
+            direction = TradeDirection.BUY
+        elif action == TradeAction.SELL:
+            direction = TradeDirection.SELL
+        else:
+            is_valid_shape = False
+            direction = None
 
     return HammerResult(
         candle=candle,
@@ -685,18 +893,49 @@ def check_hammer(candle: Candle, config: StrategyConfig) -> HammerResult:
 # SECTION 5: STEP 3 -- ENTRY PRICE (fully configurable via EntryRule)
 # ============================================================================
 
+def coerce_entry_rule(value, default: EntryRule = EntryRule.NEXT_CANDLE_OPEN) -> EntryRule:
+    if isinstance(value, EntryRule):
+        return value
+    try:
+        return EntryRule(str(value))
+    except ValueError:
+        return default
+
+
+def coerce_buffer_mode(value, default: BufferMode = BufferMode.PERCENT_OF_RANGE) -> BufferMode:
+    if isinstance(value, BufferMode):
+        return value
+    try:
+        return BufferMode(str(value))
+    except ValueError:
+        return default
+
+
+def _is_inverted_variant(variant) -> bool:
+    if variant == HammerVariant.INVERTED:
+        return True
+    if isinstance(variant, str) and variant.upper() == HammerVariant.INVERTED.value:
+        return True
+    return False
+
+
 def calculate_entry_price(
     hammer_candle: Candle,
     next_candle: Candle,
     config: StrategyConfig,
+    variant=None,
 ) -> float:
     """
-    STEP 3: Resolve entry price according to config.entry_rule.
-    Default = NEXT_CANDLE_OPEN (matches your flowchart exactly).
-    Other modes exist purely so you can test alternate entry timing.
-    An optional flat entry_offset $ is then added (default 0, no effect).
+    STEP 3: Entry from Classic or Inverted Entry Rule (Direction-tab shape).
+    HAMMER_HIGH / HAMMER_LOW are the candle high/low — set inverted separately
+    so a classic HAMMER_HIGH does not also enter inverted at the long-wick tip.
     """
-    rule = config.entry_rule
+    if _is_inverted_variant(variant):
+        rule = coerce_entry_rule(getattr(config, "inverted_entry_rule", config.entry_rule))
+        offset = float(getattr(config, "inverted_entry_offset", config.entry_offset) or 0.0)
+    else:
+        rule = coerce_entry_rule(config.entry_rule)
+        offset = float(config.entry_offset or 0.0)
 
     if rule == EntryRule.NEXT_CANDLE_OPEN:
         base = next_candle.open
@@ -711,43 +950,44 @@ def calculate_entry_price(
     else:
         raise ValueError(f"Unknown entry_rule: {rule}")
 
-    return base + config.entry_offset
+    return base + offset
 
-
-# ============================================================================
-# SECTION 6: STEP 4 -- STOP LOSS (fully configurable via BufferMode)
-# ============================================================================
 
 def calculate_stop_loss(
     hammer_candle: Candle,
     direction: TradeDirection,
     config: StrategyConfig,
+    variant=None,
 ) -> float:
     """
-    STEP 4: SL = hammer LOW (BUY) / HIGH (SELL), adjusted by a buffer.
-    Buffer size and mode are both configurable:
-        PERCENT_OF_RANGE : buffer = hammer_candle.range_ * sl_buffer_pct/100
-        PERCENT_OF_PRICE : buffer = (low or high price) * sl_buffer_pct/100
-        FLAT_AMOUNT       : buffer = sl_buffer_flat  (a fixed $ value)
-        NONE              : buffer = 0 (SL sits exactly at the wick tip)
+    STEP 4: SL = hammer LOW (BUY) / HIGH (SELL), plus the buffer for that hammer type.
     """
+    inverted = _is_inverted_variant(variant)
+    if inverted:
+        buffer_mode = coerce_buffer_mode(getattr(config, "inverted_buffer_mode", config.buffer_mode))
+        sl_pct = float(getattr(config, "inverted_sl_buffer_pct", config.sl_buffer_pct) or 0.0)
+        sl_flat = float(getattr(config, "inverted_sl_buffer_flat", config.sl_buffer_flat) or 0.0)
+    else:
+        buffer_mode = coerce_buffer_mode(config.buffer_mode)
+        sl_pct = float(config.sl_buffer_pct or 0.0)
+        sl_flat = float(config.sl_buffer_flat or 0.0)
+
     anchor = hammer_candle.low if direction == TradeDirection.BUY else hammer_candle.high
 
-    if config.buffer_mode == BufferMode.PERCENT_OF_RANGE:
-        buffer_amount = hammer_candle.range_ * (config.sl_buffer_pct / 100.0)
-    elif config.buffer_mode == BufferMode.PERCENT_OF_PRICE:
-        buffer_amount = anchor * (config.sl_buffer_pct / 100.0)
-    elif config.buffer_mode == BufferMode.FLAT_AMOUNT:
-        buffer_amount = config.sl_buffer_flat
-    elif config.buffer_mode == BufferMode.NONE:
+    if buffer_mode == BufferMode.PERCENT_OF_RANGE:
+        buffer_amount = hammer_candle.range_ * (sl_pct / 100.0)
+    elif buffer_mode == BufferMode.PERCENT_OF_PRICE:
+        buffer_amount = anchor * (sl_pct / 100.0)
+    elif buffer_mode == BufferMode.FLAT_AMOUNT:
+        buffer_amount = sl_flat
+    elif buffer_mode == BufferMode.NONE:
         buffer_amount = 0.0
     else:
-        raise ValueError(f"Unknown buffer_mode: {config.buffer_mode}")
+        raise ValueError(f"Unknown buffer_mode: {buffer_mode}")
 
     if direction == TradeDirection.BUY:
-        return anchor - buffer_amount   # SL pushed further below the low
-    else:
-        return anchor + buffer_amount   # SL pushed further above the high
+        return anchor - buffer_amount
+    return anchor + buffer_amount
 
 
 # ============================================================================
@@ -845,8 +1085,8 @@ def build_trade_signal(
     hammer_candle = hammer_result.candle
     direction = hammer_result.direction
 
-    entry_price = calculate_entry_price(hammer_candle, next_candle, config)
-    stop_loss = calculate_stop_loss(hammer_candle, direction, config)
+    entry_price = calculate_entry_price(hammer_candle, next_candle, config, variant)
+    stop_loss = calculate_stop_loss(hammer_candle, direction, config, variant)
 
     if direction == TradeDirection.BUY:
         risk = entry_price - stop_loss

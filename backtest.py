@@ -342,13 +342,17 @@ class SimulatedTrade:
     One row of the final trade ledger. Holds the original TradeSignal
     from logic.py PLUS the simulated outcome under each exit model, PLUS
     P&L and metadata needed for the metrics tables.
+
+    position_size / risk_usd are per exit model because overlap filtering
+    and PERCENT_OF_EQUITY compounding follow a different equity path in
+    each model.
     """
     signal: "logic.TradeSignal"
     timeframe_folder: str
     entry_time: datetime
     outcomes: Dict[ExitModel, Tuple[TradeOutcome, Optional[float], Optional[datetime], Optional[int]]]
-    position_size: float = 0.0
-    risk_usd: float = 0.0
+    position_size: Dict[ExitModel, float] = field(default_factory=dict)
+    risk_usd: Dict[ExitModel, float] = field(default_factory=dict)
     pnl: Dict[ExitModel, float] = field(default_factory=dict)
     equity_after: Dict[ExitModel, float] = field(default_factory=dict)
 
@@ -540,6 +544,43 @@ def _resolve_short_scan(
 # SECTION 5: POSITION SIZING
 # ============================================================================
 
+def _sizing_mode(config: BacktestConfig) -> PositionSizingMode:
+    mode = config.position_sizing_mode
+    if isinstance(mode, PositionSizingMode):
+        return mode
+    return PositionSizingMode(str(mode))
+
+
+def validate_position_sizing_config(config: BacktestConfig) -> Optional[str]:
+    """Human-readable error if Run Settings cannot size trades correctly."""
+    try:
+        mode = _sizing_mode(config)
+    except ValueError:
+        return f"Unknown position sizing mode: {config.position_sizing_mode!r}"
+
+    if config.starting_capital <= 0:
+        return "Starting Capital must be greater than 0."
+    if config.commission_per_trade < 0:
+        return "Commission per Trade cannot be negative."
+    if config.slippage_usd < 0:
+        return "Slippage cannot be negative."
+
+    if mode == PositionSizingMode.FIXED_UNITS:
+        if config.position_size <= 0 or not math.isfinite(config.position_size):
+            return "Fixed Units mode needs Position Size > 0."
+    elif mode == PositionSizingMode.FIXED_RISK_USD:
+        if config.fixed_risk_usd <= 0 or not math.isfinite(config.fixed_risk_usd):
+            return "Fixed Risk ($) mode needs Fixed Risk per Trade > 0."
+    elif mode == PositionSizingMode.PERCENT_OF_EQUITY:
+        if config.risk_pct_of_equity <= 0 or not math.isfinite(config.risk_pct_of_equity):
+            return "Percent of Equity mode needs Risk per Trade (%) > 0."
+        if config.risk_pct_of_equity > 100:
+            return "Risk per Trade (%) cannot exceed 100."
+        if config.max_equity_multiple <= 0:
+            return "Max Equity Multiple must be greater than 0 (try 50)."
+    return None
+
+
 def calculate_position_size(
     trade_signal: "logic.TradeSignal",
     config: BacktestConfig,
@@ -548,44 +589,47 @@ def calculate_position_size(
     """
     Returns (position_size, risk_usd_for_this_trade).
 
-    Applies two safety guards (see BacktestConfig.equity_floor_usd and
-    max_equity_multiple):
-        - if current_equity has dropped to/below equity_floor_usd,
-          sizing returns (0, 0) -- treated as halted/blown.
-        - the equity value USED for sizing is capped at
-          max_equity_multiple x starting_capital. This is what keeps
-          PERCENT_OF_EQUITY sizing bounded across very high trade counts
-          -- see the long comment on that config field for why this
-          matters (uncapped compounding across tens of thousands of
-          trades is a mathematical certainty to explode, not a bug).
+    FIXED_UNITS: constant lots/units. Running equity never changes size.
+    FIXED_RISK_USD: constant $ risk. Size = risk_usd / (entry-to-SL distance).
+        Running equity is a scoreboard only — it does not compound size.
+    PERCENT_OF_EQUITY: risk_usd = current equity * risk%. Size grows/shrinks
+        with the account. Halted at equity_floor_usd. Sizing equity is capped
+        at starting_capital * max_equity_multiple so high trade counts cannot
+        explode into astronomical lots.
     """
-    risk_per_unit = trade_signal.risk
-
-    if risk_per_unit <= 0:
+    risk_per_unit = float(trade_signal.risk)
+    if not math.isfinite(risk_per_unit) or risk_per_unit <= 0:
         return 0.0, 0.0
 
-    if current_equity <= config.equity_floor_usd:
-        return 0.0, 0.0
+    mode = _sizing_mode(config)
 
-    equity_cap = config.starting_capital * config.max_equity_multiple
-    sizing_equity = min(current_equity, equity_cap)
+    if mode == PositionSizingMode.FIXED_UNITS:
+        size = float(config.position_size)
+        if not math.isfinite(size) or size <= 0:
+            return 0.0, 0.0
+        return size, size * risk_per_unit
 
-    if config.position_sizing_mode == PositionSizingMode.FIXED_UNITS:
-        size = config.position_size
-        risk_usd = size * risk_per_unit
+    if mode == PositionSizingMode.FIXED_RISK_USD:
+        risk_usd = float(config.fixed_risk_usd)
+        if not math.isfinite(risk_usd) or risk_usd <= 0:
+            return 0.0, 0.0
+        return risk_usd / risk_per_unit, risk_usd
 
-    elif config.position_sizing_mode == PositionSizingMode.FIXED_RISK_USD:
-        risk_usd = config.fixed_risk_usd
-        size = risk_usd / risk_per_unit
+    if mode == PositionSizingMode.PERCENT_OF_EQUITY:
+        if current_equity <= config.equity_floor_usd or current_equity <= 0:
+            return 0.0, 0.0
+        multiple = float(config.max_equity_multiple)
+        if not math.isfinite(multiple) or multiple <= 0:
+            multiple = 50.0
+        equity_cap = config.starting_capital * multiple
+        sizing_equity = min(float(current_equity), equity_cap)
+        pct = float(config.risk_pct_of_equity)
+        if not math.isfinite(pct) or pct <= 0:
+            return 0.0, 0.0
+        risk_usd = sizing_equity * (pct / 100.0)
+        return risk_usd / risk_per_unit, risk_usd
 
-    elif config.position_sizing_mode == PositionSizingMode.PERCENT_OF_EQUITY:
-        risk_usd = sizing_equity * (config.risk_pct_of_equity / 100.0)
-        size = risk_usd / risk_per_unit
-
-    else:
-        raise ValueError(f"Unknown position_sizing_mode: {config.position_sizing_mode}")
-
-    return size, risk_usd
+    raise ValueError(f"Unknown position_sizing_mode: {config.position_sizing_mode}")
 
 
 def calculate_pnl(
@@ -617,15 +661,13 @@ def calculate_pnl(
 # SECTION 6: MAIN BACKTEST LOOP (per timeframe)
 # ============================================================================
 
-def backtest_single_timeframe(
+def simulate_timeframe_outcomes(
     timeframe_folder: str,
     config: BacktestConfig,
-) -> Tuple[List[SimulatedTrade], List["logic.TradeSignal"]]:
+) -> Tuple[Dict[ExitModel, List[Tuple]], List["logic.TradeSignal"]]:
     """
-    Runs the full pipeline for ONE timeframe:
-        load candles (Polars) -> logic.run_strategy() -> for every taken
-        signal, simulate forward under all 3 exit models (vectorized
-        NumPy) -> size position -> compute P&L -> return ledger + ignored.
+    Load candles, generate signals, resolve SL/TP under all exit models,
+    and apply per-timeframe overlap. Does not size positions.
     """
     logic_label = config.timeframe_folder_to_logic_label.get(timeframe_folder, timeframe_folder)
 
@@ -637,7 +679,8 @@ def backtest_single_timeframe(
     if df.height < 3:
         print(f"[SKIP] {timeframe_folder}: not enough candle data "
               f"({df.height} candles found).")
-        return [], []
+        empty = {m: [] for m in ALL_EXIT_MODELS}
+        return empty, []
 
     candles = df_to_candles(df)
 
@@ -712,123 +755,129 @@ def backtest_single_timeframe(
             if not config.allow_overlapping_trades and exit_time is not None:
                 open_until[exit_model] = exit_time
 
-    # ---- PASS 2: position sizing + P&L, settled in TRUE CHRONOLOGICAL
-    #      EXIT ORDER (not entry-processing order) for equity-dependent
-    #      sizing. This is the critical fix for PERCENT_OF_EQUITY sizing
-    #      combined with allow_overlapping_trades=True: if trade B enters
-    #      before trade A actually closes, B must be sized off the equity
-    #      that existed at B's ENTRY time, not off equity already inflated
-    #      by A's profit if A closed later than B opened. Sizing at entry
-    #      time and settling P&L at exit time (both in true time order)
-    #      keeps compounding realistic instead of runaway. ----
-    per_model_trades: Dict[ExitModel, Dict[int, SimulatedTrade]] = {m: {} for m in ALL_EXIT_MODELS}
+    return filtered_outcomes, ignored_signals
+
+
+def settle_position_sizing(
+    per_tf_filtered: List[Tuple[str, Dict[ExitModel, List[Tuple]]]],
+    config: BacktestConfig,
+) -> List[SimulatedTrade]:
+    """
+    Apply position sizing + P&L on ONE shared account across all timeframes.
+
+    Each timeframe still applies its own overlap filter (a 3m trade does not
+    block a 1h trade). Equity and compounding then run in true chronological
+    order across every taken trade so PERCENT_OF_EQUITY cannot compound the
+    same starting capital once per timeframe.
+    """
+    per_model_rows: Dict[ExitModel, List[Tuple]] = {m: [] for m in ALL_EXIT_MODELS}
+    for tf_folder, filtered_outcomes in per_tf_filtered:
+        for exit_model in ALL_EXIT_MODELS:
+            for sig, outcome, exit_price, exit_time, bars_held in filtered_outcomes[exit_model]:
+                per_model_rows[exit_model].append(
+                    (tf_folder, sig, outcome, exit_price, exit_time, bars_held)
+                )
+
+    merged: Dict[int, SimulatedTrade] = {}
 
     for exit_model in ALL_EXIT_MODELS:
-        rows = filtered_outcomes[exit_model]
-
-        # events: ('entry', entry_time, trade_idx) for sizing,
-        #         ('exit', exit_time, trade_idx) for settling P&L
+        rows = per_model_rows[exit_model]
         events = []
-        for i, (sig, outcome, exit_price, exit_time, bars_held) in enumerate(rows):
-            events.append((sig.entry_candle.timestamp, 0, i, "entry"))  # 0 sorts entries before exits at same timestamp
+        for i, (tf_folder, sig, outcome, exit_price, exit_time, bars_held) in enumerate(rows):
+            events.append((sig.entry_candle.timestamp, 0, i, "entry", tf_folder or ""))
             if outcome in (TradeOutcome.WIN, TradeOutcome.LOSS) and exit_time is not None:
-                events.append((exit_time, 1, i, "exit"))
-        events.sort(key=lambda e: (e[0], e[1]))
+                events.append((exit_time, 1, i, "exit", tf_folder or ""))
+        events.sort(key=lambda e: (e[0], e[1], e[4], e[2]))
 
         equity = config.starting_capital
-        sized: Dict[int, Tuple[float, float]] = {}  # trade_idx -> (pos_size, risk_usd)
+        sized: Dict[int, Tuple[float, float]] = {}
 
-        for _, _, i, kind in events:
-            sig, outcome, exit_price, exit_time, bars_held = rows[i]
+        for _, _, i, kind, _tf in events:
+            tf_folder, sig, outcome, exit_price, exit_time, bars_held = rows[i]
 
             if kind == "entry":
                 if outcome == TradeOutcome.SKIPPED_OVERLAP:
                     sized[i] = (0.0, 0.0)
                     continue
-                pos_size, risk_usd = calculate_position_size(sig, config, equity)
-                sized[i] = (pos_size, risk_usd)
+                sized[i] = calculate_position_size(sig, config, equity)
+            else:
+                pos_size, _risk_usd = sized.get(i, (0.0, 0.0))
+                equity += calculate_pnl(sig, outcome, exit_price, pos_size, config)
 
-            else:  # exit -- settle P&L into equity NOW, in true time order
-                pos_size, risk_usd = sized.get(i, (0.0, 0.0))
-                trade_pnl = calculate_pnl(sig, outcome, exit_price, pos_size, config)
-                equity += trade_pnl
-
-        # ---- build final SimulatedTrade rows for this exit model ----
-        # (equity_after here reflects equity AFTER this trade's exit event
-        # was processed in true time order, which is what makes the
-        # resulting equity curve/drawdown correct for overlapping trades)
         equity_replay = config.starting_capital
         equity_after_by_idx: Dict[int, float] = {}
-        for _, _, i, kind in events:
+        for _, _, i, kind, _tf in events:
             if kind == "exit":
-                sig, outcome, exit_price, exit_time, bars_held = rows[i]
-                pos_size, risk_usd = sized.get(i, (0.0, 0.0))
-                trade_pnl = calculate_pnl(sig, outcome, exit_price, pos_size, config)
-                equity_replay += trade_pnl
+                tf_folder, sig, outcome, exit_price, exit_time, bars_held = rows[i]
+                pos_size, _risk_usd = sized.get(i, (0.0, 0.0))
+                equity_replay += calculate_pnl(sig, outcome, exit_price, pos_size, config)
                 equity_after_by_idx[i] = equity_replay
 
-        for i, (sig, outcome, exit_price, exit_time, bars_held) in enumerate(rows):
+        for i, (tf_folder, sig, outcome, exit_price, exit_time, bars_held) in enumerate(rows):
             pos_size, risk_usd = sized.get(i, (0.0, 0.0))
-            trade_pnl = calculate_pnl(sig, outcome, exit_price, pos_size, config) if outcome in (TradeOutcome.WIN, TradeOutcome.LOSS) else 0.0
+            trade_pnl = (
+                calculate_pnl(sig, outcome, exit_price, pos_size, config)
+                if outcome in (TradeOutcome.WIN, TradeOutcome.LOSS) else 0.0
+            )
             eq_after = equity_after_by_idx.get(i, equity_replay)
-
             key = id(sig)
-            if key not in per_model_trades[exit_model]:
-                per_model_trades[exit_model][key] = {
-                    "sig": sig, "outcomes": {}, "pnl": {}, "equity_after": {},
-                    "position_size": pos_size, "risk_usd": risk_usd,
-                }
-            per_model_trades[exit_model][key]["outcomes"][exit_model] = (outcome, exit_price, exit_time, bars_held)
-            per_model_trades[exit_model][key]["pnl"][exit_model] = trade_pnl
-            per_model_trades[exit_model][key]["equity_after"][exit_model] = eq_after
-
-    # ---- merge the per-model dicts back into one SimulatedTrade per signal ----
-    merged: Dict[int, SimulatedTrade] = {}
-    for exit_model in ALL_EXIT_MODELS:
-        for key, data in per_model_trades[exit_model].items():
             if key not in merged:
                 merged[key] = SimulatedTrade(
-                    signal=data["sig"],
-                    timeframe_folder=timeframe_folder,
-                    entry_time=data["sig"].entry_candle.timestamp,
+                    signal=sig,
+                    timeframe_folder=tf_folder,
+                    entry_time=sig.entry_candle.timestamp,
                     outcomes={},
-                    position_size=data["position_size"],
-                    risk_usd=data["risk_usd"],
+                    position_size={},
+                    risk_usd={},
                     pnl={},
                     equity_after={},
                 )
-            merged[key].outcomes.update(data["outcomes"])
-            merged[key].pnl.update(data["pnl"])
-            merged[key].equity_after.update(data["equity_after"])
+            merged[key].outcomes[exit_model] = (outcome, exit_price, exit_time, bars_held)
+            merged[key].position_size[exit_model] = pos_size
+            merged[key].risk_usd[exit_model] = risk_usd
+            merged[key].pnl[exit_model] = trade_pnl
+            merged[key].equity_after[exit_model] = eq_after
 
-    ledger: List[SimulatedTrade] = sorted(merged.values(), key=lambda t: t.entry_time)
+    return sorted(merged.values(), key=lambda t: (t.entry_time, t.timeframe_folder))
 
-    return ledger, ignored_signals
+
+def backtest_single_timeframe(
+    timeframe_folder: str,
+    config: BacktestConfig,
+) -> Tuple[List[SimulatedTrade], List["logic.TradeSignal"]]:
+    """
+    Runs the full pipeline for ONE timeframe:
+        load candles -> signals -> forward exits -> size on that TF alone.
+    Prefer run_full_backtest() so sizing uses one shared account.
+    """
+    filtered, ignored = simulate_timeframe_outcomes(timeframe_folder, config)
+    ledger = settle_position_sizing([(timeframe_folder, filtered)], config)
+    return ledger, ignored
 
 
 def run_full_backtest(config: BacktestConfig) -> Tuple[List[SimulatedTrade], List["logic.TradeSignal"]]:
-    """Runs backtest_single_timeframe() across every configured timeframe."""
-    full_ledger: List[SimulatedTrade] = []
+    """Run every timeframe, then size all trades on one shared account."""
+    sizing_err = validate_position_sizing_config(config)
+    if sizing_err:
+        raise ValueError(sizing_err)
+
+    per_tf_filtered: List[Tuple[str, Dict[ExitModel, List[Tuple]]]] = []
     full_ignored: List["logic.TradeSignal"] = []
 
     for tf_folder in config.timeframes_to_test:
         print(f"\n--- Backtesting {config.symbol} [{tf_folder}] ---")
-        ledger, ignored = backtest_single_timeframe(tf_folder, config)
-        skipped_count = sum(
-            1 for t in ledger
-            if t.outcomes[ExitModel.WORST_CASE][0] == TradeOutcome.SKIPPED_OVERLAP
-        )
-        open_count = sum(
-            1 for t in ledger
-            if t.outcomes[ExitModel.WORST_CASE][0] == TradeOutcome.STILL_OPEN
-        )
-        print(f"    Taken signals: {len(ledger)} | Ignored (by logic.py): {len(ignored)} | "
+        filtered, ignored = simulate_timeframe_outcomes(tf_folder, config)
+        worst = filtered[ExitModel.WORST_CASE]
+        skipped_count = sum(1 for row in worst if row[1] == TradeOutcome.SKIPPED_OVERLAP)
+        open_count = sum(1 for row in worst if row[1] == TradeOutcome.STILL_OPEN)
+        print(f"    Signals: {len(worst)} | Ignored (by logic.py): {len(ignored)} | "
               f"Skipped (overlap, worst_case view): {skipped_count} | "
               f"Still open (worst_case view): {open_count}")
-        full_ledger.extend(ledger)
+        per_tf_filtered.append((tf_folder, filtered))
         full_ignored.extend(ignored)
 
-    return full_ledger, full_ignored
+    ledger = settle_position_sizing(per_tf_filtered, config)
+    return ledger, full_ignored
 
 
 # ============================================================================
@@ -869,14 +918,16 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             "target": sig.target,
             "risk_price_distance": sig.risk,
             "rr_multiple_target": sig.rr_multiple,
-            "position_size": t.position_size,
-            "risk_usd": t.risk_usd,
             "year": t.entry_time.year,
             "month_key": f"{t.entry_time.year:04d}-{t.entry_time.month:02d}",
         }
         for exit_model in ALL_EXIT_MODELS:
             outcome, exit_price, exit_time, bars_held = t.outcomes[exit_model]
+            pos_size = t.position_size.get(exit_model, 0.0) if isinstance(t.position_size, dict) else t.position_size
+            risk_usd = t.risk_usd.get(exit_model, 0.0) if isinstance(t.risk_usd, dict) else t.risk_usd
             row = dict(base)
+            row["position_size"] = pos_size
+            row["risk_usd"] = risk_usd
             row["exit_model"] = exit_model.value
             row["outcome"] = outcome.value
             row["exit_price"] = exit_price
@@ -1173,7 +1224,7 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     print(f"BACKTEST: {config.symbol} | Pattern: {config.pattern_type} | "
           f"Timeframes: {config.timeframes_to_test}")
     print(f"Overlap allowed: {config.allow_overlapping_trades} | "
-          f"Sizing: {config.position_sizing_mode.value}")
+          f"Sizing: {_sizing_mode(config).value}")
     print("=" * 70)
 
     ledger, ignored = run_full_backtest(config)

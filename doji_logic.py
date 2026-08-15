@@ -175,11 +175,15 @@ def preview_candle_is_green(trade_side: logic.TradeDirection, config: DojiStrate
             mode = DojiDirectionMode.WICK_BIAS
 
     if mode == DojiDirectionMode.CANDLE_COLOR:
+        g = logic.coerce_trade_action(config.green_direction, logic.TradeAction.BUY)
+        r = logic.coerce_trade_action(config.red_direction, logic.TradeAction.SELL)
         return logic.preview_candle_is_green(
             trade_side,
             logic.StrategyConfig(
-                green_direction=config.green_direction,
-                red_direction=config.red_direction,
+                classic_green=g,
+                classic_red=r,
+                inverted_green=g,
+                inverted_red=r,
             ),
         )
     if mode == DojiDirectionMode.FIXED_BUY:

@@ -412,7 +412,14 @@ class RunDatabase:
         else:
             pattern_label = "Hammer"
             entry_signal = "Hammer Candle"
-            trade_direction = (
+            trade_direction = logic.describe_hammer_direction_matrix(
+                logic.StrategyConfig(
+                    classic_green=logic.coerce_trade_action(strategy.get("classic_green", "BUY")),
+                    classic_red=logic.coerce_trade_action(strategy.get("classic_red", "SELL")),
+                    inverted_green=logic.coerce_trade_action(strategy.get("inverted_green", "BUY")),
+                    inverted_red=logic.coerce_trade_action(strategy.get("inverted_red", "SELL")),
+                )
+            ) if strategy.get("classic_green") is not None else (
                 f"Green={strategy.get('green_direction')}, Red={strategy.get('red_direction')}"
             )
             body_pct = hammer.get("body_pct")
@@ -749,17 +756,10 @@ def default_value_for_field(name: str, sources: List) -> Any:
     return ""
 
 DIRECTION_FIELDS = [
-    ("green_direction", "Green Candle Direction", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeDirection)),
-    ("red_direction", "Red Candle Direction", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeDirection)),
-]
-
-HAMMER_TYPE_FIELDS = [
-    ("enable_classic_hammer", "Enable Classic Hammer (long lower wick)", FIELD_TYPE_CHECK, None),
-    ("enable_inverted_hammer", "Enable Inverted Hammer (long upper wick)", FIELD_TYPE_CHECK, None),
-    ("classic_hammer_allow_buy", "Classic Hammer — allow BUY", FIELD_TYPE_CHECK, None),
-    ("classic_hammer_allow_sell", "Classic Hammer — allow SELL", FIELD_TYPE_CHECK, None),
-    ("inverted_hammer_allow_buy", "Inverted Hammer — allow BUY", FIELD_TYPE_CHECK, None),
-    ("inverted_hammer_allow_sell", "Inverted Hammer — allow SELL", FIELD_TYPE_CHECK, None),
+    ("classic_green", "Classic Hammer — green candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
+    ("classic_red", "Classic Hammer — red candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
+    ("inverted_green", "Inverted Hammer — green candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
+    ("inverted_red", "Inverted Hammer — red candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
 ]
 
 INDICATOR_UI_DEFAULTS = {
@@ -771,9 +771,33 @@ INDICATOR_UI_DEFAULTS = {
 }
 
 # Field names used to show/hide parameter rows when the user switches pattern.
-HAMMER_ONLY_FIELD_NAMES = {f[0] for f in HAMMER_SHAPE_FIELDS + DIRECTION_FIELDS + HAMMER_TYPE_FIELDS}
+INVERTED_ENTRY_EXIT_FIELD_NAMES = {
+    "inverted_entry_rule", "inverted_entry_offset",
+    "inverted_buffer_mode", "inverted_sl_buffer_pct", "inverted_sl_buffer_flat",
+}
+HAMMER_ONLY_FIELD_NAMES = {
+    f[0] for f in HAMMER_SHAPE_FIELDS + DIRECTION_FIELDS
+} | INVERTED_ENTRY_EXIT_FIELD_NAMES
 
-ENTRY_EXIT_FIELDS = [
+CLASSIC_ENTRY_EXIT_FIELDS = [
+    ("entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
+    ("entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
+    ("buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
+    ("sl_buffer_pct", "SL Buffer %", FIELD_TYPE_TEXT, None),
+    ("sl_buffer_flat", "SL Buffer Flat ($)", FIELD_TYPE_TEXT, None),
+]
+
+INVERTED_ENTRY_EXIT_FIELDS = [
+    ("inverted_entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
+    ("inverted_entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
+    ("inverted_buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
+    ("inverted_sl_buffer_pct", "SL Buffer %", FIELD_TYPE_TEXT, None),
+    ("inverted_sl_buffer_flat", "SL Buffer Flat ($)", FIELD_TYPE_TEXT, None),
+]
+
+ENTRY_EXIT_FIELDS = CLASSIC_ENTRY_EXIT_FIELDS + INVERTED_ENTRY_EXIT_FIELDS
+
+DOJI_ENTRY_EXIT_FIELDS = [
     ("entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
     ("entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
     ("buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
@@ -787,7 +811,7 @@ RISK_CONTROL_FIELDS = [
 ]
 
 STRATEGY_FIELDS = (
-    DIRECTION_FIELDS + HAMMER_TYPE_FIELDS
+    DIRECTION_FIELDS
     + ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS
 )
 
@@ -860,8 +884,9 @@ FIELD_HELP: Dict[str, str] = {
     "small_tol_lower": "Small wick % tolerance on the low side only.",
     "small_tol_upper": "Small wick % tolerance on the high side only.",
     "hammer_wick_side": (
-        "Preview / fallback when both hammer types are off. At run time, Classic + Inverted checkboxes "
-        "set detection: both on = EITHER shape, inverted only = UPPER wick, classic only = LOWER wick."
+        "Preview fallback only. Detection follows the Direction tab: "
+        "if any Classic row is Buy/Sell, classic (long lower wick) is on; "
+        "if any Inverted row is Buy/Sell, inverted (long upper wick) is on."
     ),
     "doji_max_body_pct": "Maximum body size (% of range) for a valid doji -- body must be at or below this (+ tolerance).",
     "doji_max_body_tol": "Extra body % allowed above the max (effective ceiling = max + tolerance).",
@@ -881,30 +906,33 @@ FIELD_HELP: Dict[str, str] = {
     "doji_allow_green_trades": "When off, green dojis never produce a trade (CANDLE_COLOR mode).",
     "doji_allow_red_trades": "When off, red dojis never produce a trade (CANDLE_COLOR mode).",
     "indicators_combine_mode": "When two or more indicators are added: ALL = every filter must pass; ANY = at least one.",
-    "green_direction": (
-        "Trade direction when the HAMMER (signal) candle closes green — not the next entry bar. "
-        "Default BUY. Classic and inverted hammers both use this same color rule."
-    ),
-    "red_direction": (
-        "Trade direction when the HAMMER (signal) candle closes red — not the next entry bar. "
-        "Default SELL. Classic and inverted hammers both use this same color rule."
-    ),
-    "enable_classic_hammer": "Detect classic hammers: long lower wick, small upper wick (hammer at support).",
-    "enable_inverted_hammer": (
-        "Detect inverted hammers (long upper wick). Must be on for inverted-shaped candles to qualify; "
-        "with Classic also on, both shapes are allowed (EITHER)."
-    ),
-    "classic_hammer_allow_buy": "If off, classic hammer signals never open BUY trades.",
-    "classic_hammer_allow_sell": "If off, classic hammer signals never open SELL trades.",
-    "inverted_hammer_allow_buy": "If off, inverted hammer signals never open BUY trades.",
-    "inverted_hammer_allow_sell": "If off, inverted hammer signals never open SELL trades.",
+    "green_direction": "Legacy field — use Classic/Inverted green dropdowns on the Direction tab.",
+    "red_direction": "Legacy field — use Classic/Inverted red dropdowns on the Direction tab.",
+    "classic_green": "When a CLASSIC hammer (long lower wick) closes green: BUY, SELL, or NO (skip).",
+    "classic_red": "When a CLASSIC hammer (long lower wick) closes red: BUY, SELL, or NO (skip).",
+    "inverted_green": "When an INVERTED hammer (long upper wick) closes green: BUY, SELL, or NO (skip).",
+    "inverted_red": "When an INVERTED hammer (long upper wick) closes red: BUY, SELL, or NO (skip).",
+    "enable_classic_hammer": "Legacy — set Classic green and Classic red to NO to turn classic off.",
+    "enable_inverted_hammer": "Legacy — set Inverted green and Inverted red to NO to turn inverted off.",
+    "classic_hammer_allow_buy": "Legacy — use Classic green/red = BUY instead.",
+    "classic_hammer_allow_sell": "Legacy — use Classic green/red = SELL instead.",
+    "inverted_hammer_allow_buy": "Legacy — use Inverted green/red = BUY instead.",
+    "inverted_hammer_allow_sell": "Legacy — use Inverted green/red = SELL instead.",
     "indicators_st_enabled": "Compute SuperTrend and show it in Pattern In Context; optional backtest filter.",
     "indicators_vwap_enabled": "Compute VWAP and show it in Pattern In Context; optional backtest filter.",
-    "entry_rule": "How the entry price is calculated once a valid signal candle is found.",
-    "entry_offset": "Fixed $ offset added to the entry price calculated by the Entry Rule.",
-    "buffer_mode": "Whether the stop-loss buffer beyond the signal candle is a % of price or a flat $ amount.",
-    "sl_buffer_pct": "Extra stop-loss room beyond the signal candle, as a % (used when Buffer Mode is percent-based).",
-    "sl_buffer_flat": "Extra stop-loss room beyond the signal candle, as a flat $ amount (used when Buffer Mode is flat).",
+    "entry_rule": "Classic hammer entry: next candle open/close, or this candle’s close / high / low.",
+    "entry_offset": "Classic hammer: extra $ added to the classic entry price.",
+    "buffer_mode": "Classic hammer stop-loss buffer type.",
+    "sl_buffer_pct": "Classic hammer: extra SL room as % (when Buffer Mode is percent-based).",
+    "sl_buffer_flat": "Classic hammer: extra SL room as a flat $ (when Buffer Mode is flat).",
+    "inverted_entry_rule": (
+        "Inverted hammer entry — separate from Classic. "
+        "Do not reuse Classic HAMMER_HIGH here unless you really want the long-wick tip."
+    ),
+    "inverted_entry_offset": "Inverted hammer: extra $ added to the inverted entry price.",
+    "inverted_buffer_mode": "Inverted hammer stop-loss buffer type.",
+    "inverted_sl_buffer_pct": "Inverted hammer: extra SL room as % (when inverted Buffer Mode is percent-based).",
+    "inverted_sl_buffer_flat": "Inverted hammer: extra SL room as a flat $ (when inverted Buffer Mode is flat).",
     "enable_risk_limit": "On: trades that would risk more than the configured limit are skipped.",
     "reject_zero_or_negative_risk": "On: skip any trade where entry and stop-loss end up on the same side (zero or negative risk).",
     "symbol": "Instrument folder name under the Data Folder to backtest (e.g. EURUSD).",
@@ -914,17 +942,17 @@ FIELD_HELP: Dict[str, str] = {
     "max_forward_candles": "How many candles forward the backtest scans looking for the trade's exit before giving up.",
     "position_sizing_mode": (
         "Backtest only — pick how lot size / $ P&L is simulated:\n"
-        "• FIXED_UNITS — uses Position Size (lots/units).\n"
-        "• FIXED_RISK_USD — risks Fixed Risk per Trade ($) each trade (recommended for many trades).\n"
-        "• PERCENT_OF_EQUITY — risks % of current equity; uses Starting Capital, Equity Floor, Max Equity Multiple.\n"
+        "• FIXED_UNITS — every trade uses Position Size (lots/units). Equity does NOT change size.\n"
+        "• FIXED_RISK_USD — every trade risks the same Fixed Risk $ (recommended). Equity does NOT compound size.\n"
+        "• PERCENT_OF_EQUITY — risks % of current equity (this is the only compounding mode).\n"
         "Live MT5 uses the lot size on the Live panel, not these fields."
     ),
-    "position_size": "Units traded per position (used when Position Sizing Mode is Fixed Units).",
-    "fixed_risk_usd": "$ risked per trade, position size solved backwards from this (used when Position Sizing Mode is Fixed Risk).",
-    "risk_pct_of_equity": "% of current equity risked per trade (used when Position Sizing Mode is % of Equity).",
-    "starting_capital": "Account balance the equity curve starts from.",
-    "equity_floor_usd": "If equity drops to or below this, the backtest stops taking new trades.",
-    "max_equity_multiple": "Caps position sizing so it never scales beyond this multiple of starting capital, even with compounding.",
+    "position_size": "Units/lots per trade when Position Sizing Mode is Fixed Units. Same size on every trade.",
+    "fixed_risk_usd": "$ risked per trade when mode is Fixed Risk. Size = this $ / (entry − stop). Does not grow with wins.",
+    "risk_pct_of_equity": "% of current equity risked per trade (Percent of Equity mode only). This is the compounding mode.",
+    "starting_capital": "Account the equity curve starts from. Used for % of equity sizing and for return % / drawdown.",
+    "equity_floor_usd": "Percent of Equity only: stop taking new trades if equity falls to/below this.",
+    "max_equity_multiple": "Percent of Equity only: never size off more than this × Starting Capital (stops runaway compounding).",
     "allow_overlapping_trades": "On: a new signal can open a trade while a previous one is still open.",
     "commission_per_trade": "Flat $ commission charged per trade, subtracted from P&L.",
     "slippage_usd": "Flat $ slippage assumed on entry and exit, subtracted from P&L.",
@@ -932,15 +960,17 @@ FIELD_HELP: Dict[str, str] = {
 
 # Which Run Settings fields matter for each position sizing mode (UI highlight only).
 SIZING_MODE_ACTIVE_FIELDS: Dict[str, List[str]] = {
-    "FIXED_UNITS": ["position_size"],
-    "fixed_units": ["position_size"],
-    "FIXED_RISK_USD": ["fixed_risk_usd"],
-    "fixed_risk_usd": ["fixed_risk_usd"],
+    "FIXED_UNITS": ["position_size", "starting_capital", "commission_per_trade", "slippage_usd"],
+    "fixed_units": ["position_size", "starting_capital", "commission_per_trade", "slippage_usd"],
+    "FIXED_RISK_USD": ["fixed_risk_usd", "starting_capital", "commission_per_trade", "slippage_usd"],
+    "fixed_risk_usd": ["fixed_risk_usd", "starting_capital", "commission_per_trade", "slippage_usd"],
     "PERCENT_OF_EQUITY": [
         "risk_pct_of_equity", "starting_capital", "equity_floor_usd", "max_equity_multiple",
+        "commission_per_trade", "slippage_usd",
     ],
     "percent_of_equity": [
         "risk_pct_of_equity", "starting_capital", "equity_floor_usd", "max_equity_multiple",
+        "commission_per_trade", "slippage_usd",
     ],
 }
 
@@ -950,9 +980,9 @@ Find hammer/doji setups on historical data, filter with indicators, compare posi
 
 <b>What affects a trade signal</b> (backtest + live)<br>
 • <b>Body / Wicks</b> — hammer shape percentages.<br>
-• <b>Direction</b> — GREEN signal bar → green_direction (default BUY); RED → red_direction (default SELL). Entry is the <i>next</i> bar.<br>
-• <b>Hammer types</b> — classic / inverted enable flags; shape does not flip BUY/SELL by itself.<br>
-• <b>Entry / Exit</b> — entry price rule, SL buffer, RR from Timeframes tab.<br>
+• <b>Direction</b> — four choices: Classic green, Classic red, Inverted green, Inverted red. Each is BUY, SELL, or NO. Entry is the <i>next</i> bar.<br>
+• <b>Hammer types</b> — a type is on if either of its color rows is Buy or Sell (NO + NO turns that type off).<br>
+• <b>Entry / Exit</b> — Classic and Inverted each have their own entry rule and SL buffer. HAMMER_HIGH is candle high (wrong wick on inverted unless you set Inverted separately).<br>
 • <b>Risk</b> — max $ SL per timeframe (logic); can disable to see all signals in backtest.<br>
 • <b>Timeframes</b> — RR and max SL per TF; checkboxes choose which TFs to include in a backtest run.<br>
 • <b>Indicators</b> — add SuperTrend/VWAP; “Apply trade filter” must be on to block trades live/backtest.<br><br>
@@ -1376,6 +1406,11 @@ class PatternContextChart(QWidget):
         self.preview_show_vwap = False
         self.preview_price_above_vwap = True
         self.preview_trade_side = "BUY"
+        self.entry_rule = "NEXT_CANDLE_OPEN"
+        self.entry_offset = 0.0
+        self.buffer_mode = "PERCENT_OF_RANGE"
+        self.sl_buffer_pct = 5.0
+        self.sl_buffer_flat = 0.0
         self._context_trade_side = None
         self._overlays = []
         self._lead_candles = []
@@ -1387,7 +1422,12 @@ class PatternContextChart(QWidget):
                  rr_multiple, max_sl_usd, timeframe_label, is_doji=False, doji_style="",
                  preview_show_st=False, preview_st_bullish=True,
                  preview_show_vwap=False, preview_price_above_vwap=True,
-                 preview_trade_side="BUY"):
+                 preview_trade_side="BUY",
+                 entry_rule="NEXT_CANDLE_OPEN",
+                 entry_offset=0.0,
+                 buffer_mode="PERCENT_OF_RANGE",
+                 sl_buffer_pct=5.0,
+                 sl_buffer_flat=0.0):
         self.body_pct = body_pct
         self.dominant_pct = dominant_pct
         self.small_pct = small_pct
@@ -1400,6 +1440,20 @@ class PatternContextChart(QWidget):
         self.preview_show_vwap = preview_show_vwap
         self.preview_price_above_vwap = preview_price_above_vwap
         self.preview_trade_side = preview_trade_side or "BUY"
+        self.entry_rule = str(entry_rule or "NEXT_CANDLE_OPEN")
+        try:
+            self.entry_offset = float(entry_offset or 0.0)
+        except (TypeError, ValueError):
+            self.entry_offset = 0.0
+        self.buffer_mode = str(buffer_mode or "PERCENT_OF_RANGE")
+        try:
+            self.sl_buffer_pct = float(sl_buffer_pct or 0.0)
+        except (TypeError, ValueError):
+            self.sl_buffer_pct = 0.0
+        try:
+            self.sl_buffer_flat = float(sl_buffer_flat or 0.0)
+        except (TypeError, ValueError):
+            self.sl_buffer_flat = 0.0
         self.rr_multiple = rr_multiple
         self.max_sl_usd = max_sl_usd
         self.timeframe_label = timeframe_label
@@ -1645,8 +1699,58 @@ class PatternContextChart(QWidget):
             candle_low_y = small_bottom
             candle_high_y = dominant_top
 
-        entry_y = body_top if is_buy else body_bottom
-        sl_y = candle_low_y if is_buy else candle_high_y
+        hammer_open_y = body_bottom if self.is_green else body_top
+        hammer_close_y = body_top if self.is_green else body_bottom
+        candle_range_px = max(abs(candle_low_y - candle_high_y), 1.0)
+        # $1 offset is a visible slice of the hammer range (preview scale, not live ticks).
+        px_per_usd = candle_range_px / 20.0
+
+        next_open_y = hammer_close_y
+        next_body = max(10.0, body_h * 0.85)
+        if is_buy:
+            next_close_y = next_open_y - next_body
+        else:
+            next_close_y = next_open_y + next_body
+        next_high_y = min(next_open_y, next_close_y) - max(4.0, small_h * 0.25)
+        next_low_y = max(next_open_y, next_close_y) + max(4.0, small_h * 0.25)
+
+        rule = (self.entry_rule or "NEXT_CANDLE_OPEN").upper()
+        use_next_bar = rule in ("NEXT_CANDLE_OPEN", "NEXT_CANDLE_CLOSE")
+        if rule == "HAMMER_HIGH":
+            entry_y = candle_high_y
+            entry_flag = "ENTRY high"
+        elif rule == "HAMMER_LOW":
+            entry_y = candle_low_y
+            entry_flag = "ENTRY low"
+        elif rule == "HAMMER_CLOSE":
+            entry_y = hammer_close_y
+            entry_flag = "ENTRY close"
+        elif rule == "NEXT_CANDLE_CLOSE":
+            entry_y = next_close_y
+            entry_flag = "ENTRY next close"
+        else:
+            entry_y = next_open_y
+            entry_flag = "ENTRY next open"
+
+        entry_y -= self.entry_offset * px_per_usd
+        if self.entry_offset:
+            entry_flag = f"{entry_flag} {self.entry_offset:+.1f}"
+
+        buf_mode = (self.buffer_mode or "PERCENT_OF_RANGE").upper()
+        if buf_mode == "NONE":
+            buffer_px = 0.0
+        elif buf_mode == "FLAT_AMOUNT":
+            buffer_px = abs(self.sl_buffer_flat) * px_per_usd
+        elif buf_mode == "PERCENT_OF_PRICE":
+            buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
+        else:
+            buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
+
+        if is_buy:
+            sl_y = candle_low_y + buffer_px
+        else:
+            sl_y = candle_high_y - buffer_px
+
         risk_y_dist = abs(sl_y - entry_y)
         reward_y_dist = risk_y_dist * max(self.rr_multiple, 0.1)
         if is_buy:
@@ -1655,7 +1759,7 @@ class PatternContextChart(QWidget):
             target_y = min(entry_y + reward_y_dist, support_y)
 
         zone_left = signal_x - candle_w * 0.9
-        zone_right = signal_x + slot_w * 0.95
+        zone_right = signal_x + slot_w * (1.85 if use_next_bar else 0.95)
 
         painter.setPen(Qt.NoPen)
         painter.setBrush(QBrush(QColor(242, 153, 0, 32)))
@@ -1701,7 +1805,24 @@ class PatternContextChart(QWidget):
         painter.drawRoundedRect(signal_x - candle_w / 2, body_top,
                                  candle_w, max(2.0, body_bottom - body_top), 2, 2)
 
-        # ---- ENTRY / SL / TP flags (hammer + doji: SL at wick extreme per logic.py)
+        next_x = signal_x + slot_w
+        if use_next_bar:
+            next_color = up_color if is_buy else down_color
+            next_wick = QPen(wick_color, 1.6)
+            next_wick.setCapStyle(Qt.RoundCap)
+            painter.setPen(next_wick)
+            painter.drawLine(int(next_x), int(next_high_y), int(next_x), int(next_low_y))
+            nb_top = min(next_open_y, next_close_y)
+            nb_bot = max(next_open_y, next_close_y)
+            next_grad = QLinearGradient(0, nb_top, 0, nb_bot)
+            next_grad.setColorAt(0.0, next_color.lighter(115))
+            next_grad.setColorAt(1.0, next_color.darker(105))
+            painter.setPen(QPen(next_color.darker(120), 1.5))
+            painter.setBrush(QBrush(next_grad))
+            painter.drawRoundedRect(next_x - candle_w / 2, nb_top,
+                                     candle_w, max(2.0, nb_bot - nb_top), 2, 2)
+
+        # ---- ENTRY / SL / TP flags (same rules as logic.py Entry / Exit)
         entry_color = QColor("#1A73E8")
         sl_color = QColor("#F29900")
         tp_color = up_color if is_buy else down_color
@@ -1728,7 +1849,7 @@ class PatternContextChart(QWidget):
             painter.drawText(int(flag_x + 6), int(flag_y + 12), text)
 
         draw_flag(target_y, tp_color, "TP")
-        draw_flag(entry_y, entry_color, "ENTRY")
+        draw_flag(entry_y, entry_color, entry_flag)
         draw_flag(sl_y, sl_color, "SL")
 
         reward_usd = self.max_sl_usd * self.rr_multiple
@@ -1760,7 +1881,11 @@ class PatternContextChart(QWidget):
         painter.drawText(int(badge_x + 7), int(badge_y + 12), action_label)
 
         x += slot_w
-        for center, body_half, is_counter in self._trail_candles:
+        trail = self._trail_candles
+        if use_next_bar:
+            x += slot_w
+            trail = self._trail_candles[1:]
+        for center, body_half, is_counter in trail:
             top_y = y_of(max(0.05, center - body_half))
             bot_y = y_of(min(0.95, center + body_half))
             candle_color = context_counter_color if is_counter else context_color
@@ -2823,16 +2948,15 @@ class BacktestDashboard(QMainWindow):
         tabs.addTab(self._make_field_tab(WICK_FIELDS + DOJI_WICK_FIELDS, defaults_shape, defaults_doji_shape, defaults_strategy, defaults_doji_strategy, live_preview=True), "Wicks")
         self._param_tab_hammer_direction = tabs.count()
         tabs.addTab(self._make_field_tab(
-            DIRECTION_FIELDS + HAMMER_TYPE_FIELDS,
+            DIRECTION_FIELDS,
             defaults_strategy, live_preview=True,
         ), "Direction")
         dir_hint = QLabel(
-            "<b>Hammer rules (same in backtest and live):</b><br>"
-            "1) <b>Shape</b> — classic = long lower wick; inverted = long upper wick "
-            "(enable each type below; both on = either shape).<br>"
-            "2) <b>Color → trade</b> — green candle uses Green direction; red candle uses Red direction "
-            "(defaults: green→BUY, red→SELL). Applies to classic <i>and</i> inverted.<br>"
-            "3) Use <b>Pattern & Preview</b> BUY / SELL toggles to show green vs red examples."
+            "<b>Four choices — each is BUY, SELL, or NO:</b><br>"
+            "• <b>Classic</b> = long lower wick. <b>Inverted</b> = long upper wick.<br>"
+            "• <b>Green / red</b> = the signal candle’s own color (not the next entry bar).<br>"
+            "• <b>NO</b> = skip that combination. Set both colors of a type to NO to turn that type off.<br>"
+            "Defaults: Classic green BUY, Classic red SELL, Inverted green BUY, Inverted red SELL."
         )
         dir_hint.setObjectName("sectionHint")
         dir_hint.setWordWrap(True)
@@ -2861,7 +2985,7 @@ class BacktestDashboard(QMainWindow):
             if inner is not None and inner.layout() is not None:
                 inner.layout().addWidget(doji_hint)
         tabs.addTab(self._make_indicator_tab(), "Indicators")
-        tabs.addTab(self._make_field_tab(ENTRY_EXIT_FIELDS, defaults_strategy), "Entry / Exit")
+        tabs.addTab(self._make_entry_exit_tab(defaults_strategy), "Entry / Exit")
         tabs.addTab(self._make_field_tab(RISK_CONTROL_FIELDS, defaults_strategy), "Risk")
         tabs.addTab(self._make_combined_timeframes_tab(), "Timeframes")
         tabs.addTab(self._make_run_settings_tab(defaults_backtest), "Run Settings")
@@ -2919,13 +3043,6 @@ class BacktestDashboard(QMainWindow):
             if name in self.field_labels:
                 self.field_labels[name].setVisible(visible)
 
-        for name, _, _, _ in HAMMER_TYPE_FIELDS:
-            visible = not is_doji
-            if name in self.field_widgets:
-                self.field_widgets[name].setVisible(visible)
-            if name in self.field_labels:
-                self.field_labels[name].setVisible(visible)
-
         if hasattr(self, "tolerance_hint_label"):
             if is_doji:
                 self.tolerance_hint_label.setText(
@@ -2941,6 +3058,20 @@ class BacktestDashboard(QMainWindow):
         if hasattr(self, "parameter_tabs"):
             self.parameter_tabs.setTabVisible(self._param_tab_hammer_direction, not is_doji)
             self.parameter_tabs.setTabVisible(self._param_tab_doji_direction, is_doji)
+        if hasattr(self, "_entry_exit_inverted_box"):
+            self._entry_exit_inverted_box.setVisible(not is_doji)
+        if hasattr(self, "_entry_exit_classic_box"):
+            self._entry_exit_classic_box.setTitle("Entry / stop" if is_doji else "Classic hammer")
+        if hasattr(self, "_entry_exit_hint"):
+            if is_doji:
+                self._entry_exit_hint.setText(
+                    "Doji uses these entry and stop settings for every signal."
+                )
+            else:
+                self._entry_exit_hint.setText(
+                    "Classic (long lower wick) and inverted (long upper wick) have their own entry and stop. "
+                    "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip."
+                )
 
     def _make_field_tab(self, field_defs, defaults_obj, defaults_obj2=None, defaults_obj3=None, defaults_obj4=None, live_preview=False) -> QWidget:
         """
@@ -3015,6 +3146,108 @@ class BacktestDashboard(QMainWindow):
         if col_pair != 0:
             row += 1
         grid.setRowStretch(row, 1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _add_fields_to_grid(
+        self,
+        grid: QGridLayout,
+        field_defs,
+        defaults_obj,
+        live_preview: bool = False,
+        columns_per_row: int = 3,
+    ) -> None:
+        """Place labeled parameter widgets into an existing grid (3 columns)."""
+        for pair_col in range(columns_per_row):
+            grid.setColumnStretch(pair_col * 2 + 1, 1)
+            grid.setColumnMinimumWidth(pair_col * 2, 140)
+
+        default_sources = [defaults_obj]
+        row = 0
+        col_pair = 0
+        for name, label_text, ftype, choices in field_defs:
+            default_val = default_value_for_field(name, default_sources)
+            if isinstance(default_val, Enum):
+                default_val = default_val.value
+            if default_val is None:
+                default_val = ""
+
+            col_base = col_pair * 2
+            help_text = FIELD_HELP.get(name, label_text)
+            label = QLabel(label_text)
+            label.setObjectName("fieldLabel")
+            label.setWordWrap(True)
+            label.setToolTip(help_text)
+            grid.addWidget(label, row, col_base)
+            self.field_labels[name] = label
+
+            if ftype == FIELD_TYPE_TEXT:
+                widget = QLineEdit(str(default_val))
+                widget.setToolTip(help_text)
+                if live_preview:
+                    widget.textChanged.connect(self._redraw_candle_preview)
+                grid.addWidget(widget, row, col_base + 1)
+            elif ftype == FIELD_TYPE_CHECK:
+                widget = QCheckBox()
+                widget.setChecked(bool(default_val))
+                widget.setToolTip(help_text)
+                if live_preview:
+                    widget.stateChanged.connect(self._redraw_candle_preview)
+                grid.addWidget(widget, row, col_base + 1)
+            elif ftype == FIELD_TYPE_DROPDOWN:
+                widget = QComboBox()
+                widget.addItems(choices)
+                widget.setCurrentText(str(default_val))
+                widget.setToolTip(help_text)
+                if live_preview:
+                    widget.currentTextChanged.connect(self._redraw_candle_preview)
+                grid.addWidget(widget, row, col_base + 1)
+            else:
+                continue
+
+            self.field_widgets[name] = widget
+            col_pair += 1
+            if col_pair >= columns_per_row:
+                col_pair = 0
+                row += 1
+
+    def _make_entry_exit_tab(self, defaults_strategy) -> QWidget:
+        """Classic hammer settings in one box, inverted in another — not mixed in one grid."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        hint = QLabel(
+            "Classic (long lower wick) and inverted (long upper wick) have their own entry and stop. "
+            "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip."
+        )
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        classic_box = QGroupBox("Classic hammer")
+        classic_grid = QGridLayout(classic_box)
+        classic_grid.setContentsMargins(12, 16, 12, 12)
+        classic_grid.setHorizontalSpacing(20)
+        classic_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(classic_grid, CLASSIC_ENTRY_EXIT_FIELDS, defaults_strategy, live_preview=True)
+        layout.addWidget(classic_box)
+
+        inverted_box = QGroupBox("Inverted hammer")
+        inverted_grid = QGridLayout(inverted_box)
+        inverted_grid.setContentsMargins(12, 16, 12, 12)
+        inverted_grid.setHorizontalSpacing(20)
+        inverted_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(inverted_grid, INVERTED_ENTRY_EXIT_FIELDS, defaults_strategy, live_preview=True)
+        layout.addWidget(inverted_box)
+
+        self._entry_exit_hint = hint
+        self._entry_exit_classic_box = classic_box
+        self._entry_exit_inverted_box = inverted_box
+        layout.addStretch(1)
         scroll.setWidget(inner)
         return scroll
 
@@ -3355,7 +3588,7 @@ class BacktestDashboard(QMainWindow):
             )
         else:
             allowed = self._hammer_preview_direction_allowed(variant, trade_side)
-            allow_note = "" if allowed else " (blocked by Direction allow flags)"
+            allow_note = "" if allowed else " (this combo is set to NO)"
             self.preview_summary_label.setText(
                 f"Preview: {variant} hammer · {color_word} candle · {trade_side} trade · "
                 f"{detection_line}{allow_note}"
@@ -3363,16 +3596,11 @@ class BacktestDashboard(QMainWindow):
 
     def _hammer_preview_direction_allowed(self, variant: str, trade_side: str) -> bool:
         cfg = self._build_hammer_strategy_config()
-        td = logic.TradeDirection.SELL if trade_side == "SELL" else logic.TradeDirection.BUY
-        if variant == logic.HammerVariant.CLASSIC.value:
-            if td == logic.TradeDirection.BUY:
-                return cfg.classic_hammer_allow_buy
-            return cfg.classic_hammer_allow_sell
-        if variant == logic.HammerVariant.INVERTED.value:
-            if td == logic.TradeDirection.BUY:
-                return cfg.inverted_hammer_allow_buy
-            return cfg.inverted_hammer_allow_sell
-        return True
+        hv = logic.HammerVariant.INVERTED if variant == "INVERTED" else logic.HammerVariant.CLASSIC
+        for c in (logic.CandleColor.GREEN, logic.CandleColor.RED):
+            if logic.hammer_trade_action(cfg, hv, c).value == trade_side:
+                return True
+        return False
 
     def _build_signal_shape_tab(self) -> QWidget:
         scroll = QScrollArea()
@@ -3447,9 +3675,9 @@ class BacktestDashboard(QMainWindow):
         # answers "does everything I'm setting actually line up" --
         # not just an isolated candle shape.
         context_hint = QLabel(
-            "Trade idea per timeframe: ENTRY / SL / TP follow logic.py (BUY: SL at candle low, TP above; "
-            "SELL: SL at candle high, TP below). Uses the Pattern & Preview BUY/SELL toggle — same for "
-            "hammer and doji. Grey candles are illustration only."
+            "ENTRY / SL / TP follow Entry / Exit for the preview shape (Classic vs Inverted). "
+            "NEXT_CANDLE_OPEN/CLOSE draw a next bar; HAMMER_HIGH/LOW/CLOSE sit on this candle. "
+            "Offset and SL buffer shift the lines. Grey candles are illustration only."
         )
         context_hint.setObjectName("sectionHint")
         context_hint.setWordWrap(True)
@@ -3567,8 +3795,8 @@ class BacktestDashboard(QMainWindow):
 
         trade_dir = self._hammer_preview_trade_direction()
         trade_side = trade_dir.value
-        is_green = logic.preview_candle_is_green(trade_dir, cfg)
         shape_choice = getattr(self, "_preview_hammer_shape", "CLASSIC")
+        is_green = logic.preview_candle_is_green(trade_dir, cfg, shape_choice)
         draw_wick = logic.preview_draw_wick_side(cfg, shape_choice)
         variant = logic.variant_name_for_draw_wick(draw_wick)
 
@@ -3754,6 +3982,29 @@ class BacktestDashboard(QMainWindow):
                 f"Tolerance band for doji style {doji_style}. {det}"
             )
 
+    def _preview_entry_exit_kwargs(self, is_doji: bool, hammer_variant: str) -> dict:
+        """Classic vs inverted Entry / Exit fields currently shown on Pattern In Context."""
+        use_inverted = (not is_doji) and str(hammer_variant).upper() == "INVERTED"
+        if use_inverted:
+            rule = self._get_field_str("inverted_entry_rule") or "NEXT_CANDLE_OPEN"
+            offset = self._get_field_float("inverted_entry_offset")
+            buf = self._get_field_str("inverted_buffer_mode") or "PERCENT_OF_RANGE"
+            pct = self._get_field_float("inverted_sl_buffer_pct")
+            flat = self._get_field_float("inverted_sl_buffer_flat")
+        else:
+            rule = self._get_field_str("entry_rule") or "NEXT_CANDLE_OPEN"
+            offset = self._get_field_float("entry_offset")
+            buf = self._get_field_str("buffer_mode") or "PERCENT_OF_RANGE"
+            pct = self._get_field_float("sl_buffer_pct")
+            flat = self._get_field_float("sl_buffer_flat")
+        return {
+            "entry_rule": rule,
+            "entry_offset": 0.0 if offset is None else offset,
+            "buffer_mode": buf,
+            "sl_buffer_pct": 5.0 if pct is None else pct,
+            "sl_buffer_flat": 0.0 if flat is None else flat,
+        }
+
     def _update_context_charts(
         self, body_pct, dominant_pct, small_pct, wick_side, is_green, is_doji: bool = False,
         doji_style: str = "",
@@ -3782,6 +4033,7 @@ class BacktestDashboard(QMainWindow):
                 rr_multiple, max_sl_usd, tf, is_doji=is_doji, doji_style=doji_style,
                 preview_trade_side=preview_trade_side,
                 **ind,
+                **self._preview_entry_exit_kwargs(is_doji, hammer_variant),
             )
 
     def _indicator_preview_state(
@@ -4582,15 +4834,20 @@ class BacktestDashboard(QMainWindow):
                     det = f"Doji {style} · {mode}"
                 detail = det
             else:
-                gd = self._get_field_str("green_direction") or "BUY"
-                rd = self._get_field_str("red_direction") or "SELL"
+                cfg = self._build_hammer_strategy_config()
+                detail = logic.describe_hammer_direction_matrix(cfg)
                 try:
-                    det = logic.describe_hammer_detection(self._build_hammer_strategy_config())
+                    det = logic.describe_hammer_detection(cfg)
                 except Exception:
                     det = ""
-                detail = f"Green→<b>{gd}</b> Red→<b>{rd}</b>"
                 if det:
                     detail += f"<br><span style='color:#5f6368;'>{det}</span>"
+                try:
+                    ee = logic.describe_hammer_entry_exit(cfg)
+                except Exception:
+                    ee = ""
+                if ee:
+                    detail += f"<br><span style='color:#5f6368;'>{ee}</span>"
         except Exception:
             detail = ""
         tf = self.live_timeframe.currentText() if hasattr(self, "live_timeframe") else "1h"
@@ -4868,6 +5125,13 @@ class BacktestDashboard(QMainWindow):
 
         preflight = self._live_preflight_notes(live_cfg)
         preflight.extend(self._live_indicator_preflight_lines(indicator_stack))
+        if pattern_type != "doji":
+            preflight.append(f"Direction: {logic.describe_hammer_direction_matrix(strategy_config)}")
+            preflight.append(f"Entry/Exit: {logic.describe_hammer_entry_exit(strategy_config)}")
+            preflight.append(
+                "These Direction + Entry/Exit rows are the same objects used in backtest "
+                "(lots/risk caps still come from the Live panel, not Run Settings)."
+            )
         tf_set = tf_settings.get(live_tf)
         if tf_set is not None:
             preflight.append(
@@ -5251,12 +5515,12 @@ class BacktestDashboard(QMainWindow):
     def _effective_hammer_wick_side_value(self) -> str:
         """Wick side used for hammer detection (matches backtest / live)."""
         defaults = logic.StrategyConfig()
-        classic = self._read_ui_field(
-            "enable_classic_hammer", defaults.enable_classic_hammer, FIELD_TYPE_CHECK,
-        )
-        inverted = self._read_ui_field(
-            "enable_inverted_hammer", defaults.enable_inverted_hammer, FIELD_TYPE_CHECK,
-        )
+        cg = self._read_ui_field("classic_green", defaults.classic_green, FIELD_TYPE_DROPDOWN)
+        cr = self._read_ui_field("classic_red", defaults.classic_red, FIELD_TYPE_DROPDOWN)
+        ig = self._read_ui_field("inverted_green", defaults.inverted_green, FIELD_TYPE_DROPDOWN)
+        ir = self._read_ui_field("inverted_red", defaults.inverted_red, FIELD_TYPE_DROPDOWN)
+        classic = logic.coerce_trade_action(cg) != logic.TradeAction.NO or logic.coerce_trade_action(cr) != logic.TradeAction.NO
+        inverted = logic.coerce_trade_action(ig) != logic.TradeAction.NO or logic.coerce_trade_action(ir) != logic.TradeAction.NO
         ui_wick = self._read_ui_field(
             "hammer_wick_side", defaults.hammer_wick_side, FIELD_TYPE_DROPDOWN,
         )
@@ -5292,20 +5556,8 @@ class BacktestDashboard(QMainWindow):
                 sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
             timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
         kwargs["timeframe_settings"] = timeframe_settings
-
-        classic = bool(kwargs.get("enable_classic_hammer", True))
-        inverted = bool(kwargs.get("enable_inverted_hammer", True))
-        ui_wick = self._read_ui_field(
-            "hammer_wick_side", defaults.hammer_wick_side, FIELD_TYPE_DROPDOWN,
-        )
-        if isinstance(ui_wick, str):
-            try:
-                ui_wick = logic.WickSide(ui_wick)
-            except ValueError:
-                ui_wick = logic.WickSide.LOWER
-        kwargs["hammer_wick_side"] = logic.resolve_hammer_wick_side(classic, inverted, ui_wick)
-
-        return logic.StrategyConfig(**kwargs)
+        cfg = logic.StrategyConfig(**kwargs)
+        return cfg
 
     def _build_indicator_stack(self) -> IndicatorStackConfig:
         def _chk(name, default=False):
@@ -5359,7 +5611,7 @@ class BacktestDashboard(QMainWindow):
             ftype = FIELD_TYPE_CHECK if isinstance(default_val, bool) else FIELD_TYPE_DROPDOWN
             kwargs[cfg_name] = self._read_ui_field(ui_name, default_val, ftype)
 
-        for name, _, ftype, _ in ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS:
+        for name, _, ftype, _ in DOJI_ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS:
             default_val = getattr(defaults, name)
             kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
@@ -5423,7 +5675,11 @@ class BacktestDashboard(QMainWindow):
         kwargs["run_name"] = f"dashboard_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         kwargs["indicator_stack"] = self._build_indicator_stack()
 
-        return backtest.BacktestConfig(**kwargs)
+        cfg = backtest.BacktestConfig(**kwargs)
+        sizing_err = backtest.validate_position_sizing_config(cfg)
+        if sizing_err:
+            raise ValueError(sizing_err)
+        return cfg
 
     # ------------------------------------------------------------------
     # RUN BUTTON HANDLER (threaded, same pattern as dashboard.py)
@@ -5956,16 +6212,15 @@ class BacktestDashboard(QMainWindow):
         inds = stack.enabled_indicator_ids()
         return {
             "pattern": "Hammer",
+            "classic_green": cfg.classic_green.value,
+            "classic_red": cfg.classic_red.value,
+            "inverted_green": cfg.inverted_green.value,
+            "inverted_red": cfg.inverted_red.value,
             "classic_hammer_enabled": cfg.enable_classic_hammer,
             "inverted_hammer_enabled": cfg.enable_inverted_hammer,
-            "green_candle_trade": getattr(cfg.green_direction, "value", "BUY"),
-            "red_candle_trade": getattr(cfg.red_direction, "value", "SELL"),
             "resolved_wick_mode": getattr(cfg.hammer_wick_side, "value", str(cfg.hammer_wick_side)),
-            "classic_allow_buy": cfg.classic_hammer_allow_buy,
-            "classic_allow_sell": cfg.classic_hammer_allow_sell,
-            "inverted_allow_buy": cfg.inverted_hammer_allow_buy,
-            "inverted_allow_sell": cfg.inverted_hammer_allow_sell,
             "entry_rule": getattr(cfg.entry_rule, "value", str(cfg.entry_rule)),
+            "inverted_entry_rule": getattr(cfg.inverted_entry_rule, "value", str(cfg.inverted_entry_rule)),
             "indicators_added": inds,
             "supertrend_filter": (
                 stack.supertrend.apply_trade_filter if "supertrend" in inds else None
@@ -5974,9 +6229,8 @@ class BacktestDashboard(QMainWindow):
                 stack.vwap.apply_trade_filter if "vwap" in inds else None
             ),
             "plain_english": (
-                f"Hammer signal bar GREEN → {getattr(cfg.green_direction, 'value', 'BUY')}, "
-                f"RED → {getattr(cfg.red_direction, 'value', 'SELL')}. "
-                "Shape classic/inverted only picks wick geometry; color picks BUY/SELL. "
+                f"{logic.describe_hammer_direction_matrix(cfg)}. "
+                f"{logic.describe_hammer_entry_exit(cfg)}. "
                 "Entry is on the NEXT bar after the signal bar closes."
             ),
         }
@@ -6042,7 +6296,26 @@ class BacktestDashboard(QMainWindow):
         if self.pattern_combo.findText(pattern) >= 0:
             self.pattern_combo.setCurrentText(pattern)
         self._apply_pattern_field_visibility()
-        for name, value in (data.get("fields") or {}).items():
+        fields = dict(data.get("fields") or {})
+        if "classic_green" not in fields:
+            migrated = logic.direction_matrix_from_legacy_fields(
+                green_direction=fields.get("green_direction", "BUY"),
+                red_direction=fields.get("red_direction", "SELL"),
+                enable_classic=fields.get("enable_classic_hammer", True),
+                enable_inverted=fields.get("enable_inverted_hammer", True),
+                classic_allow_buy=fields.get("classic_hammer_allow_buy", True),
+                classic_allow_sell=fields.get("classic_hammer_allow_sell", True),
+                inverted_allow_buy=fields.get("inverted_hammer_allow_buy", True),
+                inverted_allow_sell=fields.get("inverted_hammer_allow_sell", True),
+            )
+            fields.update(migrated)
+        if "inverted_entry_rule" not in fields and "entry_rule" in fields:
+            fields["inverted_entry_rule"] = fields.get("entry_rule")
+            fields["inverted_entry_offset"] = fields.get("entry_offset", "0")
+            fields["inverted_buffer_mode"] = fields.get("buffer_mode")
+            fields["inverted_sl_buffer_pct"] = fields.get("sl_buffer_pct")
+            fields["inverted_sl_buffer_flat"] = fields.get("sl_buffer_flat")
+        for name, value in fields.items():
             self._set_field_widget_value(name, value)
         for tf, cfg in (data.get("timeframes") or {}).items():
             edits = self.timeframe_widgets.get(tf)
