@@ -22,6 +22,7 @@ hiddenimports = [
     "live",
     "live_journal",
     "fetch",
+    "hammer_context_logic",
     "indicators",
     "indicators.config",
     "indicators.filter",

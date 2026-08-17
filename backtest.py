@@ -82,6 +82,7 @@ import polars as pl
 
 import logic  # hammer pattern rules
 import doji_logic
+import hammer_context_logic
 from indicators.config import IndicatorStackConfig
 from indicators.filter import apply_indicator_filters
 
@@ -694,6 +695,10 @@ def simulate_timeframe_outcomes(
 
     if config.pattern_type == "doji":
         all_signals = doji_logic.run_strategy(
+            candles, timeframe=logic_label, config=config.strategy_config,
+        )
+    elif config.pattern_type in ("hammer_with_candles", "hammer_context"):
+        all_signals = hammer_context_logic.run_strategy(
             candles, timeframe=logic_label, config=config.strategy_config,
         )
     else:

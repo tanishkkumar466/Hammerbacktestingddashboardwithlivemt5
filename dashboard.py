@@ -81,6 +81,7 @@ from PySide6.QtWidgets import (
 
 import logic
 import doji_logic
+import hammer_context_logic
 import backtest
 import plotting
 import indicators
@@ -409,6 +410,26 @@ class RunDatabase:
             body_tol = doji.get("max_body_tol")
             dominant_wick_tol = doji.get("min_wick_tol")
             small_wick_tol = doji.get("min_wick_tol")
+        elif pattern_type in ("hammer_with_candles", "hammer_context"):
+            pattern_label = "Hammer with candles"
+            entry_signal = "Hammer with candles"
+            buy = strategy.get("buy_hammer_ratios") or {}
+            sell = strategy.get("sell_hammer_ratios") or {}
+            trade_direction = (
+                f"BUY classic green + {strategy.get('lookback_candles', 5)} prior closes vs low; "
+                f"SELL inverted red + {strategy.get('lookback_candles', 5)} prior closes vs high"
+            )
+            body_pct = buy.get("body_pct")
+            dominant_wick_pct = buy.get("dominant_wick_pct")
+            small_wick_pct = buy.get("small_wick_pct")
+            wick_side = "BUY_CLASSIC / SELL_INVERTED"
+            body_tol = buy.get("body_tol")
+            dominant_wick_tol = buy.get("dominant_wick_tol")
+            small_wick_tol = buy.get("small_wick_tol")
+            if sell:
+                trade_direction += (
+                    f" | BUY body {buy.get('body_pct')}% / SELL body {sell.get('body_pct')}%"
+                )
         else:
             pattern_label = "Hammer"
             entry_signal = "Hammer Candle"
@@ -628,6 +649,15 @@ PATTERN_REGISTRY = {
         "ratio_config_class": doji_logic.DojiRatioConfig,
         "pattern_type": "doji",
     },
+    "Hammer with candles": {
+        "description": (
+            "Classic green hammer + N prior closes not below hammer low (BUY); "
+            "inverted red hammer + N prior closes not above hammer high (SELL). "
+            "Separate Body/Wicks for BUY vs SELL."
+        ),
+        "ratio_config_class": logic.HammerRatioConfig,
+        "pattern_type": "hammer_with_candles",
+    },
 }
 
 
@@ -641,6 +671,14 @@ FIELD_TYPE_DROPDOWN = "dropdown"
 
 def enum_choices(enum_cls) -> List[str]:
     return [e.value for e in enum_cls]
+
+
+def _prefixed_shape_fields(prefix: str, field_defs) -> List[tuple]:
+    """Duplicate Body/Wicks rows for Hammer with candles (group box title shows BUY vs SELL)."""
+    return [
+        (f"{prefix}_{name}", label, ftype, choices)
+        for name, label, ftype, choices in field_defs
+    ]
 
 
 BODY_FIELDS = [
@@ -670,6 +708,20 @@ WICK_SIDE_FIELD = [
 
 WICK_FIELDS = WICK_SHAPE_FIELDS
 HAMMER_SHAPE_FIELDS = BODY_FIELDS + WICK_SHAPE_FIELDS
+
+HAMMER_RATIO_FIELD_NAMES = {f[0] for f in HAMMER_SHAPE_FIELDS}
+
+BUY_CONTEXT_BODY_FIELDS = _prefixed_shape_fields("buy", BODY_FIELDS)
+SELL_CONTEXT_BODY_FIELDS = _prefixed_shape_fields("sell", BODY_FIELDS)
+BUY_CONTEXT_WICK_FIELDS = _prefixed_shape_fields("buy", WICK_SHAPE_FIELDS)
+SELL_CONTEXT_WICK_FIELDS = _prefixed_shape_fields("sell", WICK_SHAPE_FIELDS)
+
+HAMMER_WITH_CANDLES_SHAPE_FIELD_NAMES = {
+    f[0] for f in (
+        BUY_CONTEXT_BODY_FIELDS + SELL_CONTEXT_BODY_FIELDS
+        + BUY_CONTEXT_WICK_FIELDS + SELL_CONTEXT_WICK_FIELDS
+    )
+}
 
 DOJI_ONLY_FIELD_NAMES = {
     "doji_max_body_pct", "doji_max_body_tol",
@@ -722,6 +774,12 @@ DOJI_UI_ATTR_OVERRIDES = {
     "doji_allow_red_trades": "allow_red_trades",
 }
 
+CONTEXT_UI_ATTR_OVERRIDES = {
+    "context_lookback_candles": "lookback_candles",
+    "context_enable_buy": "enable_buy",
+    "context_enable_sell": "enable_sell",
+}
+
 # Per-indicator parameter widgets (field name -> label, type). Registry keys = dropdown ids.
 INDICATOR_WIDGET_GROUPS: Dict[str, List[tuple]] = {
     "supertrend": [
@@ -742,7 +800,22 @@ def default_value_for_field(name: str, sources: List) -> Any:
     if name.startswith("indicators_"):
         return INDICATOR_UI_DEFAULTS.get(name, "")
 
+    if name.startswith("buy_"):
+        ratio_attr = name[4:]
+        if ratio_attr in HAMMER_RATIO_FIELD_NAMES:
+            for candidate in sources:
+                if candidate is not None and hasattr(candidate, "buy_hammer_ratios"):
+                    return getattr(candidate.buy_hammer_ratios, ratio_attr)
+    if name.startswith("sell_"):
+        ratio_attr = name[5:]
+        if ratio_attr in HAMMER_RATIO_FIELD_NAMES:
+            for candidate in sources:
+                if candidate is not None and hasattr(candidate, "sell_hammer_ratios"):
+                    return getattr(candidate.sell_hammer_ratios, ratio_attr)
+
     attr = DOJI_UI_ATTR_OVERRIDES.get(name)
+    if attr is None:
+        attr = CONTEXT_UI_ATTR_OVERRIDES.get(name)
     if attr is None and name.startswith("doji_"):
         attr = name[len("doji_"):]
     elif attr is None:
@@ -761,6 +834,15 @@ DIRECTION_FIELDS = [
     ("inverted_green", "Inverted Hammer — green candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
     ("inverted_red", "Inverted Hammer — red candle", FIELD_TYPE_DROPDOWN, enum_choices(logic.TradeAction)),
 ]
+
+DIRECTION_FIELD_NAMES = {f[0] for f in DIRECTION_FIELDS}
+
+CONTEXT_PATTERN_FIELDS = [
+    ("context_lookback_candles", "Prior candles to check (count)", FIELD_TYPE_TEXT, None),
+    ("context_enable_buy", "Enable BUY (classic green hammer)", FIELD_TYPE_CHECK, None),
+    ("context_enable_sell", "Enable SELL (inverted red hammer)", FIELD_TYPE_CHECK, None),
+]
+CONTEXT_PATTERN_FIELD_NAMES = {f[0] for f in CONTEXT_PATTERN_FIELDS}
 
 INDICATOR_UI_DEFAULTS = {
     "indicators_st_atr_period": 10,
@@ -909,6 +991,9 @@ FIELD_HELP: Dict[str, str] = {
     "green_direction": "Legacy field — use Classic/Inverted green dropdowns on the Direction tab.",
     "red_direction": "Legacy field — use Classic/Inverted red dropdowns on the Direction tab.",
     "classic_green": "When a CLASSIC hammer (long lower wick) closes green: BUY, SELL, or NO (skip).",
+    "context_lookback_candles": "Prior candles before the signal bar (1, 2, 3, 5, 7, …) checked against hammer low/high.",
+    "context_enable_buy": "BUY: classic green hammer + every prior close not below hammer low.",
+    "context_enable_sell": "SELL: inverted red hammer + every prior close not above hammer high.",
     "classic_red": "When a CLASSIC hammer (long lower wick) closes red: BUY, SELL, or NO (skip).",
     "inverted_green": "When an INVERTED hammer (long upper wick) closes green: BUY, SELL, or NO (skip).",
     "inverted_red": "When an INVERTED hammer (long upper wick) closes red: BUY, SELL, or NO (skip).",
@@ -957,6 +1042,18 @@ FIELD_HELP: Dict[str, str] = {
     "commission_per_trade": "Flat $ commission charged per trade, subtracted from P&L.",
     "slippage_usd": "Flat $ slippage assumed on entry and exit, subtracted from P&L.",
 }
+
+# Hammer with candles: same tooltips as plain hammer fields, per BUY/SELL side.
+for _side_prefix in ("buy", "sell"):
+    for _base_name, _help_text in list(FIELD_HELP.items()):
+        if _base_name in HAMMER_RATIO_FIELD_NAMES:
+            FIELD_HELP[f"{_side_prefix}_{_base_name}"] = _help_text
+
+SYMMETRIC_TOLERANCE_GROUPS = (
+    ("body_tol_is_symmetric", "body_tol", "body_tol_lower", "body_tol_upper"),
+    ("dominant_tol_is_symmetric", "dominant_wick_tol", "dominant_tol_lower", "dominant_tol_upper"),
+    ("small_tol_is_symmetric", "small_wick_tol", "small_tol_lower", "small_tol_upper"),
+)
 
 # Which Run Settings fields matter for each position sizing mode (UI highlight only).
 SIZING_MODE_ACTIVE_FIELDS: Dict[str, List[str]] = {
@@ -1406,6 +1503,7 @@ class PatternContextChart(QWidget):
         self.preview_show_vwap = False
         self.preview_price_above_vwap = True
         self.preview_trade_side = "BUY"
+        self.context_lookback = 5
         self.entry_rule = "NEXT_CANDLE_OPEN"
         self.entry_offset = 0.0
         self.buffer_mode = "PERCENT_OF_RANGE"
@@ -1423,6 +1521,7 @@ class PatternContextChart(QWidget):
                  preview_show_st=False, preview_st_bullish=True,
                  preview_show_vwap=False, preview_price_above_vwap=True,
                  preview_trade_side="BUY",
+                 context_lookback=5,
                  entry_rule="NEXT_CANDLE_OPEN",
                  entry_offset=0.0,
                  buffer_mode="PERCENT_OF_RANGE",
@@ -1440,6 +1539,10 @@ class PatternContextChart(QWidget):
         self.preview_show_vwap = preview_show_vwap
         self.preview_price_above_vwap = preview_price_above_vwap
         self.preview_trade_side = preview_trade_side or "BUY"
+        try:
+            self.context_lookback = max(1, min(24, int(context_lookback or 5)))
+        except (TypeError, ValueError):
+            self.context_lookback = 5
         self.entry_rule = str(entry_rule or "NEXT_CANDLE_OPEN")
         try:
             self.entry_offset = float(entry_offset or 0.0)
@@ -1460,17 +1563,20 @@ class PatternContextChart(QWidget):
         if (
             timeframe_label != self._context_timeframe
             or self.preview_trade_side != self._context_trade_side
+            or self.context_lookback != getattr(self, "_last_context_lookback", None)
         ):
             self._regenerate_context_candles(timeframe_label, self.preview_trade_side)
+            self._last_context_lookback = self.context_lookback
         self.update()
 
     def _regenerate_context_candles(self, timeframe_label: str, trade_side: str = "BUY"):
         choppiness = TIMEFRAME_CHOPPINESS.get(timeframe_label, 0.04)
         side_key = "SELL" if trade_side == "SELL" else "BUY"
-        rng = random.Random(f"pattern-context::{timeframe_label}::{side_key}")
+        rng = random.Random(f"pattern-context::{timeframe_label}::{side_key}::{self.context_lookback}")
+        n_lead = self.context_lookback
         # BUY: downtrend into signal at support, then rally toward resistance (TP up).
         # SELL: downtrend into signal, then continuation down toward support (TP down).
-        self._lead_candles = self._generate_leg(rng, 0.16, 0.80, 5, choppiness)
+        self._lead_candles = self._generate_leg(rng, 0.16, 0.80, n_lead, choppiness)
         if side_key == "SELL":
             self._trail_candles = self._generate_leg(rng, 0.78, 0.92, 5, choppiness)
         else:
@@ -2943,9 +3049,33 @@ class BacktestDashboard(QMainWindow):
         defaults_doji_strategy = doji_logic.DojiStrategyConfig()
         defaults_backtest = backtest.BacktestConfig()
         defaults_backtest.data_root = DEFAULT_DATA_DIR
+        defaults_context = hammer_context_logic.HammerContextConfig()
 
-        tabs.addTab(self._make_field_tab(BODY_FIELDS + DOJI_BODY_FIELDS, defaults_shape, defaults_doji_shape, live_preview=True), "Body")
-        tabs.addTab(self._make_field_tab(WICK_FIELDS + DOJI_WICK_FIELDS, defaults_shape, defaults_doji_shape, defaults_strategy, defaults_doji_strategy, live_preview=True), "Wicks")
+        tabs.addTab(self._make_body_tab(
+            defaults_shape, defaults_doji_shape, defaults_context,
+        ), "Body")
+        tabs.addTab(self._make_wicks_tab(
+            defaults_shape, defaults_doji_shape, defaults_strategy, defaults_doji_strategy,
+            defaults_context,
+        ), "Wicks")
+        self._param_tab_context = tabs.count()
+        tabs.addTab(self._make_field_tab(
+            CONTEXT_PATTERN_FIELDS, defaults_context, live_preview=True,
+        ), "Context")
+        context_hint = QLabel(
+            "<b>Hammer with candles — context rule:</b><br>"
+            "• <b>BUY</b> — classic green hammer; prior N closes must stay at or above hammer low.<br>"
+            "• <b>SELL</b> — inverted red hammer; prior N closes must stay at or below hammer high.<br>"
+            "Shape settings are on the <b>Body</b> and <b>Wicks</b> tabs (separate BUY and SELL boxes). "
+            "Entry / stop per side on <b>Entry / Exit</b>."
+        )
+        context_hint.setObjectName("sectionHint")
+        context_hint.setWordWrap(True)
+        ctx_tab = self.parameter_tabs.widget(self._param_tab_context)
+        if isinstance(ctx_tab, QScrollArea):
+            inner = ctx_tab.widget()
+            if inner is not None and inner.layout() is not None:
+                inner.layout().addWidget(context_hint)
         self._param_tab_hammer_direction = tabs.count()
         tabs.addTab(self._make_field_tab(
             DIRECTION_FIELDS,
@@ -2991,6 +3121,7 @@ class BacktestDashboard(QMainWindow):
         tabs.addTab(self._make_run_settings_tab(defaults_backtest), "Run Settings")
 
         QTimer.singleShot(0, self._apply_pattern_field_visibility)
+        QTimer.singleShot(0, self._wire_symmetric_tolerance_fields)
         # Scroll wrapper keeps the panel resizable below its natural width
         # (the wide tab bar otherwise locks the dock divider in place).
         scroll = QScrollArea()
@@ -3025,12 +3156,19 @@ class BacktestDashboard(QMainWindow):
                 widget.setText(str(val))
 
     def _apply_pattern_field_visibility(self):
-        """Show hammer fields or doji fields depending on the selected pattern."""
+        """Show hammer / doji / hammer-context fields depending on the selected pattern."""
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
         is_doji = pattern == "Doji"
+        is_hammer_with_candles = pattern == "Hammer with candles"
+        is_plain_hammer = pattern == "Hammer"
 
         for name in HAMMER_ONLY_FIELD_NAMES:
-            visible = not is_doji
+            if name in DIRECTION_FIELD_NAMES:
+                visible = is_plain_hammer
+            elif name in HAMMER_RATIO_FIELD_NAMES:
+                visible = is_plain_hammer
+            else:
+                visible = is_plain_hammer or is_hammer_with_candles
             if name in self.field_widgets:
                 self.field_widgets[name].setVisible(visible)
             if name in self.field_labels:
@@ -3043,11 +3181,30 @@ class BacktestDashboard(QMainWindow):
             if name in self.field_labels:
                 self.field_labels[name].setVisible(visible)
 
+        for name in HAMMER_WITH_CANDLES_SHAPE_FIELD_NAMES:
+            visible = is_hammer_with_candles
+            if name in self.field_widgets:
+                self.field_widgets[name].setVisible(visible)
+            if name in self.field_labels:
+                self.field_labels[name].setVisible(visible)
+
+        for name in CONTEXT_PATTERN_FIELD_NAMES:
+            visible = is_hammer_with_candles
+            if name in self.field_widgets:
+                self.field_widgets[name].setVisible(visible)
+            if name in self.field_labels:
+                self.field_labels[name].setVisible(visible)
+
         if hasattr(self, "tolerance_hint_label"):
             if is_doji:
                 self.tolerance_hint_label.setText(
                     "Loosest and tightest candles your current doji tolerance "
                     "settings will still accept."
+                )
+            elif is_hammer_with_candles:
+                self.tolerance_hint_label.setText(
+                    "Loosest and tightest candles for classic (BUY) or inverted (SELL) "
+                    "hammer shape — use Preview shape toggle."
                 )
             else:
                 self.tolerance_hint_label.setText(
@@ -3056,16 +3213,30 @@ class BacktestDashboard(QMainWindow):
                 )
 
         if hasattr(self, "parameter_tabs"):
-            self.parameter_tabs.setTabVisible(self._param_tab_hammer_direction, not is_doji)
+            self.parameter_tabs.setTabVisible(self._param_tab_hammer_direction, is_plain_hammer)
             self.parameter_tabs.setTabVisible(self._param_tab_doji_direction, is_doji)
+            if hasattr(self, "_param_tab_context"):
+                self.parameter_tabs.setTabVisible(self._param_tab_context, is_hammer_with_candles)
         if hasattr(self, "_entry_exit_inverted_box"):
-            self._entry_exit_inverted_box.setVisible(not is_doji)
+            self._entry_exit_inverted_box.setVisible(is_plain_hammer or is_hammer_with_candles)
         if hasattr(self, "_entry_exit_classic_box"):
-            self._entry_exit_classic_box.setTitle("Entry / stop" if is_doji else "Classic hammer")
+            if is_hammer_with_candles:
+                self._entry_exit_classic_box.setTitle("BUY — classic green hammer")
+                self._entry_exit_inverted_box.setTitle("SELL — inverted red hammer")
+            elif is_doji:
+                self._entry_exit_classic_box.setTitle("Entry / stop")
+            else:
+                self._entry_exit_classic_box.setTitle("Classic hammer")
+                self._entry_exit_inverted_box.setTitle("Inverted hammer")
         if hasattr(self, "_entry_exit_hint"):
             if is_doji:
                 self._entry_exit_hint.setText(
                     "Doji uses these entry and stop settings for every signal."
+                )
+            elif is_hammer_with_candles:
+                self._entry_exit_hint.setText(
+                    "BUY uses classic entry + SL at hammer low (+ buffer). "
+                    "SELL uses inverted entry + SL at hammer high (+ buffer)."
                 )
             else:
                 self._entry_exit_hint.setText(
@@ -3073,11 +3244,194 @@ class BacktestDashboard(QMainWindow):
                     "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip."
                 )
 
-    def _make_field_tab(self, field_defs, defaults_obj, defaults_obj2=None, defaults_obj3=None, defaults_obj4=None, live_preview=False) -> QWidget:
+        hwc_boxes = (
+            getattr(self, "_hwc_body_hint", None),
+            getattr(self, "_hwc_body_buy_box", None),
+            getattr(self, "_hwc_body_sell_box", None),
+            getattr(self, "_hwc_wicks_hint", None),
+            getattr(self, "_hwc_wicks_buy_box", None),
+            getattr(self, "_hwc_wicks_sell_box", None),
+        )
+        for box in hwc_boxes:
+            if box is not None:
+                box.setVisible(is_hammer_with_candles)
+
+        if hasattr(self, "_plain_body_box"):
+            self._plain_body_box.setVisible(is_plain_hammer or is_doji)
+        if hasattr(self, "_plain_wicks_box"):
+            self._plain_wicks_box.setVisible(is_plain_hammer or is_doji)
+
+    def _make_body_tab(self, defaults_shape, defaults_doji_shape, defaults_context) -> QWidget:
+        """Body tab: separate BUY/SELL boxes for Hammer with candles; plain fields for Hammer/Doji."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        hwc_hint = QLabel(
+            "<b>Hammer with candles — body size</b><br>"
+            "Two independent sections below. Tune BUY (classic green) and SELL (inverted red) separately.<br>"
+            "<b>Symmetric?</b> checked = one +/- tolerance around the target. "
+            "Unchecked = set different lower and upper limits."
+        )
+        hwc_hint.setObjectName("sectionHint")
+        hwc_hint.setWordWrap(True)
+        layout.addWidget(hwc_hint)
+        self._hwc_body_hint = hwc_hint
+
+        buy_box = QGroupBox("BUY — Classic green hammer")
+        buy_grid = QGridLayout(buy_box)
+        buy_grid.setContentsMargins(12, 16, 12, 12)
+        buy_grid.setHorizontalSpacing(20)
+        buy_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            buy_grid, BUY_CONTEXT_BODY_FIELDS, defaults_context,
+            live_preview=True, columns_per_row=2,
+        )
+        layout.addWidget(buy_box)
+        self._hwc_body_buy_box = buy_box
+
+        sell_box = QGroupBox("SELL — Inverted red hammer")
+        sell_grid = QGridLayout(sell_box)
+        sell_grid.setContentsMargins(12, 16, 12, 12)
+        sell_grid.setHorizontalSpacing(20)
+        sell_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            sell_grid, SELL_CONTEXT_BODY_FIELDS, defaults_context,
+            live_preview=True, columns_per_row=2,
+        )
+        layout.addWidget(sell_box)
+        self._hwc_body_sell_box = sell_box
+
+        plain_box = QGroupBox("Hammer / Doji body settings")
+        plain_grid = QGridLayout(plain_box)
+        plain_grid.setContentsMargins(12, 16, 12, 12)
+        plain_grid.setHorizontalSpacing(20)
+        plain_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            plain_grid, BODY_FIELDS + DOJI_BODY_FIELDS,
+            defaults_shape, defaults_doji_shape,
+            live_preview=True, columns_per_row=3,
+        )
+        layout.addWidget(plain_box)
+        self._plain_body_box = plain_box
+
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _make_wicks_tab(
+        self,
+        defaults_shape,
+        defaults_doji_shape,
+        defaults_strategy,
+        defaults_doji_strategy,
+        defaults_context,
+    ) -> QWidget:
+        """Wicks tab: separate BUY/SELL boxes for Hammer with candles; plain fields for Hammer/Doji."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(14)
+
+        hwc_hint = QLabel(
+            "<b>Hammer with candles — wick size</b><br>"
+            "Dominant wick = the long wick (lower on BUY, upper on SELL). Small wick = the short side.<br>"
+            "<b>Symmetric?</b> on each wick = same +/- band. Uncheck only if you need different lower/upper limits."
+        )
+        hwc_hint.setObjectName("sectionHint")
+        hwc_hint.setWordWrap(True)
+        layout.addWidget(hwc_hint)
+        self._hwc_wicks_hint = hwc_hint
+
+        buy_box = QGroupBox("BUY — Classic green hammer")
+        buy_grid = QGridLayout(buy_box)
+        buy_grid.setContentsMargins(12, 16, 12, 12)
+        buy_grid.setHorizontalSpacing(20)
+        buy_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            buy_grid, BUY_CONTEXT_WICK_FIELDS, defaults_context,
+            live_preview=True, columns_per_row=2,
+        )
+        layout.addWidget(buy_box)
+        self._hwc_wicks_buy_box = buy_box
+
+        sell_box = QGroupBox("SELL — Inverted red hammer")
+        sell_grid = QGridLayout(sell_box)
+        sell_grid.setContentsMargins(12, 16, 12, 12)
+        sell_grid.setHorizontalSpacing(20)
+        sell_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            sell_grid, SELL_CONTEXT_WICK_FIELDS, defaults_context,
+            live_preview=True, columns_per_row=2,
+        )
+        layout.addWidget(sell_box)
+        self._hwc_wicks_sell_box = sell_box
+
+        plain_box = QGroupBox("Hammer / Doji wick settings")
+        plain_grid = QGridLayout(plain_box)
+        plain_grid.setContentsMargins(12, 16, 12, 12)
+        plain_grid.setHorizontalSpacing(20)
+        plain_grid.setVerticalSpacing(10)
+        self._add_fields_to_grid(
+            plain_grid, WICK_FIELDS + DOJI_WICK_FIELDS,
+            defaults_shape, defaults_doji_shape, defaults_strategy, defaults_doji_strategy,
+            live_preview=True, columns_per_row=3,
+        )
+        layout.addWidget(plain_box)
+        self._plain_wicks_box = plain_box
+
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _wire_symmetric_tolerance_fields(self):
+        """Enable +/- tolerance when Symmetric is on; enable lower/upper when off."""
+        prefixes = ("", "buy_", "sell_")
+        for prefix in prefixes:
+            for sym_name, tol_name, lo_name, hi_name in SYMMETRIC_TOLERANCE_GROUPS:
+                self._wire_one_symmetric_group(
+                    f"{prefix}{sym_name}",
+                    f"{prefix}{tol_name}",
+                    f"{prefix}{lo_name}",
+                    f"{prefix}{hi_name}",
+                )
+
+    def _wire_one_symmetric_group(
+        self, sym_name: str, tol_name: str, lo_name: str, hi_name: str,
+    ) -> None:
+        sym_widget = self.field_widgets.get(sym_name)
+        tol_widget = self.field_widgets.get(tol_name)
+        lo_widget = self.field_widgets.get(lo_name)
+        hi_widget = self.field_widgets.get(hi_name)
+        if sym_widget is None:
+            return
+
+        def refresh():
+            symmetric = sym_widget.isChecked()
+            if tol_widget is not None:
+                tol_widget.setEnabled(symmetric)
+                label = self.field_labels.get(tol_name)
+                if label is not None:
+                    label.setEnabled(symmetric)
+            for widget, name in ((lo_widget, lo_name), (hi_widget, hi_name)):
+                if widget is not None:
+                    widget.setEnabled(not symmetric)
+                label = self.field_labels.get(name)
+                if label is not None:
+                    label.setEnabled(not symmetric)
+
+        sym_widget.stateChanged.connect(lambda _state: refresh())
+        refresh()
+
+    def _make_field_tab(self, field_defs, *defaults_objs, live_preview=False) -> QWidget:
         """
         Builds one scrollable tab page containing all fields in
-        field_defs, reading defaults from defaults_obj (and additional
-        defaults objects for fields that live on different dataclasses).
+        field_defs, reading defaults from the given dataclass instances.
         """
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -3092,7 +3446,7 @@ class BacktestDashboard(QMainWindow):
             grid.setColumnStretch(pair_col * 2 + 1, 1)
             grid.setColumnMinimumWidth(pair_col * 2, 170)
 
-        default_sources = [defaults_obj, defaults_obj2, defaults_obj3, defaults_obj4]
+        default_sources = list(defaults_objs)
 
         row = 0
         col_pair = 0
@@ -3153,16 +3507,16 @@ class BacktestDashboard(QMainWindow):
         self,
         grid: QGridLayout,
         field_defs,
-        defaults_obj,
+        *defaults_objs,
         live_preview: bool = False,
         columns_per_row: int = 3,
     ) -> None:
-        """Place labeled parameter widgets into an existing grid (3 columns)."""
+        """Place labeled parameter widgets into an existing grid."""
         for pair_col in range(columns_per_row):
             grid.setColumnStretch(pair_col * 2 + 1, 1)
             grid.setColumnMinimumWidth(pair_col * 2, 140)
 
-        default_sources = [defaults_obj]
+        default_sources = list(defaults_objs)
         row = 0
         col_pair = 0
         for name, label_text, ftype, choices in field_defs:
@@ -3675,9 +4029,9 @@ class BacktestDashboard(QMainWindow):
         # answers "does everything I'm setting actually line up" --
         # not just an isolated candle shape.
         context_hint = QLabel(
-            "ENTRY / SL / TP follow Entry / Exit for the preview shape (Classic vs Inverted). "
-            "NEXT_CANDLE_OPEN/CLOSE draw a next bar; HAMMER_HIGH/LOW/CLOSE sit on this candle. "
-            "Offset and SL buffer shift the lines. Grey candles are illustration only."
+            "ENTRY / SL / TP follow Entry / Exit for the preview side. "
+            "Hammer with candles: grey candles = prior N bars (Context tab). "
+            "BUY/SELL use separate Body/Wicks rows."
         )
         context_hint.setObjectName("sectionHint")
         context_hint.setWordWrap(True)
@@ -3769,23 +4123,91 @@ class BacktestDashboard(QMainWindow):
             return widget.text()
         return None
 
+    def _preview_bounds_from_ratios(self, ratios) -> tuple[float, float, float, float, float, float]:
+        """Use the same asymmetric/symmetric bounds logic as the engine."""
+        body_lo, body_hi = ratios.body_bounds()
+        dominant_lo, dominant_hi = ratios.dominant_wick_bounds()
+        small_lo, small_hi = ratios.small_wick_bounds()
+        return body_lo, body_hi, dominant_lo, dominant_hi, small_lo, small_hi
+
     def _redraw_candle_preview(self, *args):
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
-        if pattern == "Doji":
+        if pattern == "Hammer with candles":
+            self._redraw_hammer_context_preview()
+        elif pattern == "Doji":
             self._redraw_doji_candle_preview()
         else:
             self._redraw_hammer_candle_preview()
 
+    def _redraw_hammer_context_preview(self):
+        """Preview BUY classic or SELL inverted shape for Hammer with candles."""
+        self._sync_preview_shape_toggle_enabled()
+        trade_side = getattr(self, "_preview_trade_side", "BUY")
+        is_buy = trade_side != "SELL"
+        prefix = "buy_" if is_buy else "sell_"
+        body_pct = self._get_field_float(f"{prefix}body_pct")
+        dominant_pct = self._get_field_float(f"{prefix}dominant_wick_pct")
+        small_pct = self._get_field_float(f"{prefix}small_wick_pct")
+        if None in (body_pct, dominant_pct, small_pct):
+            return
+
+        shape_choice = "CLASSIC" if is_buy else "INVERTED"
+        self._preview_hammer_shape = shape_choice
+
+        try:
+            cfg = self._build_hammer_context_strategy_config()
+        except Exception:
+            cfg = hammer_context_logic.HammerContextConfig()
+
+        trade_dir = (
+            logic.TradeDirection.BUY if is_buy else logic.TradeDirection.SELL
+        )
+        is_green = is_buy
+        ratios = cfg.buy_hammer_ratios if is_buy else cfg.sell_hammer_ratios
+        shape_cfg = cfg.to_buy_shape_config() if is_buy else cfg.to_sell_shape_config()
+        draw_wick = logic.preview_draw_wick_side(shape_cfg, shape_choice)
+        variant = logic.variant_name_for_draw_wick(draw_wick)
+
+        self.candle_widget.set_shape(body_pct, dominant_pct, small_pct, draw_wick, is_green)
+        body_lo, body_hi, dominant_lo, dominant_hi, small_lo, small_hi = (
+            self._preview_bounds_from_ratios(ratios)
+        )
+
+        self.tolerance_widget_min.set_shape(body_hi, dominant_lo, small_hi, draw_wick, is_green)
+        self.tolerance_label_min.setText(f"Loosest valid shape\nBody: {body_hi:.0f}%  Wick: {dominant_lo:.0f}%")
+        self.tolerance_widget_max.set_shape(body_lo, dominant_hi, small_lo, draw_wick, is_green)
+        self.tolerance_label_max.setText(f"Tightest valid shape\nBody: {body_lo:.0f}%  Wick: {dominant_hi:.0f}%")
+
+        n = cfg.lookback_candles
+        det = hammer_context_logic.describe_hammer_context_rules(cfg)
+        if hasattr(self, "tolerance_hint_label"):
+            self.tolerance_hint_label.setText(
+                f"Hammer with candles — preview {trade_side}. Prior {n} candle(s) must respect hammer "
+                f"{'low' if is_buy else 'high'}. BUY/SELL each have own Body/Wicks rows. {det}"
+            )
+
+        self._update_preview_summary_label(
+            pattern="Hammer with candles",
+            variant=variant,
+            is_green=is_green,
+            trade_side=trade_side,
+            detection_line=det,
+        )
+        ee = self._preview_entry_exit_kwargs(False, variant)
+        self._update_context_charts(
+            body_pct, dominant_pct, small_pct, draw_wick, is_green, is_doji=False,
+            hammer_variant=variant, preview_trade_side=trade_side,
+            context_lookback=n,
+            **ee,
+        )
+
     def _redraw_hammer_candle_preview(self):
         self._sync_preview_shape_toggle_enabled()
         body_pct = self._get_field_float("body_pct")
-        body_tol = self._get_field_float("body_tol")
         dominant_pct = self._get_field_float("dominant_wick_pct")
-        dominant_tol = self._get_field_float("dominant_wick_tol")
         small_pct = self._get_field_float("small_wick_pct")
-        small_tol = self._get_field_float("small_wick_tol")
 
-        if None in (body_pct, body_tol, dominant_pct, dominant_tol, small_pct, small_tol):
+        if None in (body_pct, dominant_pct, small_pct):
             return
 
         try:
@@ -3801,16 +4223,9 @@ class BacktestDashboard(QMainWindow):
         variant = logic.variant_name_for_draw_wick(draw_wick)
 
         self.candle_widget.set_shape(body_pct, dominant_pct, small_pct, draw_wick, is_green)
-
-        def clamp(v):
-            return max(0.0, min(100.0, v))
-
-        dominant_lo = clamp(dominant_pct - dominant_tol)
-        dominant_hi = clamp(dominant_pct + dominant_tol)
-        body_lo = clamp(body_pct - body_tol)
-        body_hi = clamp(body_pct + body_tol)
-        small_lo = clamp(small_pct - small_tol)
-        small_hi = clamp(small_pct + small_tol)
+        body_lo, body_hi, dominant_lo, dominant_hi, small_lo, small_hi = (
+            self._preview_bounds_from_ratios(cfg.hammer_ratios)
+        )
 
         self.tolerance_widget_min.set_shape(body_hi, dominant_lo, small_hi, draw_wick, is_green)
         self.tolerance_label_min.setText(f"Loosest valid shape\nBody: {body_hi:.0f}%  Wick: {dominant_lo:.0f}%")
@@ -3983,7 +4398,29 @@ class BacktestDashboard(QMainWindow):
             )
 
     def _preview_entry_exit_kwargs(self, is_doji: bool, hammer_variant: str) -> dict:
-        """Classic vs inverted Entry / Exit fields currently shown on Pattern In Context."""
+        """Classic vs inverted Entry / Exit fields for Pattern In Context."""
+        pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
+        if pattern == "Hammer with candles":
+            try:
+                cfg = self._build_hammer_context_strategy_config()
+            except Exception:
+                cfg = hammer_context_logic.HammerContextConfig()
+            use_sell = str(hammer_variant).upper() == "INVERTED"
+            if use_sell:
+                return {
+                    "entry_rule": cfg.inverted_entry_rule,
+                    "entry_offset": cfg.inverted_entry_offset,
+                    "buffer_mode": cfg.inverted_buffer_mode,
+                    "sl_buffer_pct": cfg.inverted_sl_buffer_pct,
+                    "sl_buffer_flat": cfg.inverted_sl_buffer_flat,
+                }
+            return {
+                "entry_rule": cfg.entry_rule,
+                "entry_offset": cfg.entry_offset,
+                "buffer_mode": cfg.buffer_mode,
+                "sl_buffer_pct": cfg.sl_buffer_pct,
+                "sl_buffer_flat": cfg.sl_buffer_flat,
+            }
         use_inverted = (not is_doji) and str(hammer_variant).upper() == "INVERTED"
         if use_inverted:
             rule = self._get_field_str("inverted_entry_rule") or "NEXT_CANDLE_OPEN"
@@ -4010,6 +4447,8 @@ class BacktestDashboard(QMainWindow):
         doji_style: str = "",
         hammer_variant: str = "CLASSIC",
         preview_trade_side: str = "BUY",
+        context_lookback: int = 5,
+        **entry_exit_kwargs,
     ):
         defaults = logic.DEFAULT_TIMEFRAME_SETTINGS
         for tf, chart in getattr(self, "context_charts", {}).items():
@@ -4032,8 +4471,9 @@ class BacktestDashboard(QMainWindow):
                 body_pct, dominant_pct, small_pct, wick_side, is_green,
                 rr_multiple, max_sl_usd, tf, is_doji=is_doji, doji_style=doji_style,
                 preview_trade_side=preview_trade_side,
+                context_lookback=context_lookback,
                 **ind,
-                **self._preview_entry_exit_kwargs(is_doji, hammer_variant),
+                **(entry_exit_kwargs if entry_exit_kwargs else self._preview_entry_exit_kwargs(is_doji, hammer_variant)),
             )
 
     def _indicator_preview_state(
@@ -4833,7 +5273,15 @@ class BacktestDashboard(QMainWindow):
                 except Exception:
                     det = f"Doji {style} · {mode}"
                 detail = det
-            else:
+            elif pattern == "Hammer with candles":
+                try:
+                    cfg = self._build_hammer_context_strategy_config()
+                    detail = hammer_context_logic.describe_hammer_context_rules(cfg)
+                    ee = hammer_context_logic.describe_hammer_context_entry_exit(cfg)
+                    detail += f"<br><span style='color:#5f6368;'>{ee}</span>"
+                except Exception:
+                    detail = "Hammer with candles — classic green BUY / inverted red SELL + prior N bars"
+            elif pattern == "Hammer":
                 cfg = self._build_hammer_strategy_config()
                 detail = logic.describe_hammer_direction_matrix(cfg)
                 try:
@@ -4848,6 +5296,8 @@ class BacktestDashboard(QMainWindow):
                     ee = ""
                 if ee:
                     detail += f"<br><span style='color:#5f6368;'>{ee}</span>"
+            else:
+                detail = ""
         except Exception:
             detail = ""
         tf = self.live_timeframe.currentText() if hasattr(self, "live_timeframe") else "1h"
@@ -5125,12 +5575,19 @@ class BacktestDashboard(QMainWindow):
 
         preflight = self._live_preflight_notes(live_cfg)
         preflight.extend(self._live_indicator_preflight_lines(indicator_stack))
-        if pattern_type != "doji":
+        if pattern_type == "hammer":
             preflight.append(f"Direction: {logic.describe_hammer_direction_matrix(strategy_config)}")
             preflight.append(f"Entry/Exit: {logic.describe_hammer_entry_exit(strategy_config)}")
             preflight.append(
                 "These Direction + Entry/Exit rows are the same objects used in backtest "
                 "(lots/risk caps still come from the Live panel, not Run Settings)."
+            )
+        elif pattern_type in ("hammer_with_candles", "hammer_context"):
+            preflight.append(f"Rules: {hammer_context_logic.describe_hammer_context_rules(strategy_config)}")
+            preflight.append(f"Entry/Exit: {hammer_context_logic.describe_hammer_context_entry_exit(strategy_config)}")
+            preflight.append(
+                "BUY = classic green hammer + prior N closes not below hammer low. "
+                "SELL = inverted red hammer + prior N closes not above hammer high."
             )
         tf_set = tf_settings.get(live_tf)
         if tf_set is not None:
@@ -5642,7 +6099,62 @@ class BacktestDashboard(QMainWindow):
         pattern = self.pattern_combo.currentText()
         if pattern == "Doji":
             return self._build_doji_strategy_config()
+        if pattern == "Hammer with candles":
+            return self._build_hammer_context_strategy_config()
         return self._build_hammer_strategy_config()
+
+    def _build_context_side_ratio_config(self, side: str) -> logic.HammerRatioConfig:
+        prefix = "buy_" if side == "buy" else "sell_"
+        defaults = logic.HammerRatioConfig()
+        kwargs = {}
+        for name in HAMMER_RATIO_FIELD_NAMES:
+            default_val = getattr(defaults, name)
+            ftype = FIELD_TYPE_CHECK if isinstance(default_val, bool) else FIELD_TYPE_TEXT
+            kwargs[name] = self._read_ui_field(f"{prefix}{name}", default_val, ftype)
+        return logic.HammerRatioConfig(**kwargs)
+
+    def _build_hammer_context_strategy_config(self) -> hammer_context_logic.HammerContextConfig:
+        defaults = hammer_context_logic.HammerContextConfig()
+        kwargs = {
+            "buy_hammer_ratios": self._build_context_side_ratio_config("buy"),
+            "sell_hammer_ratios": self._build_context_side_ratio_config("sell"),
+        }
+
+        for name, _, ftype, _ in CONTEXT_PATTERN_FIELDS:
+            attr = CONTEXT_UI_ATTR_OVERRIDES.get(name, name)
+            default_val = getattr(defaults, attr)
+            kwargs[attr] = self._read_ui_field(name, default_val, ftype)
+
+        classic_fields = CLASSIC_ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS
+        for name, _, ftype, _ in classic_fields:
+            default_val = getattr(defaults, name)
+            kwargs[name] = self._read_ui_field(name, default_val, ftype)
+
+        for name, _, ftype, _ in INVERTED_ENTRY_EXIT_FIELDS:
+            default_val = getattr(defaults, name)
+            kwargs[name] = self._read_ui_field(name, default_val, ftype)
+
+        timeframe_settings = {}
+        for tf in TIMEFRAME_LABELS:
+            tw = self.timeframe_widgets.get(tf)
+            if tw is None:
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                if defaults_tf is not None:
+                    timeframe_settings[tf] = logic.TimeframeSetting(
+                        rr_multiple=defaults_tf.rr_multiple,
+                        max_sl_usd=defaults_tf.max_sl_usd,
+                    )
+                continue
+            try:
+                rr = float(tw["rr"].text())
+                sl = float(tw["sl"].text())
+            except (ValueError, AttributeError, KeyError):
+                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
+                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
+            timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
+        kwargs["timeframe_settings"] = timeframe_settings
+        return hammer_context_logic.HammerContextConfig(**kwargs)
 
     def _build_backtest_config(self, strategy_config) -> backtest.BacktestConfig:
         defaults = backtest.BacktestConfig()
@@ -6207,6 +6719,30 @@ class BacktestDashboard(QMainWindow):
                 "red_doji": getattr(cfg.red_direction, "value", "SELL"),
                 "note": "Doji uses doji_direction_mode — not hammer green/red tabs unless mode is CANDLE_COLOR.",
             }
+        if pattern == "Hammer with candles":
+            cfg = self._build_hammer_context_strategy_config()
+            buy = cfg.buy_hammer_ratios
+            sell = cfg.sell_hammer_ratios
+            stack = self._build_indicator_stack()
+            inds = stack.enabled_indicator_ids()
+            return {
+                "pattern": "Hammer with candles",
+                "lookback_candles": cfg.lookback_candles,
+                "enable_buy": cfg.enable_buy,
+                "enable_sell": cfg.enable_sell,
+                "buy_body_pct": buy.body_pct,
+                "buy_dominant_wick_pct": buy.dominant_wick_pct,
+                "sell_body_pct": sell.body_pct,
+                "sell_dominant_wick_pct": sell.dominant_wick_pct,
+                "entry_rule": getattr(cfg.entry_rule, "value", str(cfg.entry_rule)),
+                "inverted_entry_rule": getattr(cfg.inverted_entry_rule, "value", str(cfg.inverted_entry_rule)),
+                "indicators_added": inds,
+                "plain_english": (
+                    f"{hammer_context_logic.describe_hammer_context_rules(cfg)}. "
+                    f"{hammer_context_logic.describe_hammer_context_entry_exit(cfg)}. "
+                    "BUY and SELL each have separate Body/Wicks on the Parameters tabs."
+                ),
+            }
         cfg = self._build_hammer_strategy_config()
         stack = self._build_indicator_stack()
         inds = stack.enabled_indicator_ids()
@@ -6291,12 +6827,24 @@ class BacktestDashboard(QMainWindow):
             if widget.findText(text) >= 0:
                 widget.setCurrentText(text)
 
+    def _migrate_preset_fields_for_pattern(self, pattern: str, fields: dict) -> dict:
+        """Fill Hammer-with-candles BUY/SELL fields from plain hammer fields when missing."""
+        if pattern != "Hammer with candles":
+            return fields
+        for side in ("buy", "sell"):
+            for name in HAMMER_RATIO_FIELD_NAMES:
+                key = f"{side}_{name}"
+                if key not in fields and name in fields:
+                    fields[key] = fields[name]
+        return fields
+
     def _apply_preset_snapshot(self, data: dict):
         pattern = data.get("pattern", "Hammer")
         if self.pattern_combo.findText(pattern) >= 0:
             self.pattern_combo.setCurrentText(pattern)
         self._apply_pattern_field_visibility()
         fields = dict(data.get("fields") or {})
+        fields = self._migrate_preset_fields_for_pattern(pattern, fields)
         if "classic_green" not in fields:
             migrated = logic.direction_matrix_from_legacy_fields(
                 green_direction=fields.get("green_direction", "BUY"),
@@ -6338,6 +6886,7 @@ class BacktestDashboard(QMainWindow):
             self._set_field_widget_value(name, value)
         if pattern == "Doji":
             self._fill_empty_doji_widget_defaults()
+        self._wire_symmetric_tolerance_fields()
         self._redraw_candle_preview()
         self._refresh_sizing_field_highlights()
         self._refresh_live_strategy_summary()

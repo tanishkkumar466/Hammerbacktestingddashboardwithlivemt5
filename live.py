@@ -19,6 +19,7 @@ from typing import Callable, List, Optional, Set, Tuple
 import polars as pl
 
 import doji_logic
+import hammer_context_logic
 import logic
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
@@ -58,6 +59,9 @@ def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_typ
         parts.append(doji_logic.describe_doji_detection(strategy_config))
         parts.append(f"entry={entry_rule} offset=${entry_off}")
         parts.append(f"SL buffer={buf_mode} ({sl_pct}%)" if sl_pct is not None else f"SL buffer={buf_mode}")
+    elif pattern_type in ("hammer_with_candles", "hammer_context"):
+        parts.append(hammer_context_logic.describe_hammer_context_rules(strategy_config))
+        parts.append(hammer_context_logic.describe_hammer_context_entry_exit(strategy_config))
     else:
         parts.append(logic.describe_hammer_direction_matrix(strategy_config))
         parts.append(logic.describe_hammer_detection(strategy_config))
@@ -227,10 +231,18 @@ def find_bar_signal_outcome(
     """
     if len(closed) < 3:
         return None, None
+    if pattern_type in ("hammer_with_candles", "hammer_context"):
+        lookback = max(1, int(getattr(strategy_config, "lookback_candles", 5) or 5))
+        if len(closed) < lookback + 1:
+            return None, None
 
     extended = closed + [forming]
     if pattern_type == "doji":
         signals = doji_logic.run_strategy(
+            extended, timeframe=timeframe_logic_label, config=strategy_config,
+        )
+    elif pattern_type in ("hammer_with_candles", "hammer_context"):
+        signals = hammer_context_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
     else:
@@ -254,7 +266,7 @@ def find_bar_signal_outcome(
         if sig.ignored:
             ignored_match = sig
             continue
-        if pattern_type != "doji":
+        if pattern_type != "doji" and pattern_type not in ("hammer_with_candles", "hammer_context"):
             ok, vmsg = logic.verify_hammer_trade_signal(sig, strategy_config)
             if not ok:
                 sig = logic.TradeSignal(
@@ -375,7 +387,12 @@ class LiveTradingEngine:
         self.pattern_type = pattern_type
         self.pattern_label = pattern_label
         extra = ""
-        if hasattr(strategy_config, "classic_green"):
+        if hasattr(strategy_config, "lookback_candles"):
+            extra = (
+                f"{hammer_context_logic.describe_hammer_context_rules(strategy_config)} | "
+                f"{hammer_context_logic.describe_hammer_context_entry_exit(strategy_config)} | "
+            )
+        elif hasattr(strategy_config, "classic_green"):
             extra = (
                 f"{logic.describe_hammer_direction_matrix(strategy_config)} | "
                 f"{logic.describe_hammer_entry_exit(strategy_config)} | "
@@ -528,12 +545,17 @@ class LiveTradingEngine:
             f"Indicators: {inds} | {self._active_symbol} {cfg.timeframe_label} | "
             f"lots={cfg.volume} | dry_run={cfg.dry_run} | order={cfg.order_mode}"
         )
-        if self.pattern_type != "doji":
+        if self.pattern_type == "hammer":
             self.log(
                 f"[LIVE] Direction locked for this session: "
                 f"{logic.describe_hammer_direction_matrix(self.strategy_config)} "
                 f"(signal bar shape+color; entry is next bar). "
                 f"Change Parameters then use 'Apply to live' or Stop/Start live."
+            )
+        elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
+            self.log(
+                f"[LIVE] Context rules: "
+                f"{hammer_context_logic.describe_hammer_context_rules(self.strategy_config)}"
             )
         self.log(summarize_strategy_params(
             self.strategy_config, cfg.timeframe_label, self.pattern_type,
@@ -823,7 +845,7 @@ class LiveTradingEngine:
                 self.log(
                     f"[LIVE] Pattern on signal bar but not traded ({variant}): {ignored.ignore_reason}"
                 )
-                if self.pattern_type != "doji":
+                if self.pattern_type == "hammer":
                     self.log(
                         logic.explain_hammer_signal_direction(
                             ignored.hammer_candle,
@@ -841,7 +863,7 @@ class LiveTradingEngine:
                     "(Indicators only FILTER pattern signals; SuperTrend/VWAP being bullish "
                     "never opens a trade by itself.)"
                 )
-                if self.pattern_type != "doji":
+                if self.pattern_type == "hammer":
                     self.log(
                         f"[LIVE] Hammer probe: "
                         f"{logic.describe_hammer_probe(signal_bar, self.strategy_config)}"
@@ -860,6 +882,15 @@ class LiveTradingEngine:
                                 f"[LIVE] {hr.hammer_variant.value} {hr.color.value} matched shape "
                                 f"but Direction tab is NO — no order."
                             )
+                elif self.pattern_type in ("hammer_with_candles", "hammer_context") and len(closed) >= 2:
+                    cfg = self.strategy_config
+                    idx = len(closed) - 1
+                    buy_fail = hammer_context_logic.detect_buy_setup(closed, idx, cfg)
+                    sell_fail = hammer_context_logic.detect_sell_setup(closed, idx, cfg)
+                    if buy_fail and sell_fail:
+                        self.log(
+                            f"[LIVE] Context probe: BUY — {buy_fail} | SELL — {sell_fail}"
+                        )
             return
 
         key = _signal_key(sig)
@@ -896,13 +927,35 @@ class LiveTradingEngine:
             f"[SIGNAL] {sig.direction.value} ({variant}) — hammer/signal bar: "
             f"{describe_candle(sig.hammer_candle)}"
         )
-        if self.pattern_type != "doji":
+        if self.pattern_type == "hammer":
             self.log(logic.explain_hammer_signal_direction(
                 sig.hammer_candle, sig.direction, self.strategy_config, variant,
             ))
             self.log(
                 f"[SIGNAL] Entry/SL from {'inverted' if variant == 'INVERTED' else 'classic'} "
                 f"row: {logic.entry_rule_label_for_variant(self.strategy_config, variant)}"
+            )
+        elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
+            cfg = self.strategy_config
+            n = getattr(cfg, "lookback_candles", "?")
+            if sig.direction == logic.TradeDirection.BUY:
+                self.log(
+                    f"[SIGNAL] Context BUY: {n} prior close(s) not below hammer low "
+                    f"{sig.hammer_candle.low:.2f}"
+                )
+            else:
+                self.log(
+                    f"[SIGNAL] Context SELL: {n} prior close(s) not above hammer high "
+                    f"{sig.hammer_candle.high:.2f}"
+                )
+            trade_cfg = (
+                cfg.to_buy_trade_config()
+                if sig.direction == logic.TradeDirection.BUY
+                else cfg.to_sell_trade_config()
+            )
+            self.log(
+                f"[SIGNAL] Entry/SL row: "
+                f"{logic.entry_rule_label_for_variant(trade_cfg, variant)}"
             )
         self.log(
             f"[SIGNAL] Entry bar (next candle): {describe_candle(sig.entry_candle)} | "
