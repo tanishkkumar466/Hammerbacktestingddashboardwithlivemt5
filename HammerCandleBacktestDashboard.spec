@@ -14,6 +14,7 @@ entry_script = str(ROOT / "main.py")
 datas = []
 binaries = []
 hiddenimports = [
+    "dashboard",
     "backtest",
     "plotting",
     "logic",

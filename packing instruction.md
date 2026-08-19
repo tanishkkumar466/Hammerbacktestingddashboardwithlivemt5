@@ -19,9 +19,9 @@ for you to set up.
 ## Option A: GitHub Actions (no Windows machine needed)
 
 1. Put `dashboard.py` (Qt UI entry point), `logic.py`, `doji_logic.py`,
-   `backtest.py`, and `plotting.py` in a folder together (leave
-   `fetch.py` out -- it's never imported by the dashboard, so it
-   wouldn't get bundled anyway, but no need to include it).
+   `hammer_context_logic.py`, `backtest.py`, `plotting.py`, `live.py`,
+   `broker.py`, `live_journal.py`, `indicators/`, and `main.py` in a folder
+   together (leave `fetch.py` out if you want — live uses `broker.py`).
 2. Copy the `.github/workflows/build-windows-exe.yml` file and
    `HammerCandleBacktestDashboard.spec` (included alongside this guide)
    into that same folder, keeping the `.github/workflows/` path structure.

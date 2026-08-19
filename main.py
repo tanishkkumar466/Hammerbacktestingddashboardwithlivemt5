@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import runpy
 import sys
 
 
@@ -22,7 +21,10 @@ def _app_dir() -> str:
 
 def _run_dashboard() -> None:
     os.chdir(_app_dir())
-    runpy.run_path(os.path.join(_app_dir(), "dashboard.py"), run_name="__main__")
+    # Import the module (not runpy on a .py path). Frozen onefile has no
+    # dashboard.py next to the exe — only inside the bundle as a module.
+    import dashboard
+    dashboard.launch()
 
 
 def _run_backtest() -> int:

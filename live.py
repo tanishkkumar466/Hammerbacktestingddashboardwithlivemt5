@@ -229,12 +229,15 @@ def find_bar_signal_outcome(
     Returns (actionable_signal, ignored_on_this_bar).
     ignored_on_this_bar is set when a pattern matched the last closed bar but was filtered.
     """
-    if len(closed) < 3:
-        return None, None
     if pattern_type in ("hammer_with_candles", "hammer_context"):
-        lookback = max(1, int(getattr(strategy_config, "lookback_candles", 5) or 5))
+        try:
+            lookback = max(0, int(getattr(strategy_config, "lookback_candles", 5)))
+        except (TypeError, ValueError):
+            lookback = 5
         if len(closed) < lookback + 1:
             return None, None
+    elif len(closed) < 3:
+        return None, None
 
     extended = closed + [forming]
     if pattern_type == "doji":
@@ -885,8 +888,16 @@ class LiveTradingEngine:
                 elif self.pattern_type in ("hammer_with_candles", "hammer_context") and len(closed) >= 2:
                     cfg = self.strategy_config
                     idx = len(closed) - 1
+                    signal_bar = closed[idx]
+                    body_pct = hammer_context_logic.body_pct_of_candle(
+                        signal_bar, getattr(cfg, "min_range", 1e-9),
+                    )
                     buy_fail = hammer_context_logic.detect_buy_setup(closed, idx, cfg)
                     sell_fail = hammer_context_logic.detect_sell_setup(closed, idx, cfg)
+                    self.log(
+                        f"[LIVE] Signal bar body={body_pct:.1f}% of range "
+                        f"(wick-off uses this vs Body tab cap)"
+                    )
                     if buy_fail and sell_fail:
                         self.log(
                             f"[LIVE] Context probe: BUY — {buy_fail} | SELL — {sell_fail}"
@@ -938,16 +949,36 @@ class LiveTradingEngine:
         elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
             cfg = self.strategy_config
             n = getattr(cfg, "lookback_candles", "?")
+            body_pct = hammer_context_logic.body_pct_of_candle(
+                sig.hammer_candle, getattr(cfg, "min_range", 1e-9),
+            )
             if sig.direction == logic.TradeDirection.BUY:
+                wick_note = (
+                    "body only, wick ignored"
+                    if not getattr(cfg, "buy_require_wick", True)
+                    else "classic wick required"
+                )
                 self.log(
-                    f"[SIGNAL] Context BUY: {n} prior close(s) not below hammer low "
+                    f"[SIGNAL] Context BUY ({wick_note}, body={body_pct:.1f}%): "
+                    f"{n} prior close(s) not below hammer low "
                     f"{sig.hammer_candle.low:.2f}"
                 )
             else:
+                wick_note = (
+                    "body only, wick ignored"
+                    if not getattr(cfg, "sell_require_wick", True)
+                    else "inverted wick required"
+                )
                 self.log(
-                    f"[SIGNAL] Context SELL: {n} prior close(s) not above hammer high "
+                    f"[SIGNAL] Context SELL ({wick_note}, body={body_pct:.1f}%): "
+                    f"{n} prior close(s) not above hammer high "
                     f"{sig.hammer_candle.high:.2f}"
                 )
+            sl_variant = (
+                logic.HammerVariant.INVERTED
+                if sig.direction == logic.TradeDirection.SELL
+                else logic.HammerVariant.CLASSIC
+            )
             trade_cfg = (
                 cfg.to_buy_trade_config()
                 if sig.direction == logic.TradeDirection.BUY
@@ -955,7 +986,7 @@ class LiveTradingEngine:
             )
             self.log(
                 f"[SIGNAL] Entry/SL row: "
-                f"{logic.entry_rule_label_for_variant(trade_cfg, variant)}"
+                f"{logic.entry_rule_label_for_variant(trade_cfg, sl_variant)}"
             )
         self.log(
             f"[SIGNAL] Entry bar (next candle): {describe_candle(sig.entry_candle)} | "

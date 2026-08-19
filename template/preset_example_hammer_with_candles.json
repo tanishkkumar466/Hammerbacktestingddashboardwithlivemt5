@@ -60,6 +60,8 @@
     "context_lookback_candles": "5",
     "context_enable_buy": true,
     "context_enable_sell": true,
+    "buy_require_wick": true,
+    "sell_require_wick": true,
     "buy_body_pct": "20",
     "buy_body_tol": "25",
     "buy_body_tol_is_symmetric": true,

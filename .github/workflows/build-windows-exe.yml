@@ -11,6 +11,7 @@ on:
       - "doji_logic.py"
       - "backtest.py"
       - "plotting.py"
+      - "hammer_context_logic.py"
       - "broker.py"
       - "live.py"
       - "live_journal.py"
@@ -48,6 +49,7 @@ jobs:
           $required = @(
             "main.py", "dashboard.py", "logic.py", "doji_logic.py", "backtest.py",
             "plotting.py", "broker.py", "live.py", "live_journal.py",
+            "hammer_context_logic.py",
             "HammerCandleBacktestDashboard.spec"
           )
           foreach ($f in $required) {

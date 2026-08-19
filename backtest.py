@@ -899,6 +899,7 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
     if not trades:
         return pl.DataFrame(schema={
             "timeframe": pl.Utf8, "direction": pl.Utf8, "hammer_color": pl.Utf8,
+            "pattern_variant": pl.Utf8,
             "entry_time": pl.Datetime, "entry_price": pl.Float64,
             "stop_loss": pl.Float64, "target": pl.Float64,
             "risk_price_distance": pl.Float64, "rr_multiple_target": pl.Float64,
@@ -917,6 +918,7 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             "direction": sig.direction.value,
             "hammer_color": "GREEN" if sig.hammer_candle.is_green else (
                 "RED" if sig.hammer_candle.is_red else "DOJI"),
+            "pattern_variant": getattr(sig, "pattern_variant", None) or "",
             "entry_time": t.entry_time,
             "entry_price": sig.entry_price,
             "stop_loss": sig.stop_loss,
@@ -1181,6 +1183,7 @@ def export_ignored_signals(ignored: List["logic.TradeSignal"], filepath: str) ->
     if not ignored:
         pl.DataFrame(schema={
             "timeframe": pl.Utf8, "direction": pl.Utf8, "hammer_color": pl.Utf8,
+            "pattern_variant": pl.Utf8,
             "hammer_time": pl.Utf8, "ignore_reason": pl.Utf8,
         }).write_csv(filepath)
         return
@@ -1190,6 +1193,7 @@ def export_ignored_signals(ignored: List["logic.TradeSignal"], filepath: str) ->
         "direction": sig.direction.value if sig.direction else "",
         "hammer_color": "GREEN" if sig.hammer_candle.is_green else (
             "RED" if sig.hammer_candle.is_red else "DOJI"),
+        "pattern_variant": getattr(sig, "pattern_variant", None) or "",
         "hammer_time": str(sig.hammer_candle.timestamp),
         "ignore_reason": sig.ignore_reason or "",
     } for sig in ignored]
@@ -1228,6 +1232,12 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     print("=" * 70)
     print(f"BACKTEST: {config.symbol} | Pattern: {config.pattern_type} | "
           f"Timeframes: {config.timeframes_to_test}")
+    if config.pattern_type in ("hammer_with_candles", "hammer_context"):
+        try:
+            print(hammer_context_logic.describe_hammer_context_rules(config.strategy_config))
+            print(hammer_context_logic.describe_hammer_context_entry_exit(config.strategy_config))
+        except Exception as e:
+            print(f"[WARN] Could not print Hammer-with-candles rules: {e}")
     print(f"Overlap allowed: {config.allow_overlapping_trades} | "
           f"Sizing: {_sizing_mode(config).value}")
     print("=" * 70)

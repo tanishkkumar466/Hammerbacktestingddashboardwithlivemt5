@@ -4,13 +4,16 @@ hammer_context_logic.py
 Multi-candle hammer context pattern (separate from single-candle Hammer in logic.py).
 
 BUY setup:
-    Signal bar = classic hammer (long lower wick) that closes GREEN.
-    Prior N candles (configurable: 1, 2, 3, …): every close must be >= signal low
-    (no close below the hammer low).
+    Signal bar = classic hammer (long lower wick) that closes GREEN,
+    unless buy_require_wick is False — then any GREEN candle whose body
+    is at most Body % of the range (wick up/down ignored; color still required).
+    Prior N candles: every close must be >= signal low.
 
 SELL setup:
-    Signal bar = inverted hammer (long upper wick) that closes RED.
-    Prior N candles: every close must be <= signal high (no close above hammer high).
+    Signal bar = inverted hammer (long upper wick) that closes RED,
+    unless sell_require_wick is False — then any RED candle whose body
+    is at most Body % of the range (wick up/down ignored; color still required).
+    Prior N candles: every close must be <= signal high.
 
 Entry / SL / TP reuse logic.py helpers. BUY uses classic entry+SL fields;
 SELL uses inverted entry+SL fields.
@@ -31,6 +34,9 @@ class HammerContextConfig:
     lookback_candles: int = 5
     enable_buy: bool = True
     enable_sell: bool = True
+    # When False, that side matches on body % + color only (wick up/down ignored).
+    buy_require_wick: bool = True
+    sell_require_wick: bool = True
 
     # BUY — classic green hammer
     entry_rule: logic.EntryRule = logic.EntryRule.NEXT_CANDLE_OPEN
@@ -54,7 +60,10 @@ class HammerContextConfig:
     min_range: float = 1e-9
 
     def __post_init__(self):
-        self.lookback_candles = max(1, int(self.lookback_candles or 1))
+        try:
+            self.lookback_candles = max(0, int(self.lookback_candles))
+        except (TypeError, ValueError):
+            self.lookback_candles = 5
         self.entry_rule = logic.coerce_entry_rule(self.entry_rule)
         self.inverted_entry_rule = logic.coerce_entry_rule(self.inverted_entry_rule)
         self.buffer_mode = logic.coerce_buffer_mode(self.buffer_mode)
@@ -116,19 +125,74 @@ class HammerContextConfig:
         return cfg
 
 
+def body_pct_of_candle(candle: logic.Candle, min_range: float = 1e-9) -> float:
+    rng = candle.range_
+    if rng <= min_range:
+        return 0.0
+    return (candle.body / rng) * 100.0
+
+
+def body_only_max_pct(ratios: logic.HammerRatioConfig) -> float:
+    """When wick is off, Body % is a hard cap (tolerance is not used)."""
+    raw = getattr(ratios, "body_pct", 10.0)
+    try:
+        cap = float(raw)
+    except (TypeError, ValueError):
+        cap = 10.0
+    if cap != cap:  # NaN
+        cap = 10.0
+    return max(0.0, min(100.0, cap))
+
+
+def body_only_ok(
+    candle: logic.Candle,
+    ratios: logic.HammerRatioConfig,
+    min_range: float = 1e-9,
+) -> Tuple[bool, str]:
+    """Legal when body % of range is at most Body % (wick ignored; color checked separately)."""
+    actual = body_pct_of_candle(candle, min_range)
+    cap = body_only_max_pct(ratios)
+    if actual > cap:
+        return False, f"Body {actual:.1f}% above max {cap:g}%"
+    return True, ""
+
+
 def describe_hammer_context_rules(config: HammerContextConfig) -> str:
     """Human-readable rules for Hammer with candles pattern."""
     n = config.lookback_candles
+    if n <= 0:
+        buy_ctx = "no prior-candle context"
+        sell_ctx = "no prior-candle context"
+    else:
+        buy_ctx = f"{n} prior close(s) not below hammer low"
+        sell_ctx = f"{n} prior close(s) not above hammer high"
     parts = []
     if config.enable_buy:
-        parts.append(
-            f"BUY: classic green hammer + {n} prior close(s) not below hammer low"
-        )
+        if config.buy_require_wick:
+            buy_shape = "classic green hammer"
+        else:
+            buy_hi = body_only_max_pct(config.buy_hammer_ratios)
+            buy_shape = (
+                f"green candle, body ≤ {buy_hi:g}% "
+                f"(rest is wick; upper/lower ignored)"
+            )
+        parts.append(f"BUY: {buy_shape} + {buy_ctx}")
     if config.enable_sell:
-        parts.append(
-            f"SELL: inverted red hammer + {n} prior close(s) not above hammer high"
-        )
-    return " | ".join(parts) if parts else "Both BUY and SELL setups disabled"
+        if config.sell_require_wick:
+            sell_shape = "inverted red hammer"
+        else:
+            sell_hi = body_only_max_pct(config.sell_hammer_ratios)
+            sell_shape = (
+                f"red candle, body ≤ {sell_hi:g}% "
+                f"(rest is wick; upper/lower ignored)"
+            )
+        parts.append(f"SELL: {sell_shape} + {sell_ctx}")
+    note = " | ".join(parts) if parts else "Both BUY and SELL setups disabled"
+    if (config.enable_buy and not config.buy_require_wick) or (
+        config.enable_sell and not config.sell_require_wick
+    ):
+        note += " | SL still at candle low (BUY) / high (SELL) — long wicks still set stop distance"
+    return note
 
 
 def describe_hammer_context_entry_exit(config: HammerContextConfig) -> str:
@@ -190,11 +254,20 @@ def detect_buy_setup(
     if signal_index < lookback:
         return f"Need {lookback} candles before signal bar"
     signal = candles[signal_index]
-    hr = logic.check_hammer(signal, config.to_buy_shape_config())
-    if hr.direction != logic.TradeDirection.BUY:
-        return "Not a classic green hammer"
-    if hr.hammer_variant != logic.HammerVariant.CLASSIC:
-        return "Not classic hammer shape"
+    if not config.buy_require_wick:
+        if not signal.is_green:
+            return "Not a green candle"
+        ok_body, msg = body_only_ok(
+            signal, config.buy_hammer_ratios, config.min_range,
+        )
+        if not ok_body:
+            return msg
+    else:
+        hr = logic.check_hammer(signal, config.to_buy_shape_config())
+        if hr.direction != logic.TradeDirection.BUY:
+            return "Not a classic green hammer"
+        if hr.hammer_variant != logic.HammerVariant.CLASSIC:
+            return "Not classic hammer shape"
     ok, msg = prior_closes_ok_for_buy(candles, signal_index, lookback)
     if not ok:
         return msg
@@ -212,11 +285,20 @@ def detect_sell_setup(
     if signal_index < lookback:
         return f"Need {lookback} candles before signal bar"
     signal = candles[signal_index]
-    hr = logic.check_hammer(signal, config.to_sell_shape_config())
-    if hr.direction != logic.TradeDirection.SELL:
-        return "Not an inverted red hammer"
-    if hr.hammer_variant != logic.HammerVariant.INVERTED:
-        return "Not inverted hammer shape"
+    if not config.sell_require_wick:
+        if not signal.is_red:
+            return "Not a red candle"
+        ok_body, msg = body_only_ok(
+            signal, config.sell_hammer_ratios, config.min_range,
+        )
+        if not ok_body:
+            return msg
+    else:
+        hr = logic.check_hammer(signal, config.to_sell_shape_config())
+        if hr.direction != logic.TradeDirection.SELL:
+            return "Not an inverted red hammer"
+        if hr.hammer_variant != logic.HammerVariant.INVERTED:
+            return "Not inverted hammer shape"
     ok, msg = prior_closes_ok_for_sell(candles, signal_index, lookback)
     if not ok:
         return msg
@@ -239,6 +321,8 @@ def build_context_signal(
     is_buy = direction == logic.TradeDirection.BUY
     trade_cfg = config.to_buy_trade_config() if is_buy else config.to_sell_trade_config()
     variant = logic.HammerVariant.CLASSIC if is_buy else logic.HammerVariant.INVERTED
+    wick_required = config.buy_require_wick if is_buy else config.sell_require_wick
+    stored_variant = variant.value if wick_required else "BODY_ONLY"
 
     entry_price = logic.calculate_entry_price(
         signal_candle, next_candle, trade_cfg, variant,
@@ -281,7 +365,7 @@ def build_context_signal(
         timeframe=timeframe,
         ignored=ignored,
         ignore_reason=ignore_reason,
-        pattern_variant=variant.value,
+        pattern_variant=stored_variant,
     )
 
 
