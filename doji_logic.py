@@ -138,6 +138,8 @@ class DojiStrategyConfig:
     entry_rule: logic.EntryRule = logic.EntryRule.NEXT_CANDLE_OPEN
     entry_offset: float = 0.0
 
+    sl_mode: logic.StopLossMode = logic.StopLossMode.CANDLE_EXTREME
+    sl_fixed_distance: float = 5.0
     buffer_mode: logic.BufferMode = logic.BufferMode.PERCENT_OF_RANGE
     sl_buffer_pct: float = 5.0
     sl_buffer_flat: float = 0.0
@@ -160,6 +162,16 @@ def describe_doji_detection(config: DojiStrategyConfig) -> str:
     if isinstance(mode, DojiDirectionMode):
         mode = mode.value
     return f"Doji style {style} · direction mode {mode}"
+
+
+def describe_doji_entry_exit(config: DojiStrategyConfig) -> str:
+    rule = logic.coerce_entry_rule(config.entry_rule)
+    sl_mode = logic.coerce_stop_loss_mode(getattr(config, "sl_mode", logic.StopLossMode.CANDLE_EXTREME))
+    if sl_mode == logic.StopLossMode.FIXED_FROM_ENTRY:
+        sl_txt = f"fixed ${float(config.sl_fixed_distance or 0):g} from entry"
+    else:
+        sl_txt = f"{config.buffer_mode.value} {config.sl_buffer_pct:g}%"
+    return f"entry={rule.value} offset=${config.entry_offset:g} SL={sl_txt}"
 
 
 def preview_candle_is_green(trade_side: logic.TradeDirection, config: DojiStrategyConfig) -> bool:
@@ -384,7 +396,16 @@ def calculate_stop_loss(
     signal_candle: logic.Candle,
     direction: logic.TradeDirection,
     config: DojiStrategyConfig,
+    entry_price: Optional[float] = None,
 ) -> float:
+    sl_mode = logic.coerce_stop_loss_mode(getattr(config, "sl_mode", logic.StopLossMode.CANDLE_EXTREME))
+    if sl_mode == logic.StopLossMode.FIXED_FROM_ENTRY:
+        base = entry_price if entry_price is not None else signal_candle.close
+        dist = max(0.0, float(getattr(config, "sl_fixed_distance", 0.0) or 0.0))
+        if direction == logic.TradeDirection.BUY:
+            return base - dist
+        return base + dist
+
     anchor = signal_candle.low if direction == logic.TradeDirection.BUY else signal_candle.high
 
     if config.buffer_mode == logic.BufferMode.PERCENT_OF_RANGE:
@@ -429,7 +450,7 @@ def build_trade_signal(
     signal_candle = doji_result.candle
 
     entry_price = calculate_entry_price(signal_candle, next_candle, config)
-    stop_loss = calculate_stop_loss(signal_candle, direction, config)
+    stop_loss = calculate_stop_loss(signal_candle, direction, config, entry_price=entry_price)
 
     if direction == logic.TradeDirection.BUY:
         risk = entry_price - stop_loss

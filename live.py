@@ -57,8 +57,7 @@ def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_typ
 
     if pattern_type == "doji":
         parts.append(doji_logic.describe_doji_detection(strategy_config))
-        parts.append(f"entry={entry_rule} offset=${entry_off}")
-        parts.append(f"SL buffer={buf_mode} ({sl_pct}%)" if sl_pct is not None else f"SL buffer={buf_mode}")
+        parts.append(doji_logic.describe_doji_entry_exit(strategy_config))
     elif pattern_type in ("hammer_with_candles", "hammer_context"):
         parts.append(hammer_context_logic.describe_hammer_context_rules(strategy_config))
         parts.append(hammer_context_logic.describe_hammer_context_entry_exit(strategy_config))

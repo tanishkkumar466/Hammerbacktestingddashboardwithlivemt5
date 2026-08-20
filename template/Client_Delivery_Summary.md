@@ -3,8 +3,8 @@
 > **Share with client:** Edit and send **`Client_Delivery_Summary.txt`** (plain text — opens in Word, Google Docs, email). This `.md` file is the same content in Markdown for repo viewing.
 
 **Project:** Hammer / Doji Candle Backtest Dashboard (XAUUSD) + Live Trading (MT5)  
-**Version:** 1.1 (enhanced build — backtest + live module)  
-**Document date:** 26 July 2026  
+**Version:** 1.2 (session analytics, fixed SL, expanded run history)  
+**Document date:** 20 August 2026  
 
 **Prepared for:** _______________________________  
 
@@ -55,7 +55,7 @@ Saving a “preset” is **optional** (Run Settings). Live orders use **Safety l
 
 ### 2.3 Timeframes & run configuration
 
-- **Single Timeframes tab:** Per-timeframe **Include in run**, **RR multiple**, **Max SL ($)** in one table.
+- **Combined Timeframes tab:** Per-timeframe **Include in run**, **RR multiple**, **Max SL ($)**, **signal risk filters**, and **trading session checkboxes** (Asian / London / US).
 - **Run Settings tab:** Symbol, data folder, date range, position sizing, overlap, commission, slippage, etc.
 - **Optional saved parameter sets:** Save/load/delete JSON in `presets/` — **not required** to run a backtest or to start live (but recommended to document a approved setup).
 
@@ -69,11 +69,13 @@ Saving a “preset” is **optional** (Run Settings). Live orders use **Safety l
 ### 2.5 Results & reporting
 
 - **Dock:** **Results** panel (F8) — separate from Live Trading.
-- **Metrics:** Overall, By Timeframe, By Direction — **color key:** green = BUY, red = SELL, blue = candle-bias exit model.
+- **Metrics:** Overall, By Timeframe, By Direction, **By Session**, **By Year**, **By Month** — **color key:** green = BUY, red = SELL, blue = candle-bias exit model.
+- **Session analytics:** Trades grouped into **Asian / London / US** using **IC Markets MT5 server time** (GMT+2 winter / GMT+3 US daylight saving — same as CSV data). Filter which sessions to include on the **Timeframes** tab.
+- **Fixed stop loss:** Optional **fixed distance from entry** (not only candle low/high) on Entry/Exit tab — Hammer, Hammer with candles, and Doji.
 - **Trades tab:** Trade list from last run (UI row cap; full `trade_ledger.csv` on disk).
 - **Charts tab:** Thumbnails with click-to-zoom.
-- **History tab:** SQLite `run_history.db`; double-click to open run folder; **Export to Excel**.
-- **Compare tab:** Two Strategy IDs side-by-side (PnL, win rate, drawdown, etc. by exit model).
+- **History tab:** SQLite `run_history.db` with **expanded metrics** and **Backtest_Metrics_Breakdown** (session, timeframe, direction, year, month); double-click to open run folder; **Export to Excel**.
+- **Compare tab:** Two Strategy IDs side-by-side — **overall by exit model** plus **by session (worst case)** for Asian / London / US.
 - **Toolbar:** Open output folder · Open ledger · Export last run metrics · Open charts folder.
 
 ### 2.6 Live trading (MT5)
@@ -270,6 +272,16 @@ Saving a “preset” is **optional** (Run Settings). Live orders use **Safety l
 18. **Live panel UX** — structured scroll layout (strategy / MT5 / execution / safety / log).  
 19. **Layout tools** — F2 reset, tabbed docking; macOS crash mitigation (no float windows).  
 20. **Client document** — this template updated for live scope and platform notes.
+
+### Analytics & research (v1.2)
+
+21. **Trading sessions** — Asian / London / US breakdown in Results, charts, CSV, and run history (IC Markets server clock).  
+22. **Session backtest filter** — Include/exclude sessions on Timeframes tab before running.  
+23. **Fixed stop loss from entry** — `FIXED_FROM_ENTRY` mode alongside candle-extreme SL.  
+24. **Metrics tabs** — By Year and By Month added to Results UI.  
+25. **Compare by session** — History compare shows worst-case session rows for Run A vs Run B.  
+26. **Run history DB** — Full metrics on `Backtest_Results` + granular `Backtest_Metrics_Breakdown` table.  
+27. **Hammer with candles** — Context pattern (lookback, separate BUY/SELL wick rules) fully integrated in UI and backtest.
 
 ---------------------------------------
 

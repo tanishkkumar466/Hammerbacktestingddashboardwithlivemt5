@@ -196,6 +196,12 @@ class BufferMode(Enum):
     NONE = "NONE"                           # no buffer at all, SL = exact wick tip
 
 
+class StopLossMode(Enum):
+    """Where stop-loss is anchored."""
+    CANDLE_EXTREME = "CANDLE_EXTREME"       # SL at signal candle low (BUY) / high (SELL) + buffer
+    FIXED_FROM_ENTRY = "FIXED_FROM_ENTRY"   # SL = entry price +/- fixed distance (price units)
+
+
 # ============================================================================
 # SECTION 2: MASTER CONFIG -- EVERY EDITABLE PARAMETER LIVES HERE
 # ============================================================================
@@ -398,13 +404,21 @@ def describe_hammer_entry_exit(config: "StrategyConfig") -> str:
     i_off = float(getattr(config, "inverted_entry_offset", 0.0) or 0.0)
     c_buf = coerce_buffer_mode(getattr(config, "buffer_mode", BufferMode.PERCENT_OF_RANGE))
     i_buf = coerce_buffer_mode(getattr(config, "inverted_buffer_mode", c_buf))
+    c_sl = coerce_stop_loss_mode(getattr(config, "sl_mode", StopLossMode.CANDLE_EXTREME))
+    i_sl = coerce_stop_loss_mode(getattr(config, "inverted_sl_mode", c_sl))
+    c_sl_txt = (
+        f"fixed ${float(getattr(config, 'sl_fixed_distance', 0) or 0):g} from entry"
+        if c_sl == StopLossMode.FIXED_FROM_ENTRY
+        else f"{c_buf.value} {float(getattr(config, 'sl_buffer_pct', 0) or 0):g}%/${float(getattr(config, 'sl_buffer_flat', 0) or 0):g}"
+    )
+    i_sl_txt = (
+        f"fixed ${float(getattr(config, 'inverted_sl_fixed_distance', 0) or 0):g} from entry"
+        if i_sl == StopLossMode.FIXED_FROM_ENTRY
+        else f"{i_buf.value} {float(getattr(config, 'inverted_sl_buffer_pct', 0) or 0):g}%/${float(getattr(config, 'inverted_sl_buffer_flat', 0) or 0):g}"
+    )
     return (
-        f"Classic entry={c_rule.value} offset=${c_off:g} SL={c_buf.value} "
-        f"{float(getattr(config, 'sl_buffer_pct', 0) or 0):g}%/"
-        f"${float(getattr(config, 'sl_buffer_flat', 0) or 0):g} | "
-        f"Inverted entry={i_rule.value} offset=${i_off:g} SL={i_buf.value} "
-        f"{float(getattr(config, 'inverted_sl_buffer_pct', 0) or 0):g}%/"
-        f"${float(getattr(config, 'inverted_sl_buffer_flat', 0) or 0):g}"
+        f"Classic entry={c_rule.value} offset=${c_off:g} SL={c_sl_txt} | "
+        f"Inverted entry={i_rule.value} offset=${i_off:g} SL={i_sl_txt}"
     )
 
 
@@ -500,6 +514,8 @@ class StrategyConfig:
         sync_legacy_direction_flags(self)
         self.entry_rule = coerce_entry_rule(self.entry_rule)
         self.inverted_entry_rule = coerce_entry_rule(self.inverted_entry_rule)
+        self.sl_mode = coerce_stop_loss_mode(self.sl_mode)
+        self.inverted_sl_mode = coerce_stop_loss_mode(self.inverted_sl_mode)
         self.buffer_mode = coerce_buffer_mode(self.buffer_mode)
         self.inverted_buffer_mode = coerce_buffer_mode(self.inverted_buffer_mode)
 
@@ -511,9 +527,13 @@ class StrategyConfig:
     inverted_entry_offset: float = 0.0
 
     # ---- stop loss / buffer (per hammer type) ----
+    sl_mode: StopLossMode = StopLossMode.CANDLE_EXTREME
+    sl_fixed_distance: float = 5.0
     buffer_mode: BufferMode = BufferMode.PERCENT_OF_RANGE
     sl_buffer_pct: float = 5.0
     sl_buffer_flat: float = 0.0
+    inverted_sl_mode: StopLossMode = StopLossMode.CANDLE_EXTREME
+    inverted_sl_fixed_distance: float = 5.0
     inverted_buffer_mode: BufferMode = BufferMode.PERCENT_OF_RANGE
     inverted_sl_buffer_pct: float = 5.0
     inverted_sl_buffer_flat: float = 0.0
@@ -911,6 +931,15 @@ def coerce_buffer_mode(value, default: BufferMode = BufferMode.PERCENT_OF_RANGE)
         return default
 
 
+def coerce_stop_loss_mode(value, default: StopLossMode = StopLossMode.CANDLE_EXTREME) -> StopLossMode:
+    if isinstance(value, StopLossMode):
+        return value
+    try:
+        return StopLossMode(str(value))
+    except ValueError:
+        return default
+
+
 def _is_inverted_variant(variant) -> bool:
     if variant == HammerVariant.INVERTED:
         return True
@@ -958,19 +987,33 @@ def calculate_stop_loss(
     direction: TradeDirection,
     config: StrategyConfig,
     variant=None,
+    entry_price: Optional[float] = None,
 ) -> float:
     """
-    STEP 4: SL = hammer LOW (BUY) / HIGH (SELL), plus the buffer for that hammer type.
+    STEP 4: SL = hammer LOW (BUY) / HIGH (SELL) + buffer, or fixed distance from entry.
     """
     inverted = _is_inverted_variant(variant)
     if inverted:
+        sl_mode = coerce_stop_loss_mode(
+            getattr(config, "inverted_sl_mode", StopLossMode.CANDLE_EXTREME),
+        )
+        fixed_dist = float(getattr(config, "inverted_sl_fixed_distance", 0.0) or 0.0)
         buffer_mode = coerce_buffer_mode(getattr(config, "inverted_buffer_mode", config.buffer_mode))
         sl_pct = float(getattr(config, "inverted_sl_buffer_pct", config.sl_buffer_pct) or 0.0)
         sl_flat = float(getattr(config, "inverted_sl_buffer_flat", config.sl_buffer_flat) or 0.0)
     else:
+        sl_mode = coerce_stop_loss_mode(getattr(config, "sl_mode", StopLossMode.CANDLE_EXTREME))
+        fixed_dist = float(getattr(config, "sl_fixed_distance", 0.0) or 0.0)
         buffer_mode = coerce_buffer_mode(config.buffer_mode)
         sl_pct = float(config.sl_buffer_pct or 0.0)
         sl_flat = float(config.sl_buffer_flat or 0.0)
+
+    if sl_mode == StopLossMode.FIXED_FROM_ENTRY:
+        base = entry_price if entry_price is not None else hammer_candle.close
+        dist = max(0.0, fixed_dist)
+        if direction == TradeDirection.BUY:
+            return base - dist
+        return base + dist
 
     anchor = hammer_candle.low if direction == TradeDirection.BUY else hammer_candle.high
 
@@ -1086,7 +1129,9 @@ def build_trade_signal(
     direction = hammer_result.direction
 
     entry_price = calculate_entry_price(hammer_candle, next_candle, config, variant)
-    stop_loss = calculate_stop_loss(hammer_candle, direction, config, variant)
+    stop_loss = calculate_stop_loss(
+        hammer_candle, direction, config, variant, entry_price=entry_price,
+    )
 
     if direction == TradeDirection.BUY:
         risk = entry_price - stop_loss

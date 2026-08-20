@@ -29,7 +29,7 @@ The old Tkinter version stacked parameter sections top-to-bottom in one
 tall scrolling column (Candle Body, then Candle Wicks, then Direction
 Rules, etc. -- all vertical). This version uses a QTabWidget with
 HORIZONTAL TABS across the top of the parameter panel -- Body / Wicks /
-Direction / Entry & Stop Loss / Risk / Timeframes / Run Settings each
+Direction / Entry & Stop Loss / Timeframes / Run Settings each
 get their own tab, selected left-to-right, instead of one long scroll.
 The candle preview + tolerance preview keep their own dedicated panel
 (center of the window), same idea as before, always visible regardless
@@ -84,6 +84,7 @@ import doji_logic
 import hammer_context_logic
 import backtest
 import plotting
+import sessions
 from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperTrendConfig, VWAPConfig
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
@@ -208,6 +209,88 @@ def _rows_from_metrics_table(df):
     return []
 
 
+def _migrate_table_columns(conn, table: str, column_defs: dict) -> None:
+    """Add missing columns on existing SQLite databases (safe re-run)."""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for col, sql_type in column_defs.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {sql_type}")
+
+
+def _metrics_verdict(profit_factor, net_pnl) -> str:
+    if profit_factor is not None and net_pnl is not None:
+        return "Promising" if (profit_factor > 1.2 and net_pnl > 0) else "Rejected"
+    return "Not yet tested"
+
+
+def _metrics_from_row(row_dict: dict) -> dict:
+    """Map backtest summary row (snake_case) to DB column names."""
+    if not row_dict:
+        return {}
+    wins = row_dict.get("wins")
+    losses = row_dict.get("losses")
+    total_trades = row_dict.get("total_trades")
+    if total_trades is None and (wins is not None or losses is not None):
+        total_trades = (wins or 0) + (losses or 0)
+    net_pnl = row_dict.get("net_pnl")
+    max_dd_usd = row_dict.get("max_drawdown_usd")
+    profit_factor = row_dict.get("profit_factor")
+    recovery_factor = (net_pnl / max_dd_usd) if (net_pnl is not None and max_dd_usd) else None
+    return {
+        "TotalSignals": row_dict.get("total_signals"),
+        "TotalTrades": total_trades,
+        "SkippedOverlap": row_dict.get("skipped_overlap"),
+        "StillOpen": row_dict.get("still_open"),
+        "Wins": wins,
+        "Losses": losses,
+        "WinRatePercent": row_dict.get("win_rate_pct"),
+        "GrossProfit": row_dict.get("gross_profit"),
+        "GrossLoss": row_dict.get("gross_loss"),
+        "NetProfit": net_pnl,
+        "AvgWin": row_dict.get("avg_win_usd"),
+        "AvgLoss": row_dict.get("avg_loss_usd"),
+        "AvgTradeUsd": row_dict.get("avg_trade_usd"),
+        "LargestWinUsd": row_dict.get("largest_win_usd"),
+        "LargestLossUsd": row_dict.get("largest_loss_usd"),
+        "ProfitFactor": profit_factor,
+        "ExpectedPayoff": row_dict.get("expectancy_usd"),
+        "PayoffRatio": row_dict.get("payoff_ratio"),
+        "AvgRRAchieved": row_dict.get("avg_rr_achieved"),
+        "AvgBarsHeldWin": row_dict.get("avg_bars_held_win"),
+        "AvgBarsHeldLoss": row_dict.get("avg_bars_held_loss"),
+        "MaxDrawdownUsd": max_dd_usd,
+        "MaxDrawdownPercent": row_dict.get("max_drawdown_pct"),
+        "MaxConsecutiveWins": row_dict.get("max_consecutive_wins"),
+        "MaxConsecutiveLosses": row_dict.get("max_consecutive_losses"),
+        "SharpeRatio": row_dict.get("sharpe_ratio"),
+        "SortinoRatio": row_dict.get("sortino_ratio"),
+        "StartingCapital": row_dict.get("starting_capital"),
+        "EndingCapital": row_dict.get("ending_capital"),
+        "TotalReturnPct": row_dict.get("total_return_pct"),
+        "RecoveryFactor": recovery_factor,
+        "Verdict": _metrics_verdict(profit_factor, net_pnl),
+    }
+
+
+BACKTEST_RESULT_METRIC_COLUMNS = [
+    "TotalSignals", "TotalTrades", "SkippedOverlap", "StillOpen", "Wins", "Losses",
+    "WinRatePercent", "GrossProfit", "GrossLoss", "NetProfit", "AvgWin", "AvgLoss",
+    "AvgTradeUsd", "LargestWinUsd", "LargestLossUsd", "ProfitFactor", "ExpectedPayoff",
+    "PayoffRatio", "AvgRRAchieved", "AvgBarsHeldWin", "AvgBarsHeldLoss",
+    "MaxDrawdownUsd", "MaxDrawdownPercent", "MaxConsecutiveWins", "MaxConsecutiveLosses",
+    "SharpeRatio", "SortinoRatio", "StartingCapital", "EndingCapital", "TotalReturnPct",
+    "RecoveryFactor", "Verdict",
+]
+
+METRICS_BREAKDOWN_SOURCES = (
+    ("by_session", "session"),
+    ("by_timeframe", "timeframe"),
+    ("by_direction", "direction"),
+    ("by_year", "year"),
+    ("by_month", "month"),
+)
+
+
 class RunDatabase:
     """
     Mirrors the client's Strategy Configurator workbook schema exactly:
@@ -220,14 +303,12 @@ class RunDatabase:
     Three things are appended AFTER the original columns, because the
     original schema has no column at all for them and literally cannot
     represent this app's data without them:
-      - Strategies_Master: ParamHash (dedup key) + the actual Hammer
-        shape parameters (BodyPct, DominantWickPct, etc.) -- without
-        these, two different Hammer configurations would be
-        indistinguishable in the master table.
-      - Backtest_Results: ExitModel -- this engine produces three
-        result variants per run (Best Case / Candle Bias / Worst Case),
-        which the original single-result-per-strategy schema has no
-        way to tell apart.
+      - Strategies_Master: ParamHash (dedup key) + Hammer shape parameters
+        + PatternType, SlMode, lookback, overlap, date range, etc.
+      - Backtest_Results: ExitModel + full metrics (gross PnL, streaks,
+        Sharpe/Sortino, return %, skipped overlap, …).
+      - Backtest_Metrics_Breakdown: per-session / timeframe / direction /
+        year / month rows (same metrics, for deeper analysis).
     Nothing in the original column set is renamed, reordered, or removed.
     """
 
@@ -347,7 +428,72 @@ class RunDatabase:
                 CREATE INDEX IF NOT EXISTS idx_param_hash ON Strategies_Master(ParamHash);
                 CREATE INDEX IF NOT EXISTS idx_tester_strategy ON Tester_Config(StrategyID);
                 CREATE INDEX IF NOT EXISTS idx_results_strategy ON Backtest_Results(StrategyID);
+
+                CREATE TABLE IF NOT EXISTS Backtest_Metrics_Breakdown (
+                    BreakdownID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    StrategyID INTEGER NOT NULL REFERENCES Strategies_Master(StrategyID),
+                    TestDate TEXT NOT NULL,
+                    ExitModel TEXT NOT NULL,
+                    BreakdownType TEXT NOT NULL,
+                    GroupName TEXT NOT NULL,
+                    TotalSignals REAL,
+                    TotalTrades REAL,
+                    SkippedOverlap REAL,
+                    StillOpen REAL,
+                    Wins REAL,
+                    Losses REAL,
+                    WinRatePercent REAL,
+                    GrossProfit REAL,
+                    GrossLoss REAL,
+                    NetProfit REAL,
+                    AvgWin REAL,
+                    AvgLoss REAL,
+                    AvgTradeUsd REAL,
+                    LargestWinUsd REAL,
+                    LargestLossUsd REAL,
+                    ProfitFactor REAL,
+                    ExpectedPayoff REAL,
+                    PayoffRatio REAL,
+                    AvgRRAchieved REAL,
+                    AvgBarsHeldWin REAL,
+                    AvgBarsHeldLoss REAL,
+                    MaxDrawdownUsd REAL,
+                    MaxDrawdownPercent REAL,
+                    MaxConsecutiveWins REAL,
+                    MaxConsecutiveLosses REAL,
+                    SharpeRatio REAL,
+                    SortinoRatio REAL,
+                    StartingCapital REAL,
+                    EndingCapital REAL,
+                    TotalReturnPct REAL,
+                    RecoveryFactor REAL,
+                    Verdict TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_breakdown_strategy
+                    ON Backtest_Metrics_Breakdown(StrategyID);
+                CREATE INDEX IF NOT EXISTS idx_breakdown_type
+                    ON Backtest_Metrics_Breakdown(StrategyID, BreakdownType, ExitModel);
             """)
+            _migrate_table_columns(conn, "Strategies_Master", {
+                "PatternType": "TEXT",
+                "SlMode": "TEXT",
+                "SlFixedDistance": "REAL",
+                "LookbackCandles": "REAL",
+                "AllowOverlappingTrades": "TEXT",
+                "FixedRiskUsd": "REAL",
+                "DateRangeStart": "TEXT",
+                "DateRangeEnd": "TEXT",
+            })
+            _migrate_table_columns(conn, "Backtest_Results", {
+                col: "REAL" if col not in ("Verdict",) else "TEXT"
+                for col in BACKTEST_RESULT_METRIC_COLUMNS
+                if col not in (
+                    "NetProfit", "ProfitFactor", "ExpectedPayoff", "MaxDrawdownPercent",
+                    "WinRatePercent", "TotalTrades", "AvgWin", "AvgLoss", "SharpeRatio",
+                    "RecoveryFactor", "Verdict",
+                )
+            })
             self._seed_lookup_lists(conn)
 
     def _seed_lookup_lists(self, conn):
@@ -461,6 +607,15 @@ class RunDatabase:
             dominant_wick_tol = hammer.get("dominant_wick_tol")
             small_wick_tol = hammer.get("small_wick_tol")
 
+        sl_mode = strategy.get("sl_mode") or strategy.get("inverted_sl_mode")
+        sl_fixed = strategy.get("sl_fixed_distance") or strategy.get("inverted_sl_fixed_distance")
+        lookback = strategy.get("lookback_candles")
+        allow_overlap = "Yes" if config_dict.get("allow_overlapping_trades") else "No"
+        fixed_risk = config_dict.get("fixed_risk_usd")
+        date_start = str(config_dict.get("start_date") or "")
+        date_end = str(config_dict.get("end_date") or "")
+        stop_loss_mode_col = sl_mode or strategy.get("buffer_mode")
+
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute("SELECT StrategyID FROM Strategies_Master WHERE ParamHash = ?", (param_hash,))
@@ -488,15 +643,16 @@ class RunDatabase:
                         MaxDailyLossPercent, MagicNumber, MaxSlippagePoints, OrderType, GridStepPoints,
                         GridMaxLevels, Status, Notes, ParamHash, BodyPct, DominantWickPct, SmallWickPct,
                         WickSide, BodyTolerance, DominantWickTolerance, SmallWickTolerance,
-                        TimeframesTested, CreatedAt
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        TimeframesTested, PatternType, SlMode, SlFixedDistance, LookbackCandles,
+                        AllowOverlappingTrades, FixedRiskUsd, DateRangeStart, DateRangeEnd, CreatedAt
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         f"{pattern_label}_{symbol}_{primary_tf}", "Candlestick Pattern", symbol, primary_tf,
                         None, None, None, None, None, entry_signal,
                         None, None, None,
                         strategy.get("entry_rule"), None,
                         trade_direction,
-                        strategy.get("buffer_mode"), stop_loss_value, "Risk-Reward", None,
+                        stop_loss_mode_col, stop_loss_value, "Risk-Reward", None,
                         primary_tf_settings.get("rr_multiple"),
                         "No", None, None, None,
                         config_dict.get("position_sizing_mode"), config_dict.get("risk_pct_of_equity"),
@@ -507,7 +663,8 @@ class RunDatabase:
                         body_pct, dominant_wick_pct, small_wick_pct,
                         wick_side, body_tol,
                         dominant_wick_tol, small_wick_tol,
-                        ",".join(timeframes), now,
+                        ",".join(timeframes), pattern_type, sl_mode, sl_fixed, lookback,
+                        allow_overlap, fixed_risk, date_start, date_end, now,
                     ),
                 )
                 strategy_id = cur.lastrowid
@@ -532,50 +689,74 @@ class RunDatabase:
             # produces Best Case / Candle Bias / Worst Case together.
             overall_rows = _rows_from_metrics_table((tables or {}).get("overall"))
             for row_dict in overall_rows:
-                exit_model = row_dict.get("exit_model", "")
-                net_pnl = row_dict.get("net_pnl")
-                max_dd_usd = row_dict.get("max_drawdown_usd")
-                profit_factor = row_dict.get("profit_factor")
-                recovery_factor = (net_pnl / max_dd_usd) if (net_pnl is not None and max_dd_usd) else None
-                if profit_factor is not None and net_pnl is not None:
-                    verdict = "Promising" if (profit_factor > 1.2 and net_pnl > 0) else "Rejected"
-                else:
-                    verdict = "Not yet tested"
-
-                wins = row_dict.get("wins")
-                losses = row_dict.get("losses")
-                total_trades = (wins or 0) + (losses or 0) if (wins is not None or losses is not None) else None
-
-                cur.execute(
-                    """INSERT INTO Backtest_Results (
-                        StrategyID, TestDate, NetProfit, ProfitFactor, ExpectedPayoff,
-                        MaxDrawdownPercent, WinRatePercent, TotalTrades, AvgWin, AvgLoss,
-                        SharpeRatio, RecoveryFactor, Verdict, ExitModel, OutputDir, PlotsDir
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        strategy_id, now, net_pnl, profit_factor,
-                        row_dict.get("expectancy_usd"), row_dict.get("max_drawdown_pct"),
-                        row_dict.get("win_rate_pct"), total_trades, row_dict.get("avg_win_usd"),
-                        row_dict.get("avg_loss_usd"), row_dict.get("sharpe_ratio"),
-                        recovery_factor, verdict, exit_model, output_dir, plots_dir,
-                    ),
+                self._insert_backtest_result(
+                    cur, strategy_id, now, row_dict.get("exit_model", ""),
+                    output_dir, plots_dir, row_dict,
                 )
+
+            self._insert_metrics_breakdown(cur, strategy_id, now, tables)
 
             conn.commit()
             return strategy_id, False, None
+
+    def _insert_backtest_result(self, cur, strategy_id, test_date, exit_model,
+                                output_dir, plots_dir, row_dict):
+        metrics = _metrics_from_row(row_dict)
+        cols = ["StrategyID", "TestDate", "ExitModel", "OutputDir", "PlotsDir"] + BACKTEST_RESULT_METRIC_COLUMNS
+        values = [strategy_id, test_date, exit_model, output_dir, plots_dir]
+        values += [metrics.get(c) for c in BACKTEST_RESULT_METRIC_COLUMNS]
+        cur.execute(
+            f"INSERT INTO Backtest_Results ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+            values,
+        )
+
+    def _insert_metrics_breakdown(self, cur, strategy_id, test_date, tables):
+        for table_key, breakdown_type in METRICS_BREAKDOWN_SOURCES:
+            for row_dict in _rows_from_metrics_table((tables or {}).get(table_key)):
+                metrics = _metrics_from_row(row_dict)
+                cols = (
+                    ["StrategyID", "TestDate", "ExitModel", "BreakdownType", "GroupName"]
+                    + BACKTEST_RESULT_METRIC_COLUMNS
+                )
+                values = [
+                    strategy_id,
+                    test_date,
+                    row_dict.get("exit_model", ""),
+                    breakdown_type,
+                    row_dict.get("group", ""),
+                ]
+                values += [metrics.get(c) for c in BACKTEST_RESULT_METRIC_COLUMNS]
+                cur.execute(
+                    f"INSERT INTO Backtest_Metrics_Breakdown ({','.join(cols)}) "
+                    f"VALUES ({','.join('?' * len(cols))})",
+                    values,
+                )
 
     def fetch_run_history(self):
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.execute("""
-                SELECT Strategies_Master.StrategyID, Strategies_Master.CreatedAt, Strategies_Master.Symbol,
-                       Strategies_Master.TimeframesTested, Strategies_Master.BodyPct,
-                       Strategies_Master.DominantWickPct, Strategies_Master.PositionSizingMethod,
-                       Tester_Config.InitialDeposit,
-                       (SELECT OutputDir FROM Backtest_Results WHERE Backtest_Results.StrategyID = Strategies_Master.StrategyID LIMIT 1) AS OutputDir
-                FROM Strategies_Master
-                LEFT JOIN Tester_Config ON Tester_Config.StrategyID = Strategies_Master.StrategyID
-                ORDER BY Strategies_Master.StrategyID DESC
+                SELECT s.StrategyID, s.CreatedAt, s.PatternType, s.Symbol, s.TimeframesTested,
+                       s.BodyPct, s.DominantWickPct, s.PositionSizingMethod, s.SlMode,
+                       s.LookbackCandles, s.AllowOverlappingTrades, s.FixedRiskUsd,
+                       t.InitialDeposit,
+                       wc.NetProfit AS NetProfitWC,
+                       wc.WinRatePercent AS WinRateWC,
+                       wc.ProfitFactor AS ProfitFactorWC,
+                       wc.TotalTrades AS TotalTradesWC,
+                       wc.MaxDrawdownPercent AS MaxDrawdownWC,
+                       wc.TotalReturnPct AS TotalReturnWC,
+                       (SELECT OutputDir FROM Backtest_Results
+                        WHERE Backtest_Results.StrategyID = s.StrategyID LIMIT 1) AS OutputDir,
+                       (SELECT GroupName FROM Backtest_Metrics_Breakdown b
+                        WHERE b.StrategyID = s.StrategyID AND b.BreakdownType = 'session'
+                              AND b.ExitModel = 'worst_case' AND b.ProfitFactor IS NOT NULL
+                        ORDER BY b.ProfitFactor DESC, b.NetProfit DESC LIMIT 1) AS BestSessionWC
+                FROM Strategies_Master s
+                LEFT JOIN Tester_Config t ON t.StrategyID = s.StrategyID
+                LEFT JOIN Backtest_Results wc ON wc.StrategyID = s.StrategyID
+                    AND wc.ExitModel = 'worst_case'
+                ORDER BY s.StrategyID DESC
             """)
             return [dict(r) for r in cur.fetchall()]
 
@@ -586,12 +767,32 @@ class RunDatabase:
             cur = conn.execute(
                 """
                 SELECT ExitModel, NetProfit, ProfitFactor, WinRatePercent,
-                       MaxDrawdownPercent, TotalTrades, AvgWin, AvgLoss, ExpectedPayoff
+                       MaxDrawdownPercent, TotalTrades, AvgWin, AvgLoss, ExpectedPayoff,
+                       GrossProfit, GrossLoss, SkippedOverlap, StillOpen, TotalSignals,
+                       PayoffRatio, SortinoRatio, SharpeRatio, TotalReturnPct, MaxDrawdownUsd,
+                       RecoveryFactor, Verdict
                 FROM Backtest_Results
                 WHERE StrategyID = ?
                 ORDER BY ExitModel
                 """,
                 (strategy_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def fetch_metrics_breakdown(self, strategy_id: int, breakdown_type: str = "session",
+                                exit_model: str = "worst_case"):
+        """Session / timeframe / direction / year / month rows for one run."""
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """
+                SELECT BreakdownType, GroupName, ExitModel, TotalTrades, WinRatePercent,
+                       NetProfit, ProfitFactor, MaxDrawdownPercent, ExpectedPayoff, Verdict
+                FROM Backtest_Metrics_Breakdown
+                WHERE StrategyID = ? AND BreakdownType = ? AND ExitModel = ?
+                ORDER BY GroupName
+                """,
+                (strategy_id, breakdown_type, exit_model),
             )
             return [dict(r) for r in cur.fetchall()]
 
@@ -603,7 +804,7 @@ class RunDatabase:
             conn.row_factory = sqlite3.Row
             sheets_data = {}
             for table in ("Strategies_Master", "Lookup_Lists", "Tester_Config",
-                          "Optimization_Ranges", "Backtest_Results"):
+                          "Optimization_Ranges", "Backtest_Results", "Backtest_Metrics_Breakdown"):
                 sheets_data[table] = [dict(r) for r in conn.execute(f"SELECT * FROM {table}").fetchall()]
 
         wb = openpyxl.Workbook()
@@ -616,9 +817,10 @@ class RunDatabase:
         readme["A1"].font = Font(bold=True, size=14)
         readme["A3"] = "Schema matches Strategy_Configurator_FINAL.xlsx"
         readme["A4"], readme["B4"] = "Strategies_Master", "One row per unique parameter set actually backtested. Columns not applicable to this engine (MagicNumber, GridStepPoints, indicator periods, etc.) are blank."
-        readme["A5"], readme["B5"] = "Backtest_Results", "One row per (StrategyID, ExitModel) -- this engine reports Best Case / Candle Bias / Worst Case together, so ExitModel was added to tell them apart."
-        readme["A6"], readme["B6"] = "Dedup rule", "Identical parameters (same config, same data) are only ever saved once -- re-running them does not create a duplicate row."
-        readme["A7"], readme["B7"] = "Optimization_Ranges", "Present for schema compatibility; this app doesn't run parameter sweeps, so it's always empty."
+        readme["A5"], readme["B5"] = "Backtest_Results", "One row per (StrategyID, ExitModel) with full metrics (PnL, PF, drawdown, Sharpe, sortino, streaks, etc.)."
+        readme["A6"], readme["B6"] = "Backtest_Metrics_Breakdown", "Granular rows per session, timeframe, direction, year, and month — same metrics as Backtest_Results for deeper analysis."
+        readme["A7"], readme["B7"] = "Dedup rule", "Identical parameters (same config, same data) are only ever saved once -- re-running them does not create a duplicate row."
+        readme["A8"], readme["B8"] = "Optimization_Ranges", "Present for schema compatibility; this app doesn't run parameter sweeps, so it's always empty."
         readme.column_dimensions["A"].width = 20
         readme.column_dimensions["B"].width = 90
 
@@ -682,6 +884,36 @@ FIELD_TYPE_DROPDOWN = "dropdown"
 
 def enum_choices(enum_cls) -> List[str]:
     return [e.value for e in enum_cls]
+
+
+ENTRY_RULE_LABELS_WICK_ON = {
+    "NEXT_CANDLE_OPEN": "Next candle open",
+    "NEXT_CANDLE_CLOSE": "Next candle close",
+    "HAMMER_CLOSE": "Hammer candle close",
+    "HAMMER_HIGH": "Hammer candle high",
+    "HAMMER_LOW": "Hammer candle low",
+}
+
+ENTRY_RULE_LABELS_WICK_OFF = {
+    "NEXT_CANDLE_OPEN": "Next candle open",
+    "NEXT_CANDLE_CLOSE": "Next candle close",
+    "HAMMER_CLOSE": "Signal candle close",
+    "HAMMER_HIGH": "Signal candle high",
+    "HAMMER_LOW": "Signal candle low",
+}
+
+
+def _populate_enum_combo(combo: QComboBox, choices: List[str], default_val: Any) -> None:
+    """Dropdown stores enum value in itemData; label can be changed without breaking reads."""
+    combo.clear()
+    default_str = default_val.value if isinstance(default_val, Enum) else str(default_val)
+    for choice in choices:
+        combo.addItem(str(choice), choice)
+    idx = combo.findData(default_str)
+    if idx >= 0:
+        combo.setCurrentIndex(idx)
+    elif combo.findText(default_str) >= 0:
+        combo.setCurrentText(default_str)
 
 
 def _prefixed_shape_fields(prefix: str, field_defs) -> List[tuple]:
@@ -883,7 +1115,9 @@ HAMMER_ONLY_FIELD_NAMES = {
 CLASSIC_ENTRY_EXIT_FIELDS = [
     ("entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
     ("entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
-    ("buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
+    ("sl_mode", "Stop Loss Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.StopLossMode)),
+    ("sl_fixed_distance", "Fixed SL Distance ($)", FIELD_TYPE_TEXT, None),
+    ("buffer_mode", "Buffer Mode (candle SL)", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
     ("sl_buffer_pct", "SL Buffer %", FIELD_TYPE_TEXT, None),
     ("sl_buffer_flat", "SL Buffer Flat ($)", FIELD_TYPE_TEXT, None),
 ]
@@ -891,7 +1125,9 @@ CLASSIC_ENTRY_EXIT_FIELDS = [
 INVERTED_ENTRY_EXIT_FIELDS = [
     ("inverted_entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
     ("inverted_entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
-    ("inverted_buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
+    ("inverted_sl_mode", "Stop Loss Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.StopLossMode)),
+    ("inverted_sl_fixed_distance", "Fixed SL Distance ($)", FIELD_TYPE_TEXT, None),
+    ("inverted_buffer_mode", "Buffer Mode (candle SL)", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
     ("inverted_sl_buffer_pct", "SL Buffer %", FIELD_TYPE_TEXT, None),
     ("inverted_sl_buffer_flat", "SL Buffer Flat ($)", FIELD_TYPE_TEXT, None),
 ]
@@ -901,7 +1137,9 @@ ENTRY_EXIT_FIELDS = CLASSIC_ENTRY_EXIT_FIELDS + INVERTED_ENTRY_EXIT_FIELDS
 DOJI_ENTRY_EXIT_FIELDS = [
     ("entry_rule", "Entry Rule", FIELD_TYPE_DROPDOWN, enum_choices(logic.EntryRule)),
     ("entry_offset", "Entry Offset ($)", FIELD_TYPE_TEXT, None),
-    ("buffer_mode", "Buffer Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
+    ("sl_mode", "Stop Loss Mode", FIELD_TYPE_DROPDOWN, enum_choices(logic.StopLossMode)),
+    ("sl_fixed_distance", "Fixed SL Distance ($)", FIELD_TYPE_TEXT, None),
+    ("buffer_mode", "Buffer Mode (candle SL)", FIELD_TYPE_DROPDOWN, enum_choices(logic.BufferMode)),
     ("sl_buffer_pct", "SL Buffer %", FIELD_TYPE_TEXT, None),
     ("sl_buffer_flat", "SL Buffer Flat ($)", FIELD_TYPE_TEXT, None),
 ]
@@ -1046,9 +1284,16 @@ FIELD_HELP: Dict[str, str] = {
     "indicators_vwap_enabled": "Compute VWAP and show it in Pattern In Context; optional backtest filter.",
     "entry_rule": "Classic hammer entry: next candle open/close, or this candle’s close / high / low.",
     "entry_offset": "Classic hammer: extra $ added to the classic entry price.",
-    "buffer_mode": "Classic hammer stop-loss buffer type.",
+    "sl_mode": (
+        "Stop anchor: CANDLE_EXTREME = signal candle low (BUY) or high (SELL) plus buffer. "
+        "FIXED_FROM_ENTRY = entry price minus/plus Fixed SL Distance ($)."
+    ),
+    "sl_fixed_distance": "Price distance from entry when Stop Loss Mode is Fixed from entry (e.g. 5.0 on XAUUSD).",
+    "buffer_mode": "Classic hammer: extra SL room type when Stop Loss Mode is Candle extreme.",
     "sl_buffer_pct": "Classic hammer: extra SL room as % (when Buffer Mode is percent-based).",
     "sl_buffer_flat": "Classic hammer: extra SL room as a flat $ (when Buffer Mode is flat).",
+    "inverted_sl_mode": "Inverted / SELL stop anchor — same choices as classic Stop Loss Mode.",
+    "inverted_sl_fixed_distance": "Fixed SL distance ($) for inverted/SELL when using Fixed from entry.",
     "inverted_entry_rule": (
         "Inverted hammer entry — separate from Classic. "
         "Do not reuse Classic HAMMER_HIGH here unless you really want the long-wick tip."
@@ -1119,8 +1364,7 @@ Find hammer/doji setups on historical data, filter with indicators, compare posi
 • <b>Direction</b> — four choices: Classic green, Classic red, Inverted green, Inverted red. Each is BUY, SELL, or NO. Entry is the <i>next</i> bar.<br>
 • <b>Hammer types</b> — a type is on if either of its color rows is Buy or Sell (NO + NO turns that type off).<br>
 • <b>Entry / Exit</b> — Classic and Inverted each have their own entry rule and SL buffer. HAMMER_HIGH is candle high (wrong wick on inverted unless you set Inverted separately).<br>
-• <b>Risk</b> — max $ SL per timeframe (logic); can disable to see all signals in backtest.<br>
-• <b>Timeframes</b> — RR and max SL per TF; checkboxes choose which TFs to include in a backtest run.<br>
+• <b>Timeframes</b> — RR and max SL per TF, risk-limit toggles, and include-in-run checkboxes.<br>
 • <b>Indicators</b> — add SuperTrend/VWAP; “Apply trade filter” must be on to block trades live/backtest.<br><br>
 
 <b>Backtest only</b> (Run Settings tab)<br>
@@ -1548,6 +1792,8 @@ class PatternContextChart(QWidget):
         self.buffer_mode = "PERCENT_OF_RANGE"
         self.sl_buffer_pct = 5.0
         self.sl_buffer_flat = 0.0
+        self.sl_mode = logic.StopLossMode.CANDLE_EXTREME.value
+        self.sl_fixed_distance = 5.0
         self._context_trade_side = None
         self._overlays = []
         self._lead_candles = []
@@ -1565,7 +1811,9 @@ class PatternContextChart(QWidget):
                  entry_offset=0.0,
                  buffer_mode="PERCENT_OF_RANGE",
                  sl_buffer_pct=5.0,
-                 sl_buffer_flat=0.0):
+                 sl_buffer_flat=0.0,
+                 sl_mode=logic.StopLossMode.CANDLE_EXTREME.value,
+                 sl_fixed_distance=5.0):
         self.body_pct = body_pct
         self.dominant_pct = dominant_pct
         self.small_pct = small_pct
@@ -1579,8 +1827,8 @@ class PatternContextChart(QWidget):
         self.preview_price_above_vwap = preview_price_above_vwap
         self.preview_trade_side = preview_trade_side or "BUY"
         try:
-            raw_lb = 5 if context_lookback is None else context_lookback
-            self.context_lookback = max(0, min(24, int(raw_lb)))
+            raw_lb = 0 if context_lookback is None else context_lookback
+            self.context_lookback = max(0, min(60, int(raw_lb)))
         except (TypeError, ValueError):
             self.context_lookback = 5
         self.entry_rule = str(entry_rule or "NEXT_CANDLE_OPEN")
@@ -1597,6 +1845,14 @@ class PatternContextChart(QWidget):
             self.sl_buffer_flat = float(sl_buffer_flat or 0.0)
         except (TypeError, ValueError):
             self.sl_buffer_flat = 0.0
+        raw_sl_mode = sl_mode if sl_mode is not None else logic.StopLossMode.CANDLE_EXTREME.value
+        if isinstance(raw_sl_mode, logic.StopLossMode):
+            raw_sl_mode = raw_sl_mode.value
+        self.sl_mode = str(raw_sl_mode)
+        try:
+            self.sl_fixed_distance = float(sl_fixed_distance or 0.0)
+        except (TypeError, ValueError):
+            self.sl_fixed_distance = 0.0
         self.rr_multiple = rr_multiple
         self.max_sl_usd = max_sl_usd
         self.timeframe_label = timeframe_label
@@ -1891,19 +2147,29 @@ class PatternContextChart(QWidget):
             entry_flag = f"{entry_flag} {self.entry_offset:+.1f}"
 
         buf_mode = (self.buffer_mode or "PERCENT_OF_RANGE").upper()
-        if buf_mode == "NONE":
-            buffer_px = 0.0
-        elif buf_mode == "FLAT_AMOUNT":
-            buffer_px = abs(self.sl_buffer_flat) * px_per_usd
-        elif buf_mode == "PERCENT_OF_PRICE":
-            buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
+        sl_mode = str(getattr(self, "sl_mode", logic.StopLossMode.CANDLE_EXTREME.value))
+        fixed_dist = max(0.0, float(getattr(self, "sl_fixed_distance", 0.0) or 0.0))
+        if sl_mode == logic.StopLossMode.FIXED_FROM_ENTRY.value:
+            buffer_px = fixed_dist * px_per_usd
+            if is_buy:
+                sl_y = entry_y + buffer_px
+            else:
+                sl_y = entry_y - buffer_px
+            risk_label_usd = fixed_dist
         else:
-            buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
-
-        if is_buy:
-            sl_y = candle_low_y + buffer_px
-        else:
-            sl_y = candle_high_y - buffer_px
+            if buf_mode == "NONE":
+                buffer_px = 0.0
+            elif buf_mode == "FLAT_AMOUNT":
+                buffer_px = abs(self.sl_buffer_flat) * px_per_usd
+            elif buf_mode == "PERCENT_OF_PRICE":
+                buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
+            else:
+                buffer_px = candle_range_px * (abs(self.sl_buffer_pct) / 100.0)
+            if is_buy:
+                sl_y = candle_low_y + buffer_px
+            else:
+                sl_y = candle_high_y - buffer_px
+            risk_label_usd = self.max_sl_usd
 
         risk_y_dist = abs(sl_y - entry_y)
         reward_y_dist = risk_y_dist * max(self.rr_multiple, 0.1)
@@ -1961,7 +2227,9 @@ class PatternContextChart(QWidget):
 
         next_x = signal_x + slot_w
         if use_next_bar:
-            next_color = up_color if is_buy else down_color
+            # Entry bar is not part of the pattern. Keep it grey so the
+            # coloured count matches Context N (plus the signal candle).
+            next_color = context_color
             next_wick = QPen(wick_color, 1.6)
             next_wick.setCapStyle(Qt.RoundCap)
             painter.setPen(next_wick)
@@ -2006,7 +2274,7 @@ class PatternContextChart(QWidget):
         draw_flag(entry_y, entry_color, entry_flag)
         draw_flag(sl_y, sl_color, "SL")
 
-        reward_usd = self.max_sl_usd * self.rr_multiple
+        reward_usd = risk_label_usd * self.rr_multiple
         zone_label_font = painter.font()
         zone_label_font.setBold(True)
         zone_label_font.setPointSize(7)
@@ -2014,7 +2282,7 @@ class PatternContextChart(QWidget):
         risk_mid_y = (entry_y + sl_y) / 2
         reward_mid_y = (entry_y + target_y) / 2
         painter.setPen(QPen(sl_color.darker(115)))
-        painter.drawText(int(zone_left + 5), int(risk_mid_y + 3), f"-${self.max_sl_usd:,.0f}")
+        painter.drawText(int(zone_left + 5), int(risk_mid_y + 3), f"-${risk_label_usd:,.0f}")
         painter.setPen(QPen(tp_color.darker(120)))
         painter.drawText(int(zone_left + 5), int(reward_mid_y + 3), f"+${reward_usd:,.0f}")
 
@@ -2381,6 +2649,7 @@ class BacktestDashboard(QMainWindow):
         self.field_labels: Dict[str, QLabel] = {}
         self.timeframe_widgets: Dict[str, Dict[str, QLineEdit]] = {}
         self.timeframe_enabled_widgets: Dict[str, QCheckBox] = {}
+        self.session_enabled_widgets: Dict[str, QCheckBox] = {}
         self.added_indicator_ids: set = set()
         self.indicator_group_boxes: Dict[str, QGroupBox] = {}
         self.indicator_combine_row: Optional[QWidget] = None
@@ -3167,13 +3436,18 @@ class BacktestDashboard(QMainWindow):
                 inner.layout().addWidget(doji_hint)
         tabs.addTab(self._make_indicator_tab(), "Indicators")
         tabs.addTab(self._make_entry_exit_tab(defaults_strategy), "Entry / Exit")
-        tabs.addTab(self._make_field_tab(RISK_CONTROL_FIELDS, defaults_strategy), "Risk")
-        tabs.addTab(self._make_combined_timeframes_tab(), "Timeframes")
+        tabs.addTab(
+            self._make_combined_timeframes_tab(
+                defaults_strategy, defaults_context, defaults_doji_strategy,
+            ),
+            "Timeframes",
+        )
         tabs.addTab(self._make_run_settings_tab(defaults_backtest), "Run Settings")
 
         QTimer.singleShot(0, self._apply_pattern_field_visibility)
         QTimer.singleShot(0, self._wire_symmetric_tolerance_fields)
         QTimer.singleShot(0, self._wire_wick_requirement_fields)
+        QTimer.singleShot(0, self._wire_sl_mode_fields)
         # Scroll wrapper keeps the panel resizable below its natural width
         # (the wide tab bar otherwise locks the dock divider in place).
         scroll = QScrollArea()
@@ -3289,6 +3563,9 @@ class BacktestDashboard(QMainWindow):
                 )
         if is_hammer_with_candles:
             self._refresh_hwc_copy_for_wick_mode()
+        else:
+            for fname in ("entry_rule", "inverted_entry_rule"):
+                self._apply_entry_rule_combo_labels(fname, wick_required=True)
 
         hwc_boxes = (
             getattr(self, "_hwc_body_hint", None),
@@ -3528,6 +3805,28 @@ class BacktestDashboard(QMainWindow):
         chk = self.field_widgets.get(f"{side}_require_wick")
         return True if chk is None else bool(chk.isChecked())
 
+    def _apply_entry_rule_combo_labels(self, field_name: str, wick_required: bool) -> None:
+        """Rename HAMMER_* entry options for body-only (wick off) vs hammer shape (wick on)."""
+        combo = self.field_widgets.get(field_name)
+        if not isinstance(combo, QComboBox):
+            return
+        labels = ENTRY_RULE_LABELS_WICK_ON if wick_required else ENTRY_RULE_LABELS_WICK_OFF
+        current = combo.currentData()
+        if current is None:
+            current = combo.currentText()
+        combo.blockSignals(True)
+        for i in range(combo.count()):
+            val = combo.itemData(i)
+            if val is None:
+                val = combo.itemText(i)
+            combo.setItemText(i, labels.get(str(val), str(val)))
+        idx = combo.findData(current)
+        if idx < 0 and current is not None:
+            idx = combo.findData(str(current))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
     def _refresh_hwc_copy_for_wick_mode(self):
         """Entry/Exit and Body/Wicks titles: 'hammer' only when wick shape is required."""
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else ""
@@ -3552,13 +3851,111 @@ class BacktestDashboard(QMainWindow):
             box = getattr(self, attr, None)
             if box is not None:
                 box.setTitle(title)
+        self._apply_entry_rule_combo_labels("entry_rule", buy_wick)
+        self._apply_entry_rule_combo_labels("inverted_entry_rule", sell_wick)
         if hasattr(self, "_entry_exit_hint"):
-            self._entry_exit_hint.setText(
-                "Wick off does not turn Entry / Exit off. It only changes how the signal candle is found. "
-                "BUY still uses this box: entry (default next candle open) and SL at the signal candle low + buffer. "
-                "SELL still uses the box below: SL at the signal candle high + buffer. "
-                "You do not need to change these unless you want a different entry or stop."
-            )
+            if not buy_wick and not sell_wick:
+                self._entry_exit_hint.setText(
+                    "Wick off does not turn Entry / Exit off. It only changes how the signal candle is found. "
+                    "BUY uses this box (entry default: next candle open; SL at signal candle low + buffer). "
+                    "SELL uses the box below (SL at signal candle high + buffer). "
+                    "Entry Rule options say <i>Signal candle</i> instead of <i>Hammer candle</i> when wick is off."
+                )
+            elif buy_wick and sell_wick:
+                self._entry_exit_hint.setText(
+                    "Classic green hammer (BUY) and inverted red hammer (SELL) each have their own entry and stop. "
+                    "Entry Rule lists <i>Hammer candle</i> close / high / low for entries on the signal bar."
+                )
+            else:
+                wick_bits = []
+                if buy_wick:
+                    wick_bits.append("BUY: hammer shape — Entry Rule shows Hammer candle …")
+                else:
+                    wick_bits.append("BUY: body only — Entry Rule shows Signal candle …")
+                if sell_wick:
+                    wick_bits.append("SELL: hammer shape — Entry Rule shows Hammer candle …")
+                else:
+                    wick_bits.append("SELL: body only — Entry Rule shows Signal candle …")
+                self._entry_exit_hint.setText(" ".join(wick_bits))
+
+    def _wire_sl_mode_fields(self):
+        """Enable buffer fields for candle SL; fixed distance for fixed-from-entry SL."""
+        if getattr(self, "_sl_mode_wired", False):
+            self._refresh_sl_mode_fields("classic")
+            self._refresh_sl_mode_fields("inverted")
+            return
+        self._sl_mode_wired = True
+        for mode_name, side in (("sl_mode", "classic"), ("inverted_sl_mode", "inverted")):
+            combo = self.field_widgets.get(mode_name)
+            if isinstance(combo, QComboBox):
+                self._apply_stop_loss_combo_labels(mode_name)
+                combo.currentTextChanged.connect(
+                    lambda _t, s=side: self._refresh_sl_mode_fields(s)
+                )
+                combo.currentTextChanged.connect(self._redraw_candle_preview)
+        for fname in ("sl_fixed_distance", "inverted_sl_fixed_distance"):
+            w = self.field_widgets.get(fname)
+            if isinstance(w, QLineEdit):
+                w.textChanged.connect(self._redraw_candle_preview)
+        self._refresh_sl_mode_fields("classic")
+        self._refresh_sl_mode_fields("inverted")
+
+    def _apply_stop_loss_combo_labels(self, field_name: str) -> None:
+        labels = {
+            logic.StopLossMode.CANDLE_EXTREME.value: "Signal candle low/high + buffer",
+            logic.StopLossMode.FIXED_FROM_ENTRY.value: "Fixed distance from entry",
+        }
+        combo = self.field_widgets.get(field_name)
+        if not isinstance(combo, QComboBox):
+            return
+        current = combo.currentData()
+        if current is None:
+            current = combo.currentText()
+        combo.blockSignals(True)
+        for i in range(combo.count()):
+            val = combo.itemData(i)
+            if val is None:
+                val = combo.itemText(i)
+            combo.setItemText(i, labels.get(str(val), str(val)))
+        idx = combo.findData(current)
+        if idx < 0 and current is not None:
+            idx = combo.findData(str(current))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _sl_mode_is_fixed(self, widget_name: str) -> bool:
+        combo = self.field_widgets.get(widget_name)
+        if not isinstance(combo, QComboBox):
+            return False
+        raw = combo.currentData()
+        if raw is None:
+            raw = combo.currentText()
+        return str(raw) == logic.StopLossMode.FIXED_FROM_ENTRY.value
+
+    def _refresh_sl_mode_fields(self, side: str):
+        if side == "classic":
+            mode_name = "sl_mode"
+            fixed_name = "sl_fixed_distance"
+            buffer_names = ("buffer_mode", "sl_buffer_pct", "sl_buffer_flat")
+        else:
+            mode_name = "inverted_sl_mode"
+            fixed_name = "inverted_sl_fixed_distance"
+            buffer_names = ("inverted_buffer_mode", "inverted_sl_buffer_pct", "inverted_sl_buffer_flat")
+        fixed_on = self._sl_mode_is_fixed(mode_name)
+        for name in buffer_names:
+            widget = self.field_widgets.get(name)
+            label = self.field_labels.get(name)
+            if widget is not None:
+                widget.setEnabled(not fixed_on)
+            if label is not None:
+                label.setEnabled(not fixed_on)
+        widget = self.field_widgets.get(fixed_name)
+        label = self.field_labels.get(fixed_name)
+        if widget is not None:
+            widget.setEnabled(fixed_on)
+        if label is not None:
+            label.setEnabled(fixed_on)
 
     def _refresh_side_body_fields_for_wick(self, side: str, wick_required: bool):
         """When wick is off, Body % is a max cap; tolerance rows are unused."""
@@ -3661,8 +4058,7 @@ class BacktestDashboard(QMainWindow):
                 grid.addWidget(widget, row, col_base + 1)
             elif ftype == FIELD_TYPE_DROPDOWN:
                 widget = QComboBox()
-                widget.addItems(choices)
-                widget.setCurrentText(str(default_val))
+                _populate_enum_combo(widget, choices, default_val)
                 widget.setToolTip(help_text)
                 if live_preview:
                     widget.currentTextChanged.connect(self._redraw_candle_preview)
@@ -3730,8 +4126,7 @@ class BacktestDashboard(QMainWindow):
                 grid.addWidget(widget, row, col_base + 1)
             elif ftype == FIELD_TYPE_DROPDOWN:
                 widget = QComboBox()
-                widget.addItems(choices)
-                widget.setCurrentText(str(default_val))
+                _populate_enum_combo(widget, choices, default_val)
                 widget.setToolTip(help_text)
                 if live_preview:
                     widget.currentTextChanged.connect(self._redraw_candle_preview)
@@ -3890,8 +4285,13 @@ class BacktestDashboard(QMainWindow):
         out["applies_to"] = "backtest_only — live uses Live panel lot size"
         return out
 
-    def _make_combined_timeframes_tab(self) -> QWidget:
-        """RR / max SL per timeframe plus include-in-run checkboxes in one place."""
+    def _make_combined_timeframes_tab(
+        self,
+        defaults_strategy,
+        defaults_context,
+        defaults_doji_strategy,
+    ) -> QWidget:
+        """RR / max SL per timeframe, risk-limit toggles, and include-in-run checkboxes."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         inner = QWidget()
@@ -3899,11 +4299,52 @@ class BacktestDashboard(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
 
         hint = QLabel(
-            "Check which timeframe folders to include, and set reward:risk and max stop-loss per timeframe."
+            "Set reward:risk and max stop-loss per timeframe, choose which folders to include in a run, "
+            "and use the risk toggles below to skip trades that exceed max SL or have invalid entry/SL."
         )
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
+
+        risk_box = QGroupBox("Signal risk filters")
+        risk_box.setObjectName("fieldGroup")
+        risk_grid = QGridLayout(risk_box)
+        risk_grid.setContentsMargins(12, 10, 12, 10)
+        risk_grid.setHorizontalSpacing(24)
+        risk_grid.setVerticalSpacing(8)
+        self._add_fields_to_grid(
+            risk_grid,
+            RISK_CONTROL_FIELDS,
+            defaults_strategy,
+            defaults_context,
+            defaults_doji_strategy,
+            columns_per_row=2,
+        )
+        layout.addWidget(risk_box)
+
+        session_box = QGroupBox("Trading sessions (backtest filter)")
+        session_box.setObjectName("fieldGroup")
+        session_layout = QVBoxLayout(session_box)
+        session_hint = QLabel(
+            "Include signals by entry-bar time using IC Markets MT5 server clock "
+            "(GMT+2 winter / GMT+3 US daylight saving — same as your CSV data). "
+            "Uncheck a session to skip those entries in the run; Results still breaks down all taken trades by session."
+        )
+        session_hint.setObjectName("sectionHint")
+        session_hint.setWordWrap(True)
+        session_layout.addWidget(session_hint)
+        session_row = QHBoxLayout()
+        session_row.setSpacing(24)
+        for sess_name in sessions.SESSION_ORDER:
+            win = sessions.SESSION_WINDOWS[sessions.SESSION_ORDER.index(sess_name)]
+            cb = QCheckBox(sess_name)
+            cb.setChecked(True)
+            cb.setToolTip(f"{win[1]}–{win[2]} ({sessions.BROKER_TIME_LABEL})")
+            self.session_enabled_widgets[sess_name] = cb
+            session_row.addWidget(cb)
+        session_row.addStretch()
+        session_layout.addLayout(session_row)
+        layout.addWidget(session_box)
 
         table = QTableWidget(len(TIMEFRAME_LABELS), 4)
         table.setHorizontalHeaderLabels(["Include", "Timeframe", "RR Multiple", "Max SL ($)"])
@@ -4214,8 +4655,10 @@ class BacktestDashboard(QMainWindow):
         # not just an isolated candle shape.
         context_hint = QLabel(
             "ENTRY / SL / TP follow Entry / Exit for the preview side. "
-            "Hammer with candles: the signal candle and the prior N bars (Context tab) are in colour. "
-            "Set N to 0 to colour only the signal candle. Other bars stay grey."
+            "Hammer with candles: colour the signal candle and the prior N bars from the Context tab. "
+            "Hammer and Doji colour only the signal (single-candle patterns). "
+            "The next bar is the entry candle — it stays grey. Trail bars after that stay grey. "
+            "Every timeframe tab uses the same N; only noise/RR/max SL change per tab."
         )
         context_hint.setObjectName("sectionHint")
         context_hint.setWordWrap(True)
@@ -4455,6 +4898,7 @@ class BacktestDashboard(QMainWindow):
         self._update_context_charts(
             body_pct, dominant_pct, small_pct, draw_wick, is_green, is_doji=False,
             hammer_variant=variant, preview_trade_side=trade_side,
+            context_lookback=0,
         )
 
     def _doji_preview_is_green(self, lower_wick_pct: float, upper_wick_pct: float) -> bool:
@@ -4583,6 +5027,7 @@ class BacktestDashboard(QMainWindow):
             body_pct, dominant_pct, small_pct, wick_side, is_green,
             is_doji=True, doji_style=doji_style,
             preview_trade_side=trade_side,
+            context_lookback=0,
         )
         mode = self._get_field_str("doji_direction_mode") or "WICK_BIAS"
         try:
@@ -4615,6 +5060,8 @@ class BacktestDashboard(QMainWindow):
                 return {
                     "entry_rule": cfg.inverted_entry_rule,
                     "entry_offset": cfg.inverted_entry_offset,
+                    "sl_mode": cfg.inverted_sl_mode,
+                    "sl_fixed_distance": cfg.inverted_sl_fixed_distance,
                     "buffer_mode": cfg.inverted_buffer_mode,
                     "sl_buffer_pct": cfg.inverted_sl_buffer_pct,
                     "sl_buffer_flat": cfg.inverted_sl_buffer_flat,
@@ -4622,29 +5069,53 @@ class BacktestDashboard(QMainWindow):
             return {
                 "entry_rule": cfg.entry_rule,
                 "entry_offset": cfg.entry_offset,
+                "sl_mode": cfg.sl_mode,
+                "sl_fixed_distance": cfg.sl_fixed_distance,
                 "buffer_mode": cfg.buffer_mode,
                 "sl_buffer_pct": cfg.sl_buffer_pct,
                 "sl_buffer_flat": cfg.sl_buffer_flat,
             }
         use_inverted = (not is_doji) and str(hammer_variant).upper() == "INVERTED"
+        defaults = logic.StrategyConfig()
         if use_inverted:
-            rule = self._get_field_str("inverted_entry_rule") or "NEXT_CANDLE_OPEN"
-            offset = self._get_field_float("inverted_entry_offset")
-            buf = self._get_field_str("inverted_buffer_mode") or "PERCENT_OF_RANGE"
-            pct = self._get_field_float("inverted_sl_buffer_pct")
-            flat = self._get_field_float("inverted_sl_buffer_flat")
+            rule = self._read_ui_field(
+                "inverted_entry_rule", defaults.inverted_entry_rule, FIELD_TYPE_DROPDOWN,
+            )
+            offset = self._read_ui_field(
+                "inverted_entry_offset", defaults.inverted_entry_offset, FIELD_TYPE_TEXT,
+            )
+            sl_mode = self._read_ui_field(
+                "inverted_sl_mode", defaults.inverted_sl_mode, FIELD_TYPE_DROPDOWN,
+            )
+            fixed = self._read_ui_field(
+                "inverted_sl_fixed_distance", defaults.inverted_sl_fixed_distance, FIELD_TYPE_TEXT,
+            )
+            buf = self._read_ui_field(
+                "inverted_buffer_mode", defaults.inverted_buffer_mode, FIELD_TYPE_DROPDOWN,
+            )
+            pct = self._read_ui_field(
+                "inverted_sl_buffer_pct", defaults.inverted_sl_buffer_pct, FIELD_TYPE_TEXT,
+            )
+            flat = self._read_ui_field(
+                "inverted_sl_buffer_flat", defaults.inverted_sl_buffer_flat, FIELD_TYPE_TEXT,
+            )
         else:
-            rule = self._get_field_str("entry_rule") or "NEXT_CANDLE_OPEN"
-            offset = self._get_field_float("entry_offset")
-            buf = self._get_field_str("buffer_mode") or "PERCENT_OF_RANGE"
-            pct = self._get_field_float("sl_buffer_pct")
-            flat = self._get_field_float("sl_buffer_flat")
+            rule = self._read_ui_field("entry_rule", defaults.entry_rule, FIELD_TYPE_DROPDOWN)
+            offset = self._read_ui_field("entry_offset", defaults.entry_offset, FIELD_TYPE_TEXT)
+            sl_mode = self._read_ui_field("sl_mode", defaults.sl_mode, FIELD_TYPE_DROPDOWN)
+            fixed = self._read_ui_field("sl_fixed_distance", defaults.sl_fixed_distance, FIELD_TYPE_TEXT)
+            buf = self._read_ui_field("buffer_mode", defaults.buffer_mode, FIELD_TYPE_DROPDOWN)
+            pct = self._read_ui_field("sl_buffer_pct", defaults.sl_buffer_pct, FIELD_TYPE_TEXT)
+            flat = self._read_ui_field("sl_buffer_flat", defaults.sl_buffer_flat, FIELD_TYPE_TEXT)
+        sl_mode_val = sl_mode.value if isinstance(sl_mode, logic.StopLossMode) else str(sl_mode)
         return {
-            "entry_rule": rule,
-            "entry_offset": 0.0 if offset is None else offset,
-            "buffer_mode": buf,
-            "sl_buffer_pct": 5.0 if pct is None else pct,
-            "sl_buffer_flat": 0.0 if flat is None else flat,
+            "entry_rule": rule.value if hasattr(rule, "value") else rule,
+            "entry_offset": float(offset or 0.0),
+            "sl_mode": sl_mode_val,
+            "sl_fixed_distance": float(fixed or 0.0),
+            "buffer_mode": buf.value if hasattr(buf, "value") else buf,
+            "sl_buffer_pct": float(pct or 0.0),
+            "sl_buffer_flat": float(flat or 0.0),
         }
 
     def _update_context_charts(
@@ -5919,6 +6390,15 @@ class BacktestDashboard(QMainWindow):
             '<span style="background-color:#D7F5DD; padding:2px 10px; border-radius:4px;">BUY</span> '
             '<span style="background-color:#FADBD8; padding:2px 10px; border-radius:4px;">SELL</span> '
             '<span style="background-color:#D2E3FC; padding:2px 10px; border-radius:4px;">Candle bias</span>'
+            '<br>Trade count: <b>Total Trades</b> is WIN + LOSS only. '
+            'Overlap skips are <b>Skipped Overlap</b> (not in Total Trades). '
+            'Taken setups = Total Trades + Skipped Overlap + Still Open. '
+            'By Timeframe lists each TF three times (best / candle-bias / worst) — do not add those rows. '
+            '30m often has more skips than 1h because signals are denser while a trade is still open.'
+            '<br><b>By Session</b>: Asian 00:00–07:59 · London 08:00–15:59 · US 16:00–23:59 '
+            f'({sessions.BROKER_TIME_LABEL}, entry bar). Filter sessions on the Timeframes tab. '
+            'Session <b>Net PnL / wins / losses</b> sum to Overall; session Max DD and Return % are '
+            '<b>as if that session alone</b> (not additive across sessions).'
         )
         self.results_color_legend.setTextFormat(Qt.RichText)
         self.results_color_legend.setObjectName("sectionHint")
@@ -5934,6 +6414,15 @@ class BacktestDashboard(QMainWindow):
 
         self.by_direction_table = self._make_metrics_table()
         self.metrics_sub_tabs.addTab(self._wrap_table(self.by_direction_table), "By Direction")
+
+        self.by_session_table = self._make_metrics_table()
+        self.metrics_sub_tabs.addTab(self._wrap_table(self.by_session_table), "By Session")
+
+        self.by_year_table = self._make_metrics_table()
+        self.metrics_sub_tabs.addTab(self._wrap_table(self.by_year_table), "By Year")
+
+        self.by_month_table = self._make_metrics_table()
+        self.metrics_sub_tabs.addTab(self._wrap_table(self.by_month_table), "By Month")
 
         self.results_tabs.addTab(metrics_tab, "Metrics")
 
@@ -6004,8 +6493,8 @@ class BacktestDashboard(QMainWindow):
         compare_tab = QWidget()
         compare_layout = QVBoxLayout(compare_tab)
         compare_hint = QLabel(
-            "Pick two saved runs from history and compare net profit, win rate, and max drawdown "
-            "for each exit model (best case, candle bias, worst case)."
+            "Pick two saved runs from history. <b>Overall</b> compares each exit model; "
+            "<b>By Session</b> compares Asian / London / US (worst case) side-by-side."
         )
         compare_hint.setObjectName("sectionHint")
         compare_hint.setWordWrap(True)
@@ -6024,8 +6513,12 @@ class BacktestDashboard(QMainWindow):
         compare_btn.clicked.connect(self._run_history_compare)
         pick_row.addWidget(compare_btn)
         compare_layout.addLayout(pick_row)
+        compare_layout.addWidget(QLabel("<b>Overall — by exit model</b>"))
         self.compare_results_table = self._make_metrics_table()
         compare_layout.addWidget(self.compare_results_table, 1)
+        compare_layout.addWidget(QLabel("<b>By session — worst case</b>"))
+        self.compare_session_table = self._make_metrics_table()
+        compare_layout.addWidget(self.compare_session_table, 1)
         self.results_tabs.addTab(compare_tab, "Compare")
 
         button_row = QHBoxLayout()
@@ -6106,6 +6599,9 @@ class BacktestDashboard(QMainWindow):
         if isinstance(widget, QCheckBox):
             return widget.isChecked()
         if isinstance(widget, QComboBox):
+            data = widget.currentData()
+            if data is not None:
+                return str(data)
             return widget.currentText()
         return None
 
@@ -6390,6 +6886,10 @@ class BacktestDashboard(QMainWindow):
             tf for tf, cb in self.timeframe_enabled_widgets.items() if cb.isChecked()
         ]
         kwargs["timeframes_to_test"] = selected_timeframes
+        kwargs["sessions_enabled"] = [
+            name for name in sessions.SESSION_ORDER
+            if self.session_enabled_widgets.get(name) and self.session_enabled_widgets[name].isChecked()
+        ]
         kwargs["output_root"] = DEFAULT_OUTPUT_DIR
         kwargs["run_name"] = f"dashboard_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         kwargs["indicator_stack"] = self._build_indicator_stack()
@@ -6413,6 +6913,13 @@ class BacktestDashboard(QMainWindow):
 
         if not backtest_config.timeframes_to_test:
             QMessageBox.warning(self, "No Timeframes Selected", "Select at least one timeframe to test.")
+            return
+
+        if not backtest_config.sessions_enabled:
+            QMessageBox.warning(
+                self, "No Sessions Selected",
+                "Select at least one trading session on the Timeframes tab (Asian / London / US).",
+            )
             return
 
         if not os.path.isdir(backtest_config.data_root):
@@ -6496,17 +7003,29 @@ class BacktestDashboard(QMainWindow):
             print(f"Could not load run history: {e}")
             return
 
-        headers = ["Strategy ID", "Created At", "Symbol", "Timeframes", "Body %", "Dominant Wick %",
-                   "Position Sizing", "Initial Deposit", "Output Folder"]
+        headers = [
+            "Strategy ID", "Created At", "Pattern", "Symbol", "Timeframes", "Body %",
+            "Net PnL (WC)", "Win Rate (WC)", "PF (WC)", "Max DD % (WC)", "Best Session (WC)",
+            "Dominant Wick %", "Position Sizing", "Initial Deposit", "Output Folder",
+        ]
         self.history_table.setColumnCount(len(headers))
         self.history_table.setHorizontalHeaderLabels(headers)
         self.history_table.setRowCount(len(rows))
 
         for i, r in enumerate(rows):
+            pf = r.get("ProfitFactorWC")
+            net = r.get("NetProfitWC")
+            wr = r.get("WinRateWC")
             values = [
-                r.get("StrategyID"), r.get("CreatedAt"), r.get("Symbol"),
-                r.get("TimeframesTested"), r.get("BodyPct"), r.get("DominantWickPct"),
-                r.get("PositionSizingMethod"), r.get("InitialDeposit"), r.get("OutputDir"),
+                r.get("StrategyID"), r.get("CreatedAt"), r.get("PatternType"), r.get("Symbol"),
+                r.get("TimeframesTested"), r.get("BodyPct"),
+                f"{net:,.2f}" if isinstance(net, (int, float)) else net,
+                f"{wr:.1f}%" if isinstance(wr, (int, float)) else wr,
+                f"{pf:.2f}" if isinstance(pf, (int, float)) else pf,
+                f"{r.get('MaxDrawdownWC'):.2f}%" if isinstance(r.get("MaxDrawdownWC"), (int, float)) else r.get("MaxDrawdownWC"),
+                r.get("BestSessionWC"),
+                r.get("DominantWickPct"), r.get("PositionSizingMethod"), r.get("InitialDeposit"),
+                r.get("OutputDir"),
             ]
             for j, val in enumerate(values):
                 item = QTableWidgetItem("" if val is None else str(val))
@@ -6678,6 +7197,9 @@ class BacktestDashboard(QMainWindow):
         self._fill_overall_vertical(tables.get("overall"))
         self._fill_table(self.by_timeframe_table, tables.get("by_timeframe"))
         self._fill_table(self.by_direction_table, tables.get("by_direction"))
+        self._fill_table(self.by_session_table, tables.get("by_session"))
+        self._fill_table(self.by_year_table, tables.get("by_year"))
+        self._fill_table(self.by_month_table, tables.get("by_month"))
         self._fill_trade_ledger_table(tables.get("ledger"))
 
     def _display_charts(self, plots_dir: str):
@@ -6796,6 +7318,7 @@ class BacktestDashboard(QMainWindow):
         write_polars_sheet("overall", self.last_tables.get("overall"))
         write_polars_sheet("by_timeframe", self.last_tables.get("by_timeframe"))
         write_polars_sheet("by_direction", self.last_tables.get("by_direction"))
+        write_polars_sheet("by_session", self.last_tables.get("by_session"))
         write_polars_sheet("by_year", self.last_tables.get("by_year"))
         write_polars_sheet("by_month", self.last_tables.get("by_month"))
         ledger = self.last_tables.get("ledger")
@@ -6884,6 +7407,47 @@ class BacktestDashboard(QMainWindow):
             for j, text in enumerate(values):
                 table.setItem(i, j, _table_item(text, row_bg))
         table.resizeColumnsToContents()
+
+        try:
+            sess_a = {
+                r["GroupName"]: r
+                for r in self.run_db.fetch_metrics_breakdown(int(id_a), "session", "worst_case")
+            }
+            sess_b = {
+                r["GroupName"]: r
+                for r in self.run_db.fetch_metrics_breakdown(int(id_b), "session", "worst_case")
+            }
+        except Exception:
+            sess_a, sess_b = {}, {}
+
+        sess_headers = [
+            "Session",
+            f"Net PnL (#{id_a})", f"Net PnL (#{id_b})",
+            f"Win % (#{id_a})", f"Win % (#{id_b})",
+            f"PF (#{id_a})", f"PF (#{id_b})",
+            f"Trades (#{id_a})", f"Trades (#{id_b})",
+        ]
+        stable = self.compare_session_table
+        stables = sessions.SESSION_ORDER
+        stables_rows = [s for s in stables if s in sess_a or s in sess_b]
+        if not stables_rows:
+            stables_rows = stables
+        stable.setColumnCount(len(sess_headers))
+        stable.setHorizontalHeaderLabels(sess_headers)
+        stable.setRowCount(len(stables_rows))
+        for i, sess in enumerate(stables_rows):
+            ra, rb = sess_a.get(sess, {}), sess_b.get(sess, {})
+            svalues = [
+                sess,
+                _fmt_money(ra.get("NetProfit")), _fmt_money(rb.get("NetProfit")),
+                _fmt_pct(ra.get("WinRatePercent")), _fmt_pct(rb.get("WinRatePercent")),
+                _fmt_pf(ra.get("ProfitFactor")), _fmt_pf(rb.get("ProfitFactor")),
+                _fmt_int(ra.get("TotalTrades")), _fmt_int(rb.get("TotalTrades")),
+            ]
+            for j, text in enumerate(svalues):
+                stable.setItem(i, j, _table_item(text))
+        stable.resizeColumnsToContents()
+
         if hasattr(self, "results_tabs"):
             for idx in range(self.results_tabs.count()):
                 if self.results_tabs.tabText(idx) == "Compare":
@@ -6997,6 +7561,11 @@ class BacktestDashboard(QMainWindow):
                 "sl": edits["sl"].text(),
                 "enabled": cb.isChecked() if cb else True,
             }
+        sessions_preset = {
+            name: (self.session_enabled_widgets[name].isChecked()
+                   if name in self.session_enabled_widgets else True)
+            for name in sessions.SESSION_ORDER
+        }
         pattern = self.pattern_combo.currentText()
         stack = self._build_indicator_stack()
         return {
@@ -7007,6 +7576,7 @@ class BacktestDashboard(QMainWindow):
             "backtest": self._collect_preset_backtest_settings(),
             "fields": fields,
             "timeframes": timeframes,
+            "sessions": sessions_preset,
             "indicators_added": sorted(self.added_indicator_ids),
             "indicators": {
                 "combine_mode": stack.combine_mode.value,
@@ -7036,7 +7606,10 @@ class BacktestDashboard(QMainWindow):
                 widget.setChecked(bool(value))
         elif isinstance(widget, QComboBox):
             text = "" if value is None else str(value)
-            if widget.findText(text) >= 0:
+            idx = widget.findData(text)
+            if idx >= 0:
+                widget.setCurrentIndex(idx)
+            elif widget.findText(text) >= 0:
                 widget.setCurrentText(text)
 
     def _migrate_preset_fields_for_pattern(self, pattern: str, fields: dict) -> dict:
@@ -7088,6 +7661,10 @@ class BacktestDashboard(QMainWindow):
             folder = TIMEFRAME_TO_FOLDER.get(tf)
             if folder and folder in self.timeframe_enabled_widgets and "enabled" in cfg:
                 self.timeframe_enabled_widgets[folder].setChecked(bool(cfg["enabled"]))
+        for sess_name, enabled in (data.get("sessions") or {}).items():
+            cb = self.session_enabled_widgets.get(sess_name)
+            if cb is not None:
+                cb.setChecked(bool(enabled))
         for ind_id in list(self.added_indicator_ids):
             self._remove_indicator(ind_id)
         for ind_id in data.get("indicators_added") or []:

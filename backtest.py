@@ -68,6 +68,7 @@ OUTPUT FILES (all CSV, ready for Excel/Numbers import)
     output/<run_name>/summary_by_month.csv       -- year-month x exit model
     output/<run_name>/summary_by_timeframe.csv   -- timeframe x exit model
     output/<run_name>/summary_by_direction.csv   -- BUY/SELL x exit model
+    output/<run_name>/summary_by_session.csv     -- Asian/London/US x exit model (IC Markets server time)
 """
 
 import os
@@ -83,6 +84,7 @@ import polars as pl
 import logic  # hammer pattern rules
 import doji_logic
 import hammer_context_logic
+import sessions
 from indicators.config import IndicatorStackConfig
 from indicators.filter import apply_indicator_filters
 
@@ -188,6 +190,12 @@ class BacktestConfig:
 
     # ---- overlap handling ----
     allow_overlapping_trades: bool = False
+
+    # ---- session filter (IC Markets server clock on entry bar) ----
+    # Subset of sessions.SESSION_ORDER; default all three = no filter.
+    sessions_enabled: List[str] = field(default_factory=lambda: [
+        "Asian", "London", "US",
+    ])
 
     # ---- costs (set to 0 to ignore, fully optional) ----
     commission_per_trade: float = 0.0        # flat $ per trade (round turn)
@@ -709,6 +717,24 @@ def simulate_timeframe_outcomes(
     if config.indicator_stack.enabled_indicator_ids():
         all_signals = apply_indicator_filters(all_signals, df, config.indicator_stack)
 
+    enabled_sessions = set(config.sessions_enabled or sessions.SESSION_ORDER)
+    if enabled_sessions != set(sessions.SESSION_ORDER):
+        session_skipped = 0
+        for sig in all_signals:
+            if sig.ignored:
+                continue
+            sess = sessions.classify_session(sig.entry_candle.timestamp)
+            if sess not in enabled_sessions:
+                sig.ignored = True
+                sig.ignore_reason = f"Session filter ({sess} not enabled)"
+                session_skipped += 1
+        if session_skipped:
+            enabled_names = [s for s in sessions.SESSION_ORDER if s in enabled_sessions]
+            print(
+                f"    [{timeframe_folder}] Session filter: skipped {session_skipped} signal(s) "
+                f"(enabled: {', '.join(enabled_names)})"
+            )
+
     taken_signals = [s for s in all_signals if not s.ignored]
     ignored_signals = [s for s in all_signals if s.ignored]
 
@@ -726,6 +752,10 @@ def simulate_timeframe_outcomes(
     for sig in taken_signals:
         entry_idx = timestamp_to_index.get(sig.entry_candle.timestamp)
         if entry_idx is None:
+            print(
+                f"    [WARN] {timeframe_folder}: dropped signal at "
+                f"{sig.entry_candle.timestamp} — entry bar not in candle index."
+            )
             continue
 
         start = entry_idx + 1
@@ -875,9 +905,14 @@ def run_full_backtest(config: BacktestConfig) -> Tuple[List[SimulatedTrade], Lis
         worst = filtered[ExitModel.WORST_CASE]
         skipped_count = sum(1 for row in worst if row[1] == TradeOutcome.SKIPPED_OVERLAP)
         open_count = sum(1 for row in worst if row[1] == TradeOutcome.STILL_OPEN)
+        win_loss = sum(
+            1 for row in worst
+            if row[1] in (TradeOutcome.WIN, TradeOutcome.LOSS)
+        )
         print(f"    Signals: {len(worst)} | Ignored (by logic.py): {len(ignored)} | "
               f"Skipped (overlap, worst_case view): {skipped_count} | "
-              f"Still open (worst_case view): {open_count}")
+              f"Still open (worst_case view): {open_count} | "
+              f"Results Total Trades (WIN+LOSS): {win_loss}")
         per_tf_filtered.append((tf_folder, filtered))
         full_ignored.extend(ignored)
 
@@ -907,7 +942,7 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             "exit_model": pl.Utf8, "outcome": pl.Utf8,
             "exit_price": pl.Float64, "exit_time": pl.Datetime,
             "bars_held": pl.Int64, "pnl_usd": pl.Float64, "equity_after": pl.Float64,
-            "year": pl.Int32, "month_key": pl.Utf8,
+            "year": pl.Int32, "month_key": pl.Utf8, "session": pl.Utf8,
         })
 
     rows = []
@@ -944,7 +979,8 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             row["equity_after"] = t.equity_after[exit_model]
             rows.append(row)
 
-    return pl.DataFrame(rows)
+    df = pl.DataFrame(rows)
+    return sessions.add_session_column(df)
 
 
 # ============================================================================
@@ -1058,8 +1094,6 @@ def compute_metrics_grouped(
         pl.col("is_skipped").sum().alias("skipped_overlap"),
         pl.col("win_pnl").sum().alias("gross_profit"),
         pl.col("loss_pnl").sum().alias("gross_loss"),
-        pl.col("win_pnl").mean().alias("avg_win_usd"),
-        pl.col("loss_pnl").mean().alias("avg_loss_usd"),
         pl.col("win_pnl").max().alias("largest_win_usd"),
         pl.col("loss_pnl").min().alias("largest_loss_usd"),
         pl.col("win_bars").mean().alias("avg_bars_held_win"),
@@ -1077,6 +1111,15 @@ def compute_metrics_grouped(
         (pl.col("wins") + pl.col("losses")).alias("total_trades"),
         pl.col("gross_profit").fill_null(0.0),
         pl.col("gross_loss").fill_null(0.0),
+    ])
+
+    agg_df = agg_df.with_columns([
+        pl.when(pl.col("wins") > 0)
+          .then(pl.col("gross_profit") / pl.col("wins"))
+          .otherwise(None).alias("avg_win_usd"),
+        pl.when(pl.col("losses") > 0)
+          .then(pl.col("gross_loss") / pl.col("losses"))
+          .otherwise(None).alias("avg_loss_usd"),
     ])
 
     agg_df = agg_df.with_columns([
@@ -1168,6 +1211,19 @@ def compute_metrics_grouped(
             result = result.with_columns(pl.lit(None).alias(c))
 
     result = result.select(final_cols).sort(["exit_model", "group"])
+    if group_cols == ["timeframe"] and "group" in result.columns:
+        mapping = {
+            "1min": "1m", "3min": "3m", "5min": "5m", "10min": "10m",
+            "15min": "15m", "30min": "30m", "1hour": "1h",
+        }
+        result = result.with_columns(
+            pl.col("group").replace(mapping).alias("group")
+        )
+    if group_cols == ["session"] and "group" in result.columns:
+        order = {name: i for i, name in enumerate(sessions.SESSION_ORDER)}
+        result = result.with_columns(
+            pl.col("group").replace(order).cast(pl.Int32).alias("_session_ord")
+        ).sort(["exit_model", "_session_ord"]).drop("_session_ord")
     return result
 
 
@@ -1263,6 +1319,7 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
         "by_month": compute_metrics_grouped(df, ["month_key"], config.starting_capital),
         "by_timeframe": compute_metrics_grouped(df, ["timeframe"], config.starting_capital),
         "by_direction": compute_metrics_grouped(df, ["direction"], config.starting_capital),
+        "by_session": compute_metrics_grouped(df, ["session"], config.starting_capital),
     }
 
     for name, table in tables.items():
@@ -1271,7 +1328,7 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     print(f"\n[OK] Exported to: {out_dir}/")
     print("    trade_ledger.csv, ignored_signals.csv, skipped_overlap.csv, still_open.csv,")
     print("    summary_overall.csv, summary_by_year.csv, summary_by_month.csv,")
-    print("    summary_by_timeframe.csv, summary_by_direction.csv")
+    print("    summary_by_timeframe.csv, summary_by_direction.csv, summary_by_session.csv")
 
     if tables["overall"].height:
         print("\n--- QUICK OVERALL SUMMARY (all 3 exit models) ---")
@@ -1281,6 +1338,17 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
                   f"WinRate={row['win_rate_pct']:5.1f}% | NetPnL=${row['net_pnl']:>10.2f} | "
                   f"PF={pf:>5} | MaxDD=${row['max_drawdown_usd']:>9.2f} | "
                   f"Return={row['total_return_pct']:6.2f}%")
+
+        sess = tables.get("by_session")
+        if sess is not None and sess.height:
+            print(f"\n--- BY SESSION ({sessions.DATA_SOURCE_NOTE}) ---")
+            wc = sess.filter(pl.col("exit_model") == "worst_case").sort("group")
+            for row in wc.iter_rows(named=True):
+                pf = f"{row['profit_factor']:.2f}" if row.get("profit_factor") is not None else "N/A"
+                print(
+                    f"  [{row['group']:6}] Trades={row['total_trades']:>5} | "
+                    f"WinRate={row['win_rate_pct']:5.1f}% | NetPnL=${row['net_pnl']:>10.2f} | PF={pf}"
+                )
 
     tables["ledger"] = df
     return tables

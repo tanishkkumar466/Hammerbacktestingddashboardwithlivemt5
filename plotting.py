@@ -7,7 +7,7 @@ WHAT THIS FILE DOES
 ----------------------
 Reads the CSV files produced by backtest.py (trade_ledger.csv,
 summary_by_year.csv, summary_by_month.csv, summary_by_timeframe.csv,
-summary_by_direction.csv) and produces:
+summary_by_direction.csv, summary_by_session.csv) and produces:
 
     1. A full set of COLORFUL, LIGHT-THEME charts (never dark mode) --
        equity curves, drawdown charts, win-rate/profit-factor bars,
@@ -69,6 +69,8 @@ matplotlib.use("Agg")  # no GUI backend needed, just save PNGs
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Patch
+
+import sessions
 
 
 # ============================================================================
@@ -640,6 +642,95 @@ def plot_direction_comparison(summary_by_direction: pl.DataFrame, config: Plotti
     axes[1].set_ylabel("Net P&L ($)")
 
     fig.suptitle(f"BUY vs SELL Performance ({config.primary_exit_model})")
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_session_performance(summary_by_session: pl.DataFrame, config: PlottingConfig, out_path: str):
+    """Win rate + net P&L by trading session (Asian / London / US, UTC entry bar)."""
+    if summary_by_session.height == 0:
+        return
+
+    sub = summary_by_session.filter(pl.col("exit_model") == config.primary_exit_model)
+    if sub.height == 0:
+        return
+
+    order = {name: i for i, name in enumerate(sessions.SESSION_ORDER)}
+    sub = sub.with_columns(
+        pl.col("group").replace(order).cast(pl.Int32).alias("_ord")
+    ).sort("_ord")
+
+    session_names = sub["group"].to_list()
+    win_rates = sub["win_rate_pct"].to_list()
+    net_pnls = sub["net_pnl"].to_list()
+    trade_counts = sub["total_trades"].to_list()
+    session_colors = {
+        sessions.SESSION_ASIAN: "#F4B942",
+        sessions.SESSION_LONDON: "#4A90D9",
+        sessions.SESSION_US: "#34A853",
+    }
+    colors = [session_colors.get(s, COLORS["neutral"]) for s in session_names]
+
+    _apply_light_theme()
+    fig, axes = plt.subplots(1, 3, figsize=(config.figure_width * 1.35, config.figure_height),
+                              dpi=config.figure_dpi)
+
+    axes[0].bar(session_names, win_rates, color=colors, alpha=0.9, edgecolor="white", linewidth=0.8)
+    axes[0].set_title("Win Rate by Session")
+    axes[0].set_ylabel("Win Rate (%)")
+
+    pnl_colors = [COLORS["win"] if p >= 0 else COLORS["loss"] for p in net_pnls]
+    axes[1].bar(session_names, net_pnls, color=pnl_colors, alpha=0.9, edgecolor="white", linewidth=0.8)
+    axes[1].axhline(0, color="#888888", linewidth=1)
+    axes[1].set_title("Net P&L by Session")
+    axes[1].set_ylabel("Net P&L ($)")
+
+    axes[2].bar(session_names, trade_counts, color=colors, alpha=0.85, edgecolor="white", linewidth=0.8)
+    axes[2].set_title("Trade Count by Session")
+    axes[2].set_ylabel("Trades (WIN+LOSS)")
+
+    fig.suptitle(
+        f"Session Breakdown — {config.primary_exit_model}  "
+        f"(entry bar {sessions.BROKER_TIME_LABEL}: Asian 00–07 · London 08–15 · US 16–23)"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_profit_factor_by_session(summary_by_session: pl.DataFrame, config: PlottingConfig, out_path: str):
+    """Grouped bar chart: profit factor per session, all exit models."""
+    if summary_by_session.height == 0:
+        return
+
+    session_names = sessions.SESSION_ORDER
+    n_models = len(EXIT_MODEL_COLORS)
+    bar_width = 0.8 / n_models
+    x = np.arange(len(session_names))
+
+    _apply_light_theme()
+    fig, ax = plt.subplots(figsize=(config.figure_width, config.figure_height), dpi=config.figure_dpi)
+
+    for i, (exit_model, color) in enumerate(EXIT_MODEL_COLORS.items()):
+        vals = []
+        for sess in session_names:
+            row = summary_by_session.filter(
+                (pl.col("group") == sess) & (pl.col("exit_model") == exit_model)
+            )
+            pf = row["profit_factor"][0] if row.height else None
+            vals.append(pf if pf is not None else 0)
+        offset = (i - n_models / 2) * bar_width + bar_width / 2
+        ax.bar(x + offset, vals, width=bar_width, label=exit_model, color=color, alpha=0.9,
+               edgecolor="white", linewidth=0.8)
+
+    ax.axhline(1.0, color="#888888", linewidth=1.2, linestyle="--", label="Breakeven (PF=1.0)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(session_names)
+    ax.set_title("Profit Factor by Session (IC Markets server time)")
+    ax.set_xlabel("Session")
+    ax.set_ylabel("Profit Factor")
+    ax.legend(frameon=True, facecolor="white", edgecolor="#CCCCCC")
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
@@ -1325,6 +1416,7 @@ def generate_all_plots(config: PlottingConfig) -> None:
     summary_by_month = load_summary(config, "by_month")
     summary_by_timeframe = load_summary(config, "by_timeframe")
     summary_by_direction = load_summary(config, "by_direction")
+    summary_by_session = load_summary(config, "by_session")
 
     charts = [
         ("equity_curves_all_models.png", lambda p: plot_equity_curves_all_models(ledger, config, p)),
@@ -1334,6 +1426,8 @@ def generate_all_plots(config: PlottingConfig) -> None:
         ("net_pnl_by_year.png", lambda p: plot_net_pnl_by_year(summary_by_year, config, p)),
         ("profit_factor_by_timeframe.png", lambda p: plot_profit_factor_by_timeframe(summary_by_timeframe, config, p)),
         ("direction_comparison.png", lambda p: plot_direction_comparison(summary_by_direction, config, p)),
+        ("session_performance.png", lambda p: plot_session_performance(summary_by_session, config, p)),
+        ("profit_factor_by_session.png", lambda p: plot_profit_factor_by_session(summary_by_session, config, p)),
         ("monthly_heatmap.png", lambda p: plot_monthly_heatmap(summary_by_month, config, p)),
         ("r_multiple_distribution.png", lambda p: plot_r_multiple_distribution(ledger, config, p)),
         ("hammer_color_breakdown.png", lambda p: plot_hammer_color_breakdown(ledger, config, p)),

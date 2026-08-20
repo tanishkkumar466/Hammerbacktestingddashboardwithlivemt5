@@ -3,8 +3,8 @@
 ================================================================================
 
 Project:     Hammer / Doji Candle Backtest Dashboard (XAUUSD) + Live Trading (MT5)
-Version:     1.1 (enhanced build — backtest + live module)
-Document date: 26 July 2026
+Version:     1.2 (session analytics, fixed SL, expanded run history)
+Document date: 20 August 2026
 
 Prepared for: _________________________________________________
 
@@ -85,7 +85,8 @@ Platform note:
 2.3 Timeframes and run configuration
 ------------------------------------
 
-  - Single Timeframes tab: Include in run, RR multiple, Max SL ($) per timeframe.
+  - Timeframes tab: Include in run, RR multiple, Max SL ($), signal risk filters,
+    and trading session checkboxes (Asian / London / US) per backtest run.
   - Run Settings tab: Symbol, data folder, date range, sizing, overlap,
     commission, slippage, etc.
   - Optional saved parameter sets: Save/load/delete JSON in presets/ — not
@@ -108,13 +109,18 @@ Platform note:
 -------------------------
 
   - Results panel (keyboard F8), separate from Live Trading.
-  - Metrics: Overall, By Timeframe, By Direction — color key: green = BUY,
-    red = SELL, blue = candle-bias exit model.
+  - Metrics: Overall, By Timeframe, By Direction, By Session, By Year, By Month
+    — color key: green = BUY, red = SELL, blue = candle-bias exit model.
+  - Session analytics: Asian / London / US using IC Markets MT5 server time
+    (GMT+2 winter / GMT+3 US daylight saving — same as CSV data). Filter
+    sessions on the Timeframes tab before running.
+  - Fixed stop loss: Optional fixed distance from entry on Entry/Exit tab.
   - Trades tab: Trade list from last run (full data in trade_ledger.csv).
-  - Charts tab: Thumbnails with click-to-zoom.
-  - History tab: SQLite run history; double-click to open run folder; Export
-    to Excel.
-  - Compare tab: Two Strategy IDs side-by-side (PnL, win rate, drawdown, etc.).
+  - Charts tab: Thumbnails with click-to-zoom (includes session charts).
+  - History tab: SQLite run_history.db with expanded metrics and breakdown
+    table; double-click to open run folder; Export to Excel.
+  - Compare tab: Overall by exit model plus By Session (worst case) for Run A
+    vs Run B.
   - Toolbar: Open output folder, open ledger, export last run metrics, open
     charts folder.
 
@@ -328,6 +334,15 @@ Live trading and operations (this phase)
   18. Structured Live panel layout and UI polish.
   19. Layout tools (F2 reset); macOS stability (no float windows).
   20. Client delivery document updated for live scope.
+
+Analytics and research (v1.2)
+  21. Trading sessions — Asian / London / US in Results, charts, CSV, history.
+  22. Session backtest filter — Include/exclude on Timeframes tab.
+  23. Fixed stop loss from entry (FIXED_FROM_ENTRY mode).
+  24. Metrics tabs — By Year and By Month in Results UI.
+  25. Compare by session — worst-case session rows for Run A vs Run B.
+  26. Run history DB — expanded Backtest_Results + Backtest_Metrics_Breakdown.
+  27. Hammer with candles — context pattern fully integrated.
 
 
 --------------------------------------------------------------------------------

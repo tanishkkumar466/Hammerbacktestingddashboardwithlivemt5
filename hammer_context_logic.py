@@ -41,6 +41,8 @@ class HammerContextConfig:
     # BUY — classic green hammer
     entry_rule: logic.EntryRule = logic.EntryRule.NEXT_CANDLE_OPEN
     entry_offset: float = 0.0
+    sl_mode: logic.StopLossMode = logic.StopLossMode.CANDLE_EXTREME
+    sl_fixed_distance: float = 5.0
     buffer_mode: logic.BufferMode = logic.BufferMode.PERCENT_OF_RANGE
     sl_buffer_pct: float = 5.0
     sl_buffer_flat: float = 0.0
@@ -48,6 +50,8 @@ class HammerContextConfig:
     # SELL — inverted red hammer
     inverted_entry_rule: logic.EntryRule = logic.EntryRule.NEXT_CANDLE_OPEN
     inverted_entry_offset: float = 0.0
+    inverted_sl_mode: logic.StopLossMode = logic.StopLossMode.CANDLE_EXTREME
+    inverted_sl_fixed_distance: float = 5.0
     inverted_buffer_mode: logic.BufferMode = logic.BufferMode.PERCENT_OF_RANGE
     inverted_sl_buffer_pct: float = 5.0
     inverted_sl_buffer_flat: float = 0.0
@@ -66,6 +70,8 @@ class HammerContextConfig:
             self.lookback_candles = 5
         self.entry_rule = logic.coerce_entry_rule(self.entry_rule)
         self.inverted_entry_rule = logic.coerce_entry_rule(self.inverted_entry_rule)
+        self.sl_mode = logic.coerce_stop_loss_mode(self.sl_mode)
+        self.inverted_sl_mode = logic.coerce_stop_loss_mode(self.inverted_sl_mode)
         self.buffer_mode = logic.coerce_buffer_mode(self.buffer_mode)
         self.inverted_buffer_mode = logic.coerce_buffer_mode(self.inverted_buffer_mode)
 
@@ -99,6 +105,8 @@ class HammerContextConfig:
         cfg = self.to_buy_shape_config()
         cfg.entry_rule = self.entry_rule
         cfg.entry_offset = self.entry_offset
+        cfg.sl_mode = self.sl_mode
+        cfg.sl_fixed_distance = self.sl_fixed_distance
         cfg.buffer_mode = self.buffer_mode
         cfg.sl_buffer_pct = self.sl_buffer_pct
         cfg.sl_buffer_flat = self.sl_buffer_flat
@@ -113,6 +121,8 @@ class HammerContextConfig:
         cfg.entry_offset = self.inverted_entry_offset
         cfg.inverted_entry_rule = self.inverted_entry_rule
         cfg.inverted_entry_offset = self.inverted_entry_offset
+        cfg.inverted_sl_mode = self.inverted_sl_mode
+        cfg.inverted_sl_fixed_distance = self.inverted_sl_fixed_distance
         cfg.buffer_mode = self.inverted_buffer_mode
         cfg.inverted_buffer_mode = self.inverted_buffer_mode
         cfg.sl_buffer_pct = self.inverted_sl_buffer_pct
@@ -191,8 +201,18 @@ def describe_hammer_context_rules(config: HammerContextConfig) -> str:
     if (config.enable_buy and not config.buy_require_wick) or (
         config.enable_sell and not config.sell_require_wick
     ):
-        note += " | SL still at candle low (BUY) / high (SELL) — long wicks still set stop distance"
+        if (
+            config.sl_mode == logic.StopLossMode.CANDLE_EXTREME
+            and config.inverted_sl_mode == logic.StopLossMode.CANDLE_EXTREME
+        ):
+            note += " | SL still at candle low (BUY) / high (SELL) — long wicks still set stop distance"
     return note
+
+
+def _sl_mode_label(mode: logic.StopLossMode, fixed: float, buf: logic.BufferMode) -> str:
+    if mode == logic.StopLossMode.FIXED_FROM_ENTRY:
+        return f"fixed ${fixed:g} from entry"
+    return buf.value
 
 
 def describe_hammer_context_entry_exit(config: HammerContextConfig) -> str:
@@ -200,9 +220,9 @@ def describe_hammer_context_entry_exit(config: HammerContextConfig) -> str:
     s_rule = logic.coerce_entry_rule(config.inverted_entry_rule)
     return (
         f"BUY entry={c_rule.value} offset=${config.entry_offset:g} "
-        f"SL={config.buffer_mode.value} | "
+        f"SL={_sl_mode_label(config.sl_mode, config.sl_fixed_distance, config.buffer_mode)} | "
         f"SELL entry={s_rule.value} offset=${config.inverted_entry_offset:g} "
-        f"SL={config.inverted_buffer_mode.value}"
+        f"SL={_sl_mode_label(config.inverted_sl_mode, config.inverted_sl_fixed_distance, config.inverted_buffer_mode)}"
     )
 
 
@@ -328,7 +348,7 @@ def build_context_signal(
         signal_candle, next_candle, trade_cfg, variant,
     )
     stop_loss = logic.calculate_stop_loss(
-        signal_candle, direction, trade_cfg, variant,
+        signal_candle, direction, trade_cfg, variant, entry_price=entry_price,
     )
 
     if direction == logic.TradeDirection.BUY:
