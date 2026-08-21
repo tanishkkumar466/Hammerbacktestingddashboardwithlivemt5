@@ -13,7 +13,13 @@ def _inverted_red(ts="sig"):
 
 
 def _pad(ts, close):
-    return Candle(ts, close, close + 0.5, close - 0.5, close)
+    """Bullish pad candle (close > open) with room around the close."""
+    return Candle(ts, close - 0.3, close + 0.5, close - 0.5, close)
+
+
+def _pad_red(ts, close):
+    """Bearish pad candle (open > close)."""
+    return Candle(ts, close + 0.4, close + 0.5, close - 0.5, close)
 
 
 def test_buy_requires_prior_closes_not_below_hammer_low():
@@ -124,7 +130,7 @@ def test_asymmetric_buy_body_bounds():
 
 
 def test_body_only_ignores_wick_shape():
-    """Wick off: any green candle with body ≤ cap is a BUY, even with a long upper wick."""
+    """Wick off: body ≤ cap + previous RED → BUY (signal color ignored)."""
     body_only = HammerRatioConfig(
         body_pct=10.0,
         body_tol=0.0,
@@ -138,10 +144,14 @@ def test_body_only_ignores_wick_shape():
         enable_risk_limit=False,
         timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
     )
-    # Green, small body (~9.5%), LONG upper wick — not a classic hammer.
+    # Signal: green, small body (~9.5%), LONG upper wick — not a classic hammer.
     signal = Candle("s", 100.0, 110.0, 99.5, 101.0)
-    candles = [_pad("p0", 100.0), signal, Candle("n", 101.0, 102.0, 100.5, 101.5)]
+    candles = [_pad_red("p0", 100.0), signal, Candle("n", 101.0, 102.0, 100.5, 101.5)]
     assert hc.detect_buy_setup(candles, 1, cfg) is None
+
+    # Same signal but previous GREEN → not BUY under wick-off.
+    candles_green_prev = [_pad("p0", 100.0), signal, Candle("n", 101.0, 102.0, 100.5, 101.5)]
+    assert hc.detect_buy_setup(candles_green_prev, 1, cfg) is not None
 
     cfg_wick_on = hc.HammerContextConfig(
         buy_require_wick=True,
@@ -152,13 +162,14 @@ def test_body_only_ignores_wick_shape():
     assert hc.detect_buy_setup(candles, 1, cfg_wick_on) is not None
 
     fat = Candle("s", 100.0, 110.0, 90.0, 108.0)  # body well above 10%
-    fat_bars = [_pad("p0", 100.0), fat, Candle("n", 108.0, 109.0, 107.0, 108.5)]
+    fat_bars = [_pad_red("p0", 100.0), fat, Candle("n", 108.0, 109.0, 107.0, 108.5)]
     fail = hc.detect_buy_setup(fat_bars, 1, cfg)
     assert fail is not None
     assert "Body" in fail
 
 
 def test_body_only_sell_red_ignores_lower_wick():
+    """Wick off SELL: previous GREEN + body ≤ cap (signal may be any color)."""
     body_only = HammerRatioConfig(body_pct=10.0, body_tol=0.0)
     cfg = hc.HammerContextConfig(
         sell_hammer_ratios=body_only,
@@ -168,10 +179,13 @@ def test_body_only_sell_red_ignores_lower_wick():
         enable_risk_limit=False,
         timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
     )
-    # Red, small body, long LOWER wick — not an inverted hammer.
+    # Signal red with long LOWER wick — not inverted; prev green → SELL.
     signal = Candle("s", 101.0, 101.5, 90.0, 100.0)
     candles = [_pad("p0", 99.0), signal, Candle("n", 100.0, 100.5, 99.0, 99.5)]
     assert hc.detect_sell_setup(candles, 1, cfg) is None
+
+    candles_red_prev = [_pad_red("p0", 99.0), signal, Candle("n", 100.0, 100.5, 99.0, 99.5)]
+    assert hc.detect_sell_setup(candles_red_prev, 1, cfg) is not None
 
 
 def test_body_only_live_pipeline_matches_backtest():
@@ -189,11 +203,11 @@ def test_body_only_live_pipeline_matches_backtest():
         enable_risk_limit=False,
         timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
     )
-    # Green, body ~9.5%, long UPPER wick (not a classic hammer).
+    # Immediate previous must be RED for BUY; signal color ignored.
     signal = Candle("s", 100.0, 110.0, 99.5, 101.0)
     closed = [
         _pad("p0", 100.0),
-        _pad("p1", 100.5),
+        _pad_red("p1", 100.5),
         signal,
     ]
     forming = Candle("n", 101.0, 102.0, 100.5, 101.5)
@@ -216,7 +230,7 @@ def test_body_only_live_pipeline_matches_backtest():
 
     rules = hc.describe_hammer_context_rules(cfg)
     assert "≤ 10" in rules
-    assert "upper/lower ignored" in rules
+    assert "prev red" in rules.lower() or "prev green" in rules.lower()
 
     # Tolerance must not widen the cap when wick is off (20±25 is not 45%).
     wide = HammerRatioConfig(body_pct=10.0, body_tol=25.0)
@@ -278,19 +292,26 @@ def test_lookback_ignores_bars_beyond_n():
     assert "below hammer low" in fail
 
 
-def test_body_only_rejects_doji_and_wrong_color():
+def test_body_only_rejects_doji_prev_and_wrong_prev_color():
     ratios = HammerRatioConfig(body_pct=10.0, body_tol=25.0)
     buy_cfg = hc.HammerContextConfig(
         buy_hammer_ratios=ratios, buy_require_wick=False,
         enable_sell=False, lookback_candles=1, enable_risk_limit=False,
     )
-    doji = Candle("s", 100.0, 110.0, 90.0, 100.0)  # body 0%, no color
-    bars = [_pad("p0", 100.0), doji, Candle("n", 100.0, 101.0, 99.0, 100.5)]
-    assert "green" in (hc.detect_buy_setup(bars, 1, buy_cfg) or "").lower()
+    # Signal may be red with small body — still BUY if previous is red.
+    signal_red = Candle("s", 100.5, 101.0, 99.5, 100.0)  # body 0.5 / range 1.5 ≈ 33% — too fat
+    # Use body ≤ 10%: range 10, body 0.5 → 5%
+    signal_red = Candle("s", 100.5, 105.0, 95.0, 100.0)
+    good = [_pad_red("p0", 100.0), signal_red, Candle("n", 100.5, 101.0, 100.0, 100.8)]
+    assert hc.detect_buy_setup(good, 1, buy_cfg) is None
 
-    red = Candle("s", 101.0, 102.0, 99.0, 100.5)  # red, small body
-    red_bars = [_pad("p0", 100.0), red, Candle("n", 100.5, 101.0, 100.0, 100.8)]
-    assert "green" in (hc.detect_buy_setup(red_bars, 1, buy_cfg) or "").lower()
+    doji_prev = Candle("p0", 100.0, 101.0, 99.0, 100.0)
+    bars = [doji_prev, signal_red, Candle("n", 100.5, 101.0, 100.0, 100.8)]
+    fail = hc.detect_buy_setup(bars, 1, buy_cfg) or ""
+    assert "previous" in fail.lower() or "doji" in fail.lower() or "color" in fail.lower()
+
+    green_prev = [_pad("p0", 100.0), signal_red, Candle("n", 100.5, 101.0, 100.0, 100.8)]
+    assert hc.detect_buy_setup(green_prev, 1, buy_cfg) is not None
 
 
 def test_extreme_lower_wick_fails_hammer_but_passes_body_only():
@@ -298,7 +319,7 @@ def test_extreme_lower_wick_fails_hammer_but_passes_body_only():
     ratios = HammerRatioConfig(body_pct=10.0, body_tol=25.0)
     # Green, body ~6.4%, lower wick ~82% (same proportions as a real 1h XAUUSD bar).
     signal = Candle("s", 100.00, 100.18, 99.00, 100.06)
-    candles = [_pad("p0", 100.0), signal, Candle("n", 100.06, 100.20, 100.00, 100.10)]
+    candles = [_pad_red("p0", 100.0), signal, Candle("n", 100.06, 100.20, 100.00, 100.10)]
 
     wick_on = hc.HammerContextConfig(
         buy_hammer_ratios=ratios, buy_require_wick=True,
@@ -340,7 +361,7 @@ if __name__ == "__main__":
     test_body_only_sell_red_ignores_lower_wick()
     test_body_only_live_pipeline_matches_backtest()
     test_lookback_ignores_bars_beyond_n()
-    test_body_only_rejects_doji_and_wrong_color()
+    test_body_only_rejects_doji_prev_and_wrong_prev_color()
     test_extreme_lower_wick_fails_hammer_but_passes_body_only()
     test_body_only_zero_pct_cap_is_not_replaced_with_ten()
     test_backtest_ledger_keeps_body_only_variant()

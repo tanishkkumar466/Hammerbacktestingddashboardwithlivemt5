@@ -76,7 +76,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QMessageBox, QFrame, QDialog, QSizePolicy,
     QDockWidget, QInputDialog, QPlainTextEdit, QFormLayout,
-    QAbstractItemView, QDialogButtonBox,
+    QAbstractItemView, QDialogButtonBox, QButtonGroup, QColorDialog, QRadioButton,
 )
 
 import logic
@@ -85,6 +85,7 @@ import hammer_context_logic
 import backtest
 import plotting
 import sessions
+import polars as pl
 from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperTrendConfig, VWAPConfig
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
@@ -865,8 +866,8 @@ PATTERN_REGISTRY = {
         "description": (
             "Classic green hammer + N prior closes not below hammer low (BUY); "
             "inverted red hammer + N prior closes not above hammer high (SELL). "
-            "Separate Body/Wicks for BUY vs SELL. Wick can be turned off: then detect "
-            "body ≤ Body % (e.g. 10) plus candle color; wick up or down is ignored."
+            "Separate Body/Wicks for BUY vs SELL. Wick off: body ≤ Body % only — "
+            "signal color ignored; previous candle red→BUY, green→SELL."
         ),
         "ratio_config_class": logic.HammerRatioConfig,
         "pattern_type": "hammer_with_candles",
@@ -1255,21 +1256,23 @@ FIELD_HELP: Dict[str, str] = {
     ),
     "context_enable_buy": (
         "Turn BUY setups on. Wick on = classic green hammer. "
-        "Wick off = any green candle with body ≤ Body %. Prior closes must stay at or above candle low."
+        "Wick off = signal body ≤ Body % (any color); previous candle must be red. "
+        "Prior closes must stay at or above candle low."
     ),
     "context_enable_sell": (
         "Turn SELL setups on. Wick on = inverted red hammer. "
-        "Wick off = any red candle with body ≤ Body %. Prior closes must stay at or below candle high."
+        "Wick off = signal body ≤ Body % (any color); previous candle must be green. "
+        "Prior closes must stay at or below candle high."
     ),
     "buy_require_wick": (
-        "On (default): BUY needs a classic hammer (long lower wick).\n"
-        "Off: ignore wick up or down. BUY is any GREEN candle whose body is at most "
-        "Body % of the candle range (set Body % to 10 for a 10% max). Color still required."
+        "On (default): BUY needs a classic hammer (long lower wick) that closes green.\n"
+        "Off: ignore wick shape AND signal candle color. BUY when the previous candle is RED "
+        "and the signal body is at most Body % of range (e.g. Body % = 10)."
     ),
     "sell_require_wick": (
-        "On (default): SELL needs an inverted hammer (long upper wick).\n"
-        "Off: ignore wick up or down. SELL is any RED candle whose body is at most "
-        "Body % of the candle range (set Body % to 10 for a 10% max). Color still required."
+        "On (default): SELL needs an inverted hammer (long upper wick) that closes red.\n"
+        "Off: ignore wick shape AND signal candle color. SELL when the previous candle is GREEN "
+        "and the signal body is at most Body % of range (e.g. Body % = 10)."
     ),
     "classic_red": "When a CLASSIC hammer (long lower wick) closes red: BUY, SELL, or NO (skip).",
     "inverted_green": "When an INVERTED hammer (long upper wick) closes green: BUY, SELL, or NO (skip).",
@@ -2657,6 +2660,9 @@ class BacktestDashboard(QMainWindow):
         self.last_plots_dir: Optional[str] = None
         self.last_trade_ledger_path: Optional[str] = None
         self.last_tables: Optional[dict] = None
+        self.last_backtest_config = None
+        self._trade_ledger_full_df = None
+        self._trade_ledger_display_df = None
         self._worker_thread: Optional[threading.Thread] = None
         self.mt5_broker = MT5Broker()
         self._live_log_bridge = LiveLogBridge()
@@ -3530,7 +3536,8 @@ class BacktestDashboard(QMainWindow):
             elif is_hammer_with_candles:
                 self.tolerance_hint_label.setText(
                     "With wick required: classic BUY / inverted SELL shape. "
-                    "With wick off: Body % is the max body (e.g. 10); color still required."
+                    "With wick off: Body % max only; direction from previous candle "
+                    "(red→BUY, green→SELL) — signal color ignored."
                 )
             else:
                 self.tolerance_hint_label.setText(
@@ -3595,10 +3602,11 @@ class BacktestDashboard(QMainWindow):
 
         hwc_hint = QLabel(
             "<b>Hammer with candles — body size</b><br>"
-            "Two independent sections: BUY (green) and SELL (red).<br>"
+            "Two independent sections: BUY and SELL.<br>"
             "When wick is <b>on</b>: Body % is a target with +/- tolerance (hammer shape).<br>"
-            "When wick is <b>off</b>: Body % is a hard maximum. Example: 10 means body ≤ 10% of the candle. "
-            "Wick up or down is ignored. Green still BUY, red still SELL. Tolerance fields are unused."
+            "When wick is <b>off</b>: Body % is a hard maximum (e.g. 10 = body ≤ 10%). "
+            "Wick shape and <b>signal candle color are ignored</b>. "
+            "Direction comes from the previous candle: red → BUY, green → SELL."
         )
         hwc_hint.setObjectName("sectionHint")
         hwc_hint.setWordWrap(True)
@@ -3664,10 +3672,9 @@ class BacktestDashboard(QMainWindow):
 
         hwc_hint = QLabel(
             "<b>Hammer with candles — wick size</b><br>"
-            "<b>Unchecked (your body-only mode):</b> Dominant Wick % / 60±18 is <b>not used</b>. "
-            "Only Body % counts (e.g. 10 = body ≤ 10% of the candle). "
-            "The rest of the candle is wick — upper, lower, or both, does not matter. "
-            "Green still BUY, red still SELL.<br>"
+            "<b>Unchecked (body-only mode):</b> Dominant Wick % is <b>not used</b>. "
+            "Only Body % counts. Signal color does not matter. "
+            "Previous candle: <b>red → BUY</b>, <b>green → SELL</b>.<br>"
             "<b>Checked (default):</b> classic long lower wick for BUY, inverted long upper wick for SELL "
             "(that is when the 60% ± 18% band applies)."
         )
@@ -3835,10 +3842,10 @@ class BacktestDashboard(QMainWindow):
         buy_wick = self._require_wick_checked("buy")
         sell_wick = self._require_wick_checked("sell")
         buy_title = (
-            "BUY — classic green hammer" if buy_wick else "BUY — green signal candle (body only)"
+            "BUY — classic green hammer" if buy_wick else "BUY — prev red → signal (body only)"
         )
         sell_title = (
-            "SELL — inverted red hammer" if sell_wick else "SELL — red signal candle (body only)"
+            "SELL — inverted red hammer" if sell_wick else "SELL — prev green → signal (body only)"
         )
         for attr, title in (
             ("_hwc_body_buy_box", buy_title),
@@ -3856,10 +3863,11 @@ class BacktestDashboard(QMainWindow):
         if hasattr(self, "_entry_exit_hint"):
             if not buy_wick and not sell_wick:
                 self._entry_exit_hint.setText(
-                    "Wick off does not turn Entry / Exit off. It only changes how the signal candle is found. "
-                    "BUY uses this box (entry default: next candle open; SL at signal candle low + buffer). "
-                    "SELL uses the box below (SL at signal candle high + buffer). "
-                    "Entry Rule options say <i>Signal candle</i> instead of <i>Hammer candle</i> when wick is off."
+                    "Wick off: signal color is ignored. Direction = previous candle "
+                    "(red → BUY, green → SELL). Body % only on the signal bar. "
+                    "BUY uses this box (SL at signal low + buffer by default). "
+                    "SELL uses the box below (SL at signal high + buffer). "
+                    "Entry Rule options say <i>Signal candle</i> instead of <i>Hammer candle</i>."
                 )
             elif buy_wick and sell_wick:
                 self._entry_exit_hint.setText(
@@ -4322,28 +4330,77 @@ class BacktestDashboard(QMainWindow):
         )
         layout.addWidget(risk_box)
 
-        session_box = QGroupBox("Trading sessions (backtest filter)")
+        session_box = QGroupBox("When to take trades")
         session_box.setObjectName("fieldGroup")
         session_layout = QVBoxLayout(session_box)
         session_hint = QLabel(
-            "Include signals by entry-bar time using IC Markets MT5 server clock "
-            "(GMT+2 winter / GMT+3 US daylight saving — same as your CSV data). "
-            "Uncheck a session to skip those entries in the run; Results still breaks down all taken trades by session."
+            "Choose <b>one</b>: trading sessions, or Indian time hours. "
+            "IST converts IC Markets server time automatically (GMT+2 winter / GMT+3 summer). "
+            "Same setting is used for backtest and live."
         )
         session_hint.setObjectName("sectionHint")
         session_hint.setWordWrap(True)
+        session_hint.setTextFormat(Qt.RichText)
         session_layout.addWidget(session_hint)
-        session_row = QHBoxLayout()
+
+        self.time_filter_mode_group = QButtonGroup(self)
+        self.time_filter_mode_sessions = QRadioButton("Trading sessions (Asian / London / US)")
+        self.time_filter_mode_sessions.setChecked(True)
+        self.time_filter_mode_sessions.setToolTip(
+            "Keep only entries in the sessions you tick (broker/CSV clock)."
+        )
+        self.time_filter_mode_ist = QRadioButton("Indian time (IST)")
+        self.time_filter_mode_ist.setToolTip(
+            "Keep only entries between From and To on the Indian clock."
+        )
+        self.time_filter_mode_group.addButton(self.time_filter_mode_sessions, 0)
+        self.time_filter_mode_group.addButton(self.time_filter_mode_ist, 1)
+        session_layout.addWidget(self.time_filter_mode_sessions)
+
+        self.session_checks_row = QWidget()
+        session_row = QHBoxLayout(self.session_checks_row)
+        session_row.setContentsMargins(24, 0, 0, 8)
         session_row.setSpacing(24)
         for sess_name in sessions.SESSION_ORDER:
             win = sessions.SESSION_WINDOWS[sessions.SESSION_ORDER.index(sess_name)]
             cb = QCheckBox(sess_name)
             cb.setChecked(True)
-            cb.setToolTip(f"{win[1]}–{win[2]} ({sessions.BROKER_TIME_LABEL})")
+            cb.setToolTip(f"{sess_name}: {win[1]}–{win[2]} on IC Markets server clock")
             self.session_enabled_widgets[sess_name] = cb
             session_row.addWidget(cb)
         session_row.addStretch()
-        session_layout.addLayout(session_row)
+        session_layout.addWidget(self.session_checks_row)
+
+        session_layout.addWidget(self.time_filter_mode_ist)
+        self.ist_filter_row = QWidget()
+        ist_row = QHBoxLayout(self.ist_filter_row)
+        ist_row.setContentsMargins(24, 0, 0, 0)
+        ist_row.setSpacing(8)
+        ist_row.addWidget(QLabel("From"))
+        self.ist_time_start_edit = QLineEdit("09:15")
+        self.ist_time_start_edit.setPlaceholderText("HH:MM")
+        self.ist_time_start_edit.setMaximumWidth(70)
+        self.ist_time_start_edit.setToolTip("Indian Standard Time start")
+        ist_row.addWidget(self.ist_time_start_edit)
+        ist_row.addWidget(QLabel("to"))
+        self.ist_time_end_edit = QLineEdit("15:30")
+        self.ist_time_end_edit.setPlaceholderText("HH:MM")
+        self.ist_time_end_edit.setMaximumWidth(70)
+        self.ist_time_end_edit.setToolTip("Indian Standard Time end")
+        ist_row.addWidget(self.ist_time_end_edit)
+        ist_row.addWidget(QLabel("IST"))
+        ist_row.addStretch()
+        session_layout.addWidget(self.ist_filter_row)
+
+        # Keep old attribute names as no-ops / aliases so presets don't crash
+        self.session_clock_combo = None
+        self.broker_offset_combo = None
+        self.ist_time_filter_cb = None
+        self.broker_summer_cb = None
+
+        self.time_filter_mode_sessions.toggled.connect(self._sync_time_filter_mode_ui)
+        self.time_filter_mode_ist.toggled.connect(self._sync_time_filter_mode_ui)
+        self._sync_time_filter_mode_ui()
         layout.addWidget(session_box)
 
         table = QTableWidget(len(TIMEFRAME_LABELS), 4)
@@ -4429,6 +4486,66 @@ class BacktestDashboard(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(wrap)
         return scroll
+
+    def _sync_time_filter_mode_ui(self) -> None:
+        """Show only the controls for the selected filter mode."""
+        use_ist = bool(
+            getattr(self, "time_filter_mode_ist", None)
+            and self.time_filter_mode_ist.isChecked()
+        )
+        if hasattr(self, "session_checks_row"):
+            self.session_checks_row.setEnabled(not use_ist)
+            self.session_checks_row.setVisible(True)
+        if hasattr(self, "ist_filter_row"):
+            self.ist_filter_row.setEnabled(use_ist)
+            self.ist_filter_row.setVisible(True)
+
+    def _time_filter_mode(self) -> str:
+        if getattr(self, "time_filter_mode_ist", None) and self.time_filter_mode_ist.isChecked():
+            return "ist"
+        return "sessions"
+
+    def _collect_time_filter_kwargs(self) -> Dict[str, Any]:
+        """
+        Map the simple two-option UI onto backtest/live filter fields.
+        Mode 'sessions' → Asian/London/US on broker clock.
+        Mode 'ist' → IST start/end window only (IC Markets → IST auto by bar date).
+        """
+        mode = self._time_filter_mode()
+        start = (
+            self.ist_time_start_edit.text().strip()
+            if hasattr(self, "ist_time_start_edit") else "09:15"
+        ) or "09:15"
+        end = (
+            self.ist_time_end_edit.text().strip()
+            if hasattr(self, "ist_time_end_edit") else "15:30"
+        ) or "15:30"
+
+        if mode == "ist":
+            return {
+                "sessions_enabled": list(sessions.SESSION_ORDER),
+                "session_clock": sessions.CLOCK_BROKER,
+                "broker_utc_offset_hours": None,  # auto IC Markets GMT+2/GMT+3 per bar
+                "ist_time_filter_enabled": True,
+                "ist_time_start": start,
+                "ist_time_end": end,
+                "time_filter_mode": "ist",
+            }
+
+        enabled = [
+            name for name in sessions.SESSION_ORDER
+            if self.session_enabled_widgets.get(name)
+            and self.session_enabled_widgets[name].isChecked()
+        ]
+        return {
+            "sessions_enabled": enabled,
+            "session_clock": sessions.CLOCK_BROKER,
+            "broker_utc_offset_hours": None,
+            "ist_time_filter_enabled": False,
+            "ist_time_start": start,
+            "ist_time_end": end,
+            "time_filter_mode": "sessions",
+        }
 
     def _build_preview_toolbar(self) -> QWidget:
         """BUY vs SELL and classic vs inverted preview toggles (hammer + context charts)."""
@@ -4817,7 +4934,7 @@ class BacktestDashboard(QMainWindow):
             )
             self.tolerance_widget_max.set_shape(min(3.0, body_cap), leftover_tiny, leftover_tiny, draw_wick, is_green)
             self.tolerance_label_max.setText(
-                f"Smaller body still valid\nBody ≤ {body_cap:.0f}%  (color still required)"
+                f"Smaller body still valid\nBody ≤ {body_cap:.0f}%  (prev candle sets BUY/SELL)"
             )
         else:
             self.candle_widget.set_shape(body_pct, dominant_pct, small_pct, draw_wick, is_green)
@@ -5699,8 +5816,15 @@ class BacktestDashboard(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Apply to live", str(e))
             return
+        tf = self._collect_time_filter_kwargs()
         self._live_engine.update_runtime_strategy(
             strategy_config, indicator_stack, pattern_type, pattern,
+            sessions_enabled=tf["sessions_enabled"],
+            session_clock=tf["session_clock"],
+            broker_utc_offset_hours=tf["broker_utc_offset_hours"],
+            ist_time_filter_enabled=tf["ist_time_filter_enabled"],
+            ist_time_start=tf["ist_time_start"],
+            ist_time_end=tf["ist_time_end"],
         )
         self._refresh_live_strategy_summary()
         self._live_log("Dashboard parameters pushed to live loop.")
@@ -6175,6 +6299,7 @@ class BacktestDashboard(QMainWindow):
             fallback_to_market_on_limit_fail=self.live_fallback_market.isChecked(),
             max_entry_deviation_points=_f("live_max_entry_deviation", 200.0),
             limit_offset_from_market=self.live_limit_offset_from_market.isChecked(),
+            **{k: v for k, v in self._collect_time_filter_kwargs().items() if k != "time_filter_mode"},
         )
 
     def _live_worker_running(self) -> bool:
@@ -6239,6 +6364,14 @@ class BacktestDashboard(QMainWindow):
 
         self._refresh_live_strategy_summary()
         is_demo = self.mt5_broker.account_is_demo()
+        if not live_cfg.sessions_enabled and self._time_filter_mode() == "sessions":
+            QMessageBox.warning(
+                self, "No Sessions Selected",
+                "Select at least one trading session (Asian / London / US), "
+                "or switch to Indian time mode.",
+            )
+            return
+
         real_money = is_demo is False
 
         if live_cfg.demo_accounts_only and real_money:
@@ -6251,6 +6384,29 @@ class BacktestDashboard(QMainWindow):
 
         preflight = self._live_preflight_notes(live_cfg)
         preflight.extend(self._live_indicator_preflight_lines(indicator_stack))
+        if getattr(live_cfg, "ist_time_filter_enabled", False):
+            preflight.append(
+                f"Filter: Indian time {live_cfg.ist_time_start}–{live_cfg.ist_time_end} IST"
+            )
+        else:
+            sess_on = live_cfg.sessions_enabled or list(sessions.SESSION_ORDER)
+            if set(sess_on) != set(sessions.SESSION_ORDER):
+                preflight.append(f"Filter: sessions {', '.join(sess_on)}")
+            else:
+                preflight.append("Filter: all sessions (Asian / London / US)")
+
+        # NEXT_CANDLE_CLOSE uses the forming bar live — warn so users don't expect backtest parity
+        entry_rules = []
+        for attr in ("entry_rule", "inverted_entry_rule"):
+            rule = getattr(strategy_config, attr, None)
+            if rule is not None:
+                entry_rules.append(str(getattr(rule, "value", rule)))
+        if any("CLOSE" in r.upper() for r in entry_rules):
+            preflight.append(
+                "WARNING: Entry uses NEXT_CANDLE_CLOSE — live evaluates the forming bar "
+                "(close not final). Prefer NEXT_CANDLE_OPEN for live/backtest parity."
+            )
+
         if pattern_type == "hammer":
             preflight.append(f"Direction: {logic.describe_hammer_direction_matrix(strategy_config)}")
             preflight.append(f"Entry/Exit: {logic.describe_hammer_entry_exit(strategy_config)}")
@@ -6396,7 +6552,7 @@ class BacktestDashboard(QMainWindow):
             'By Timeframe lists each TF three times (best / candle-bias / worst) — do not add those rows. '
             '30m often has more skips than 1h because signals are denser while a trade is still open.'
             '<br><b>By Session</b>: Asian 00:00–07:59 · London 08:00–15:59 · US 16:00–23:59 '
-            f'({sessions.BROKER_TIME_LABEL}, entry bar). Filter sessions on the Timeframes tab. '
+            f'({sessions.BROKER_TIME_LABEL} or IST — Timeframes tab). Filter sessions / IST window there. '
             'Session <b>Net PnL / wins / losses</b> sum to Overall; session Max DD and Return % are '
             '<b>as if that session alone</b> (not additive across sessions).'
         )
@@ -6430,18 +6586,49 @@ class BacktestDashboard(QMainWindow):
         trades_layout = QVBoxLayout(trades_tab)
         trades_hint = QLabel(
             "Individual trades from the last run. Row color: "
-            "<b>green</b> = BUY, <b>red</b> = SELL, <b>blue</b> = candle-bias exit model."
+            "<b>green</b> = BUY, <b>red</b> = SELL, <b>blue</b> = candle-bias exit model.<br>"
+            "<b>Double-click a row</b> (or select + Inspect) to open a candlestick chart with "
+            "prior bars, signal/entry, and SL / TP / exit markers."
         )
         trades_hint.setTextFormat(Qt.RichText)
         trades_hint.setObjectName("sectionHint")
         trades_hint.setWordWrap(True)
         trades_layout.addWidget(trades_hint)
+
+        trade_filter_row = QHBoxLayout()
+        trade_filter_row.addWidget(QLabel("Exit model:"))
+        self.trade_exit_model_filter = QComboBox()
+        self.trade_exit_model_filter.addItem("Worst case", "worst_case")
+        self.trade_exit_model_filter.addItem("Candle bias", "candle_bias")
+        self.trade_exit_model_filter.addItem("Best case", "best_case")
+        self.trade_exit_model_filter.addItem("All models", "")
+        self.trade_exit_model_filter.setToolTip(
+            "Filter the trade list. Inspect uses the selected row’s exit model."
+        )
+        self.trade_exit_model_filter.currentIndexChanged.connect(self._refresh_trade_ledger_view)
+        trade_filter_row.addWidget(self.trade_exit_model_filter)
+        inspect_btn = QPushButton("Inspect selected trade")
+        inspect_btn.setObjectName("secondaryButton")
+        inspect_btn.setToolTip("Open candlestick chart for the highlighted trade.")
+        inspect_btn.clicked.connect(self._inspect_selected_trade)
+        trade_filter_row.addWidget(inspect_btn)
+        trade_filter_row.addStretch()
+        trades_layout.addLayout(trade_filter_row)
+
         self.trade_ledger_note = QLabel("Run a backtest to populate the trade list.")
         self.trade_ledger_note.setObjectName("sectionHint")
         trades_layout.addWidget(self.trade_ledger_note)
         self.trade_ledger_table = self._make_metrics_table()
+        self.trade_ledger_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.trade_ledger_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.trade_ledger_table.cellDoubleClicked.connect(
+            lambda _r, _c: self._inspect_selected_trade()
+        )
         trades_layout.addWidget(self.trade_ledger_table, 1)
         self.results_tabs.addTab(trades_tab, "Trades")
+        self._trade_ledger_display_df = None
+        self._trade_ledger_full_df = None
+        self.last_backtest_config = None
 
         charts_tab = QWidget()
         charts_outer_layout = QVBoxLayout(charts_tab)
@@ -6886,18 +7073,38 @@ class BacktestDashboard(QMainWindow):
             tf for tf, cb in self.timeframe_enabled_widgets.items() if cb.isChecked()
         ]
         kwargs["timeframes_to_test"] = selected_timeframes
-        kwargs["sessions_enabled"] = [
-            name for name in sessions.SESSION_ORDER
-            if self.session_enabled_widgets.get(name) and self.session_enabled_widgets[name].isChecked()
-        ]
+        tf_kwargs = self._collect_time_filter_kwargs()
+        kwargs["sessions_enabled"] = tf_kwargs["sessions_enabled"]
+        kwargs["session_clock"] = tf_kwargs["session_clock"]
+        kwargs["broker_utc_offset_hours"] = tf_kwargs["broker_utc_offset_hours"]
+        kwargs["ist_time_filter_enabled"] = tf_kwargs["ist_time_filter_enabled"]
+        kwargs["ist_time_start"] = tf_kwargs["ist_time_start"]
+        kwargs["ist_time_end"] = tf_kwargs["ist_time_end"]
         kwargs["output_root"] = DEFAULT_OUTPUT_DIR
         kwargs["run_name"] = f"dashboard_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         kwargs["indicator_stack"] = self._build_indicator_stack()
+
+        # Always store an absolute data_root so CSV discovery does not depend
+        # on the process working directory (restart-only "CSV not found" bug).
+        raw_root = str(kwargs.get("data_root") or DEFAULT_DATA_DIR)
+        resolved_root = backtest.resolve_data_root(raw_root, anchor_dir=APP_DIR)
+        kwargs["data_root"] = resolved_root
+        raw_sym = str(kwargs.get("symbol") or "XAUUSD").strip()
+        kwargs["symbol"] = backtest.resolve_symbol_folder(resolved_root, raw_sym)
 
         cfg = backtest.BacktestConfig(**kwargs)
         sizing_err = backtest.validate_position_sizing_config(cfg)
         if sizing_err:
             raise ValueError(sizing_err)
+
+        # Keep the Run Settings fields in sync with what we will actually use.
+        root_w = self.field_widgets.get("data_root")
+        if isinstance(root_w, QLineEdit) and root_w.text().strip() != resolved_root:
+            root_w.setText(resolved_root)
+        sym_w = self.field_widgets.get("symbol")
+        if isinstance(sym_w, QLineEdit) and kwargs["symbol"] != raw_sym:
+            sym_w.setText(kwargs["symbol"])
+
         return cfg
 
     # ------------------------------------------------------------------
@@ -6918,16 +7125,25 @@ class BacktestDashboard(QMainWindow):
         if not backtest_config.sessions_enabled:
             QMessageBox.warning(
                 self, "No Sessions Selected",
-                "Select at least one trading session on the Timeframes tab (Asian / London / US).",
+                "Select at least one trading session (Asian / London / US), "
+                "or switch to Indian time mode.",
             )
             return
+
+        if (
+            getattr(backtest_config, "ist_time_filter_enabled", False)
+            and self._time_filter_mode() == "ist"
+        ):
+            # basic HH:MM sanity — parse will clamp; empty already defaulted
+            pass
 
         if not os.path.isdir(backtest_config.data_root):
             QMessageBox.critical(
                 self, "Data Folder Not Found",
                 f"Could not find the data folder:\n{backtest_config.data_root}\n\n"
-                f"Make sure a 'data' folder sits in the same location as this application, "
-                f"containing your historical price CSVs."
+                f"Expected an absolute path next to the app (e.g. {DEFAULT_DATA_DIR}).\n"
+                f"Relative paths like 'data' are resolved against the app folder, "
+                f"not whatever folder you launched from."
             )
             return
 
@@ -6940,6 +7156,31 @@ class BacktestDashboard(QMainWindow):
                 self, "Symbol Not Found",
                 f"No data found for symbol '{backtest_config.symbol}' in:\n{symbol_dir}\n\n"
                 f"Symbols available in your data folder: {available_text}"
+            )
+            return
+
+        # Fail early if selected timeframes have no CSVs (clearer than empty results)
+        missing_csv = []
+        for tf_folder in backtest_config.timeframes_to_test:
+            files = backtest.find_csv_files(
+                backtest_config.data_root, backtest_config.symbol, tf_folder,
+            )
+            if not files:
+                missing_csv.append(tf_folder)
+        if missing_csv:
+            example = os.path.join(
+                backtest_config.data_root, backtest_config.symbol,
+                missing_csv[0], "<year>", f"{backtest_config.symbol}_{missing_csv[0]}_YYYY-MM.csv",
+            )
+            QMessageBox.critical(
+                self, "CSV data not found",
+                "No price CSV files found for:\n  • "
+                + "\n  • ".join(missing_csv)
+                + f"\n\nLooking under:\n{backtest_config.data_root}"
+                f"/{backtest_config.symbol}/…\n\n"
+                f"Expected layout like:\n{example}\n\n"
+                "If you just copied CSVs in, click Run again — paths are now "
+                "resolved to the app folder automatically."
             )
             return
 
@@ -6961,6 +7202,7 @@ class BacktestDashboard(QMainWindow):
         self.last_plots_dir = plots_dir
         self.last_tables = tables
         self.last_trade_ledger_path = os.path.join(output_dir, "trade_ledger.csv")
+        self.last_backtest_config = getattr(self._worker, "backtest_config", None)
 
         self._display_metrics(tables)
         self._display_charts(plots_dir)
@@ -7124,8 +7366,14 @@ class BacktestDashboard(QMainWindow):
         table.resizeColumnsToContents()
 
     def _fill_trade_ledger_table(self, df) -> None:
+        self._trade_ledger_full_df = df
+        self._refresh_trade_ledger_view()
+
+    def _refresh_trade_ledger_view(self) -> None:
         table = self.trade_ledger_table
-        if df is None or df.height == 0:
+        df = self._trade_ledger_full_df
+        if df is None or getattr(df, "height", 0) == 0:
+            self._trade_ledger_display_df = None
             table.setRowCount(1)
             table.setColumnCount(1)
             table.setHorizontalHeaderLabels([""])
@@ -7134,19 +7382,101 @@ class BacktestDashboard(QMainWindow):
                 self.trade_ledger_note.setText("No trades were generated.")
             return
 
-        total = df.height
+        model_filter = ""
+        if hasattr(self, "trade_exit_model_filter"):
+            model_filter = self.trade_exit_model_filter.currentData() or ""
+        view = df
+        if model_filter and "exit_model" in df.columns:
+            view = df.filter(pl.col("exit_model") == model_filter)
+
+        total = view.height
         if total > TRADE_LEDGER_DISPLAY_MAX_ROWS:
-            df = df.head(TRADE_LEDGER_DISPLAY_MAX_ROWS)
+            view = view.head(TRADE_LEDGER_DISPLAY_MAX_ROWS)
             note = (
-                f"Showing first {TRADE_LEDGER_DISPLAY_MAX_ROWS:,} of {total:,} trade rows "
-                f"(full list: trade_ledger.csv in the run folder)."
+                f"Showing first {TRADE_LEDGER_DISPLAY_MAX_ROWS:,} of {total:,} rows"
+                f"{' (' + model_filter + ')' if model_filter else ''}. "
+                f"Double-click a row to inspect candlesticks."
             )
         else:
-            note = f"{total:,} trade rows (one row per trade × exit model)."
+            note = (
+                f"{total:,} trade rows"
+                f"{' (' + model_filter + ')' if model_filter else ' (all exit models)'}. "
+                f"Double-click a row to inspect candlesticks."
+            )
         if hasattr(self, "trade_ledger_note"):
-            self.trade_ledger_note.setText(note)
+            cfg = getattr(self, "last_backtest_config", None)
+            if cfg is not None and getattr(cfg, "ist_time_filter_enabled", False):
+                clock_note = (
+                    f" Filtered by Indian time "
+                    f"{getattr(cfg, 'ist_time_start', '')}–{getattr(cfg, 'ist_time_end', '')} IST."
+                )
+            else:
+                clock_note = " Entry Time Ist / Exit Time Ist are Indian clock."
+            self.trade_ledger_note.setText(note + clock_note)
 
-        self._fill_table(table, df, color_rows=True)
+        self._trade_ledger_display_df = view
+        prefer = [
+            "entry_time_ist", "entry_time", "timeframe", "direction", "session", "outcome", "exit_model",
+            "entry_price", "stop_loss", "target", "exit_price", "exit_time_ist", "exit_time",
+            "bars_held", "pnl_usd", "pattern_variant", "risk_usd", "session_clock",
+        ]
+        cols = [c for c in prefer if c in view.columns]
+        cols += [c for c in view.columns if c not in cols]
+        view = view.select(cols)
+
+        table.setColumnCount(len(cols))
+        table.setHorizontalHeaderLabels([c.replace("_", " ").title() for c in cols])
+        table.setRowCount(view.height)
+        for i, row in enumerate(view.iter_rows(named=True)):
+            row_bg = result_tint_for_row(row)
+            for j, col in enumerate(cols):
+                val = row.get(col)
+                if isinstance(val, float):
+                    text = f"{val:,.3f}" if abs(val) < 1000 else f"{val:,.2f}"
+                elif val is None:
+                    text = ""
+                else:
+                    text = str(val)
+                item = _table_item(text, row_bg)
+                if j == 0:
+                    item.setData(Qt.UserRole, dict(row))
+                table.setItem(i, j, item)
+        table.resizeColumnsToContents()
+
+    def _inspect_selected_trade(self) -> None:
+        table = getattr(self, "trade_ledger_table", None)
+        if table is None:
+            return
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "Select a trade",
+                "Click a trade row first, then Inspect — or double-click the row.",
+            )
+            return
+        item = table.item(row, 0)
+        trade = item.data(Qt.UserRole) if item is not None else None
+        if not isinstance(trade, dict):
+            QMessageBox.information(self, "No trade data", "That row has no trade details.")
+            return
+        cfg = self.last_backtest_config
+        if cfg is None:
+            QMessageBox.warning(
+                self, "No run context",
+                "Run a backtest in this session first so the inspector knows the data folder.",
+            )
+            return
+        try:
+            # Prefer indicators from the run; if none were saved/enabled, use
+            # whatever is currently added on the Indicators tab so overlays still show.
+            stack = getattr(cfg, "indicator_stack", None)
+            if stack is None or not stack.enabled_indicator_ids():
+                stack = self._build_indicator_stack()
+            dialog = TradeInspectDialog(self, trade, cfg, indicator_stack=stack)
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Inspect failed", str(e))
+            traceback.print_exc()
 
     def _fill_overall_vertical(self, df) -> None:
         """Same transpose logic as dashboard.py: metric=row, exit_model=column."""
@@ -7201,6 +7531,40 @@ class BacktestDashboard(QMainWindow):
         self._fill_table(self.by_year_table, tables.get("by_year"))
         self._fill_table(self.by_month_table, tables.get("by_month"))
         self._fill_trade_ledger_table(tables.get("ledger"))
+        self._refresh_session_results_legend()
+
+    def _refresh_session_results_legend(self) -> None:
+        if not hasattr(self, "results_color_legend"):
+            return
+        cfg = getattr(self, "last_backtest_config", None)
+        ist_on = bool(getattr(cfg, "ist_time_filter_enabled", False)) if cfg else False
+        if ist_on and cfg is not None:
+            filter_txt = (
+                f"<b>Filter:</b> Indian time "
+                f"{getattr(cfg, 'ist_time_start', '?')}–{getattr(cfg, 'ist_time_end', '?')} IST. "
+                "By Session below is still Asian/London/US on broker clock for breakdown."
+            )
+        else:
+            enabled = getattr(cfg, "sessions_enabled", None) if cfg else None
+            if enabled and set(enabled) != set(sessions.SESSION_ORDER):
+                filter_txt = f"<b>Filter:</b> sessions {', '.join(enabled)} (broker clock)."
+            else:
+                filter_txt = "<b>Filter:</b> all sessions (broker clock)."
+        self.results_color_legend.setText(
+            'Color key: '
+            '<span style="background-color:#D7F5DD; padding:2px 10px; border-radius:4px;">BUY</span> '
+            '<span style="background-color:#FADBD8; padding:2px 10px; border-radius:4px;">SELL</span> '
+            '<span style="background-color:#D2E3FC; padding:2px 10px; border-radius:4px;">Candle bias</span>'
+            '<br>Trade count: <b>Total Trades</b> is WIN + LOSS only. '
+            'Overlap skips are <b>Skipped Overlap</b> (not in Total Trades). '
+            'Taken setups = Total Trades + Skipped Overlap + Still Open. '
+            'By Timeframe lists each TF three times (best / candle-bias / worst) — do not add those rows. '
+            '30m often has more skips than 1h because signals are denser while a trade is still open.'
+            f'<br>{filter_txt} '
+            'Trades tab shows <b>Entry Time Ist</b> / <b>Exit Time Ist</b>. '
+            'Session <b>Net PnL / wins / losses</b> sum to Overall; session Max DD and Return % are '
+            '<b>as if that session alone</b> (not additive across sessions).'
+        )
 
     def _display_charts(self, plots_dir: str):
         while self.charts_layout.count():
@@ -7566,6 +7930,13 @@ class BacktestDashboard(QMainWindow):
                    if name in self.session_enabled_widgets else True)
             for name in sessions.SESSION_ORDER
         }
+        tf = self._collect_time_filter_kwargs()
+        sessions_preset["time_filter_mode"] = tf["time_filter_mode"]
+        sessions_preset["ist_time_start"] = tf["ist_time_start"]
+        sessions_preset["ist_time_end"] = tf["ist_time_end"]
+        sessions_preset["session_clock"] = tf["session_clock"]
+        sessions_preset["ist_time_filter_enabled"] = tf["ist_time_filter_enabled"]
+
         pattern = self.pattern_combo.currentText()
         stack = self._build_indicator_stack()
         return {
@@ -7661,10 +8032,32 @@ class BacktestDashboard(QMainWindow):
             folder = TIMEFRAME_TO_FOLDER.get(tf)
             if folder and folder in self.timeframe_enabled_widgets and "enabled" in cfg:
                 self.timeframe_enabled_widgets[folder].setChecked(bool(cfg["enabled"]))
-        for sess_name, enabled in (data.get("sessions") or {}).items():
+        sess_data = data.get("sessions") or {}
+        for sess_name in sessions.SESSION_ORDER:
+            if sess_name not in sess_data:
+                continue
             cb = self.session_enabled_widgets.get(sess_name)
             if cb is not None:
-                cb.setChecked(bool(enabled))
+                cb.setChecked(bool(sess_data[sess_name]))
+        mode = sess_data.get("time_filter_mode")
+        if mode is None:
+            # Migrate old presets: IST window checkbox → ist mode
+            if sess_data.get("ist_time_filter_enabled"):
+                mode = "ist"
+            elif sess_data.get("session_clock") == sessions.CLOCK_IST:
+                mode = "ist"
+            else:
+                mode = "sessions"
+        if hasattr(self, "time_filter_mode_ist") and hasattr(self, "time_filter_mode_sessions"):
+            if mode == "ist":
+                self.time_filter_mode_ist.setChecked(True)
+            else:
+                self.time_filter_mode_sessions.setChecked(True)
+        if hasattr(self, "ist_time_start_edit") and sess_data.get("ist_time_start"):
+            self.ist_time_start_edit.setText(str(sess_data["ist_time_start"]))
+        if hasattr(self, "ist_time_end_edit") and sess_data.get("ist_time_end"):
+            self.ist_time_end_edit.setText(str(sess_data["ist_time_end"]))
+        self._sync_time_filter_mode_ui()
         for ind_id in list(self.added_indicator_ids):
             self._remove_indicator(ind_id)
         for ind_id in data.get("indicators_added") or []:
@@ -7775,6 +8168,682 @@ class BacktestDashboard(QMainWindow):
             os.system(f'open "{path}"')
         else:
             os.system(f'xdg-open "{path}"')
+
+
+class TradeInspectDialog(QDialog):
+    """Candlestick chart for one backtest trade: prior bars + entry/SL/TP/exit."""
+
+    BARS_BEFORE = 40
+    BARS_AFTER = 25
+    DRAW_PALETTE = (
+        "#F9AB00",  # amber
+        "#1A73E8",  # blue
+        "#34A853",  # green
+        "#EA4335",  # red
+        "#A142F4",  # purple
+        "#E37400",  # orange
+        "#00ACC1",  # cyan
+        "#5F6368",  # gray
+        "#000000",  # black
+        "#FFFFFF",  # white
+    )
+
+    def __init__(self, parent, trade: dict, backtest_config, indicator_stack=None):
+        super().__init__(parent)
+        self.setWindowTitle("Inspect trade — candlesticks")
+        self.resize(1080, 720)
+        self._indicator_stack = indicator_stack
+        if self._indicator_stack is None:
+            self._indicator_stack = getattr(backtest_config, "indicator_stack", None)
+        # If the saved run had no indicators, fall back to the live UI stack.
+        if (
+            self._indicator_stack is None
+            or not getattr(self._indicator_stack, "enabled_indicator_ids", lambda: [])()
+        ):
+            parent_dash = parent
+            if parent_dash is not None and hasattr(parent_dash, "_build_indicator_stack"):
+                ui_stack = parent_dash._build_indicator_stack()
+                if ui_stack.enabled_indicator_ids():
+                    self._indicator_stack = ui_stack
+
+        layout = QVBoxLayout(self)
+
+        summary = QLabel(self._summary_html(trade, backtest_config, self._indicator_stack))
+        summary.setTextFormat(Qt.RichText)
+        summary.setWordWrap(True)
+        summary.setObjectName("sectionHint")
+        layout.addWidget(summary)
+
+        stack = self._indicator_stack
+        ind_bits = []
+        if stack is not None:
+            if getattr(stack.supertrend, "enabled", False):
+                ind_bits.append(
+                    f"<span style='color:#34A853'>━</span>/<span style='color:#EA4335'>━</span> "
+                    f"SuperTrend (ATR {stack.supertrend.atr_period}, ×{stack.supertrend.multiplier:g})"
+                )
+            if getattr(stack.vwap, "enabled", False):
+                ind_bits.append("<span style='color:#1A73E8'>- -</span> VWAP")
+        legend = QLabel(
+            "<span style='color:#188038'>■</span> BUY / green &nbsp; "
+            "<span style='color:#D93025'>■</span> SELL / red &nbsp; "
+            "<span style='background:#FFF2A8; padding:1px 6px;'>signal bar</span> "
+            "(bar before entry) &nbsp; "
+            "<span style='background:#D2E3FC; padding:1px 6px;'>entry bar</span> &nbsp; "
+            "<span style='color:#188038'>— TP</span> &nbsp; "
+            "<span style='color:#D93025'>— SL</span> &nbsp; "
+            "<span style='color:#5F6368'>× exit</span>"
+            + ((" &nbsp; · &nbsp; " + " &nbsp; ".join(ind_bits)) if ind_bits else
+               " &nbsp; · &nbsp; <i>No indicators — add SuperTrend/VWAP on Indicators tab, then Inspect again</i>")
+        )
+        legend.setTextFormat(Qt.RichText)
+        legend.setObjectName("sectionHint")
+        layout.addWidget(legend)
+
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
+            from matplotlib.figure import Figure
+        except ImportError:
+            layout.addWidget(QLabel("matplotlib Qt backend is required to draw the chart."))
+            close = QPushButton("Close")
+            close.clicked.connect(self.accept)
+            layout.addWidget(close)
+            return
+
+        self._ax = None
+        self._canvas = None
+        self._fig = None
+        self._draw_mode = "cursor"
+        self._draw_color = "#F9AB00"
+        self._pending_point = None
+        self._preview_artists = []
+        self._user_drawings = []  # each item: list of matplotlib artists
+        self._crosshair_h = None
+        self._crosshair_v = None
+        self._crosshair_txt = None
+        self._cid_click = self._cid_move = self._cid_key = None
+
+        tools = QHBoxLayout()
+        tools.setSpacing(6)
+        self._draw_hint = QLabel("Tools: pick a draw mode, then click the chart. Esc cancels. ⌫ undoes.")
+        self._draw_hint.setObjectName("sectionHint")
+        tools.addWidget(self._draw_hint, 1)
+
+        self._draw_btn_group = QButtonGroup(self)
+        self._draw_btn_group.setExclusive(True)
+        mode_specs = [
+            ("cursor", "Cursor"),
+            ("hline", "H-Line"),
+            ("vline", "V-Line"),
+            ("trend", "Trendline"),
+            ("ray", "Ray"),
+        ]
+        self._draw_mode_buttons = {}
+        for mode_id, label in mode_specs:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setChecked(mode_id == "cursor")
+            btn.setToolTip({
+                "cursor": "Pan/zoom with toolbar below; hover shows price",
+                "hline": "Click once to place a horizontal price line",
+                "vline": "Click once to place a vertical time line",
+                "trend": "Click two points for a trendline",
+                "ray": "Click two points; line extends across the chart",
+            }[mode_id])
+            self._draw_btn_group.addButton(btn)
+            self._draw_mode_buttons[mode_id] = btn
+            btn.clicked.connect(lambda checked=False, m=mode_id: self._set_draw_mode(m))
+            tools.addWidget(btn)
+
+        undo_btn = QPushButton("Undo")
+        undo_btn.setToolTip("Remove last drawing (Backspace / Delete)")
+        undo_btn.clicked.connect(self._undo_drawing)
+        tools.addWidget(undo_btn)
+        clear_btn = QPushButton("Clear drawings")
+        clear_btn.setToolTip("Remove all user drawings")
+        clear_btn.clicked.connect(self._clear_drawings)
+        tools.addWidget(clear_btn)
+        layout.addLayout(tools)
+
+        # Color palette for new drawings (TradingView-style swatches + custom)
+        color_row = QHBoxLayout()
+        color_row.setSpacing(4)
+        color_lbl = QLabel("Color:")
+        color_lbl.setObjectName("sectionHint")
+        color_row.addWidget(color_lbl)
+        self._color_btn_group = QButtonGroup(self)
+        self._color_btn_group.setExclusive(True)
+        self._color_swatch_buttons = {}
+        for hex_color in self.DRAW_PALETTE:
+            sw = QPushButton()
+            sw.setCheckable(True)
+            sw.setFixedSize(22, 22)
+            sw.setCursor(Qt.PointingHandCursor)
+            sw.setToolTip(hex_color)
+            sw.setStyleSheet(
+                f"QPushButton {{ background-color: {hex_color}; border: 1px solid #5F6368; "
+                f"border-radius: 3px; }}"
+                f"QPushButton:checked {{ border: 2px solid #202124; }}"
+            )
+            sw.setChecked(hex_color.upper() == self._draw_color.upper())
+            self._color_btn_group.addButton(sw)
+            self._color_swatch_buttons[hex_color] = sw
+            sw.clicked.connect(lambda checked=False, c=hex_color: self._set_draw_color(c))
+            color_row.addWidget(sw)
+
+        self._color_preview = QPushButton()
+        self._color_preview.setFixedSize(28, 22)
+        self._color_preview.setToolTip("Current draw color — click for full palette")
+        self._color_preview.setCursor(Qt.PointingHandCursor)
+        self._color_preview.clicked.connect(self._pick_custom_color)
+        color_row.addWidget(self._color_preview)
+        custom_btn = QPushButton("Custom…")
+        custom_btn.setToolTip("Open full color picker")
+        custom_btn.clicked.connect(self._pick_custom_color)
+        color_row.addWidget(custom_btn)
+        color_row.addStretch(1)
+        layout.addLayout(color_row)
+        self._refresh_color_preview()
+
+        self._coord_label = QLabel("—")
+        self._coord_label.setObjectName("sectionHint")
+        layout.addWidget(self._coord_label)
+
+        fig = Figure(figsize=(10.5, 5.4), dpi=110)
+        canvas = FigureCanvasQTAgg(fig)
+        canvas.setFocusPolicy(Qt.StrongFocus)
+        self._fig = fig
+        self._canvas = canvas
+        layout.addWidget(canvas, 1)
+        self._nav = NavigationToolbar2QT(canvas, self)
+        layout.addWidget(self._nav)
+        self._draw_chart(fig, trade, backtest_config)
+        canvas.draw()
+        self._install_draw_events()
+
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        layout.addWidget(close)
+
+    @staticmethod
+    def _summary_html(trade: dict, cfg=None, stack=None) -> str:
+        def fmt(v, money=False):
+            if v is None:
+                return "—"
+            if money and isinstance(v, (int, float)):
+                return f"{float(v):,.2f}"
+            return str(v)
+
+        ind_note = ""
+        if stack is None and cfg is not None:
+            stack = getattr(cfg, "indicator_stack", None)
+        if stack is not None:
+            parts = []
+            if getattr(stack.supertrend, "enabled", False):
+                filt = "filter ON" if stack.supertrend.apply_trade_filter else "filter OFF"
+                parts.append(f"SuperTrend ({filt})")
+            if getattr(stack.vwap, "enabled", False):
+                filt = "filter ON" if stack.vwap.apply_trade_filter else "filter OFF"
+                parts.append(f"VWAP ({filt})")
+            if parts:
+                ind_note = " · indicators: " + ", ".join(parts)
+
+        return (
+            f"<b>{fmt(trade.get('direction'))}</b> · {fmt(trade.get('timeframe'))} · "
+            f"session <b>{fmt(trade.get('session'))}</b> · "
+            f"{fmt(trade.get('exit_model'))} · outcome <b>{fmt(trade.get('outcome'))}</b>"
+            f"{ind_note}<br>"
+            f"Entry {fmt(trade.get('entry_time'))} @ {fmt(trade.get('entry_price'), True)} · "
+            f"SL {fmt(trade.get('stop_loss'), True)} · TP {fmt(trade.get('target'), True)} · "
+            f"Exit {fmt(trade.get('exit_time'))} @ {fmt(trade.get('exit_price'), True)} · "
+            f"PnL {fmt(trade.get('pnl_usd'), True)} · bars {fmt(trade.get('bars_held'))} · "
+            f"variant {fmt(trade.get('pattern_variant'))}"
+        )
+
+    def _draw_chart(self, fig, trade: dict, cfg) -> None:
+        import numpy as np
+        from matplotlib.patches import Rectangle
+        from indicators.supertrend import compute_supertrend
+        from indicators.vwap import compute_vwap
+
+        ax = fig.add_subplot(111)
+        self._ax = ax
+        tf_folder = self._resolve_timeframe_folder(trade.get("timeframe"))
+        entry_time = trade.get("entry_time")
+        if entry_time is None:
+            ax.text(0.5, 0.5, "No entry_time on this trade.", ha="center", va="center")
+            ax.axis("off")
+            return
+        if isinstance(entry_time, str):
+            entry_time = datetime.fromisoformat(entry_time.replace("Z", ""))
+
+        df = backtest.load_candles_df(
+            cfg.data_root, cfg.symbol, tf_folder,
+            getattr(cfg, "start_date", None), getattr(cfg, "end_date", None),
+        )
+        if df.height == 0:
+            ax.text(0.5, 0.5, f"No candles for {cfg.symbol}/{tf_folder}", ha="center", va="center")
+            ax.axis("off")
+            return
+
+        times = df["datetime"].to_list()
+        # Find entry bar index (nearest at/after entry_time)
+        entry_idx = None
+        for i, ts in enumerate(times):
+            if ts == entry_time or (ts is not None and ts >= entry_time):
+                entry_idx = i
+                break
+        if entry_idx is None:
+            entry_idx = len(times) - 1
+
+        signal_idx = max(0, entry_idx - 1)
+        bars_held = trade.get("bars_held") or 0
+        try:
+            bars_held = int(bars_held)
+        except (TypeError, ValueError):
+            bars_held = 0
+        start = max(0, signal_idx - self.BARS_BEFORE)
+        end = min(len(times), entry_idx + max(self.BARS_AFTER, bars_held + 3) + 1)
+        window = df.slice(start, end - start)
+        if window.height == 0:
+            ax.text(0.5, 0.5, "Empty candle window.", ha="center", va="center")
+            ax.axis("off")
+            return
+
+        # Compute indicators on the FULL series (ATR / session VWAP need history),
+        # then slice to the visible window so lines match the backtest filters.
+        stack = self._indicator_stack
+        show_st = bool(stack and getattr(stack.supertrend, "enabled", False))
+        show_vwap = bool(stack and getattr(stack.vwap, "enabled", False))
+        st_win = dir_win = vwap_win = None
+        if show_st or show_vwap:
+            high_all = df["high"].to_numpy()
+            low_all = df["low"].to_numpy()
+            close_all = df["close"].to_numpy()
+            vol_all = df["volume"].to_numpy() if "volume" in df.columns else None
+            if show_st:
+                st_line, st_dir = compute_supertrend(
+                    high_all, low_all, close_all,
+                    atr_period=int(stack.supertrend.atr_period),
+                    multiplier=float(stack.supertrend.multiplier),
+                )
+                st_win = st_line[start:end]
+                dir_win = st_dir[start:end]
+            if show_vwap:
+                vwap_all = compute_vwap(high_all, low_all, close_all, vol_all, timestamps=times)
+                vwap_win = vwap_all[start:end]
+
+        w_times = window["datetime"].to_list()
+        opens = window["open"].to_list()
+        highs = window["high"].to_list()
+        lows = window["low"].to_list()
+        closes = window["close"].to_list()
+        x = list(range(len(w_times)))
+
+        local_signal = signal_idx - start
+        local_entry = entry_idx - start
+
+        for i in x:
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            up = c >= o
+            color = "#188038" if up else "#D93025"
+            ax.vlines(i, l, h, color=color, linewidth=1.0, zorder=2)
+            body_bottom = min(o, c)
+            body_h = max(abs(c - o), (max(highs) - min(lows)) * 0.001)
+            face = "#188038" if up else "#D93025"
+            ax.add_patch(Rectangle(
+                (i - 0.35, body_bottom), 0.7, body_h,
+                facecolor=face, edgecolor=face, linewidth=0.6, zorder=3,
+            ))
+
+        # SuperTrend: green = bullish, red = bearish (same as filter engine)
+        st_plotted = False
+        if st_win is not None and len(st_win) == len(x):
+            st_label_used = False
+            for i in range(len(x) - 1):
+                a, b = st_win[i], st_win[i + 1]
+                if a != a or b != b:  # NaN
+                    continue
+                bull = int(dir_win[i]) >= 0 if dir_win is not None else True
+                col = "#34A853" if bull else "#EA4335"
+                lbl = None
+                if not st_label_used:
+                    lbl = "SuperTrend"
+                    st_label_used = True
+                ax.plot([i, i + 1], [a, b], color=col, linewidth=2.2, zorder=6, label=lbl)
+                st_plotted = True
+
+        vwap_plotted = False
+        if vwap_win is not None and len(vwap_win) == len(x):
+            ys = [float(v) if v == v else np.nan for v in vwap_win]
+            if any(v == v for v in ys):
+                ax.plot(x, ys, color="#1A73E8", linewidth=2.0, linestyle="--", zorder=6, label="VWAP")
+                vwap_plotted = True
+
+        # Highlight signal (pattern) bar and entry bar
+        y_vals = list(lows) + list(highs)
+        if st_win is not None:
+            y_vals.extend([float(v) for v in st_win if v == v])
+        if vwap_win is not None:
+            y_vals.extend([float(v) for v in vwap_win if v == v])
+        y0, y1 = min(y_vals), max(y_vals)
+        pad = (y1 - y0) * 0.04 if y1 > y0 else 1.0
+        if 0 <= local_signal < len(x):
+            ax.axvspan(local_signal - 0.45, local_signal + 0.45, color="#FFF2A8", alpha=0.55, zorder=1)
+            ax.text(local_signal, y1 + pad * 0.2, "signal", ha="center", fontsize=8, color="#B06000")
+        if 0 <= local_entry < len(x):
+            ax.axvspan(local_entry - 0.45, local_entry + 0.45, color="#D2E3FC", alpha=0.55, zorder=1)
+            ax.text(local_entry, y1 + pad * 0.55, "entry", ha="center", fontsize=8, color="#1967D2")
+
+        sl = trade.get("stop_loss")
+        tp = trade.get("target")
+        entry_px = trade.get("entry_price")
+        if entry_px is not None:
+            ax.axhline(float(entry_px), color="#1967D2", linewidth=1.1, linestyle="--", label="Entry", zorder=5)
+        if sl is not None:
+            ax.axhline(float(sl), color="#D93025", linewidth=1.2, linestyle="-", label="SL", zorder=5)
+        if tp is not None:
+            ax.axhline(float(tp), color="#188038", linewidth=1.2, linestyle="-", label="TP", zorder=5)
+
+        exit_time = trade.get("exit_time")
+        exit_price = trade.get("exit_price")
+        if exit_time is not None and exit_price is not None:
+            if isinstance(exit_time, str):
+                try:
+                    exit_time = datetime.fromisoformat(exit_time.replace("Z", ""))
+                except ValueError:
+                    exit_time = None
+            if exit_time is not None:
+                for i, ts in enumerate(w_times):
+                    if ts == exit_time or (ts is not None and ts >= exit_time):
+                        ax.scatter([i], [float(exit_price)], marker="X", s=80, color="#5F6368",
+                                   zorder=7, label="Exit")
+                        break
+
+        # Tick labels: sparse timestamps
+        step = max(1, len(x) // 8)
+        ax.set_xticks(x[::step])
+        ax.set_xticklabels(
+            [ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts) for ts in w_times[::step]],
+            rotation=25, ha="right", fontsize=8,
+        )
+        ax.set_xlim(-1, len(x))
+        ax.set_ylim(y0 - pad, y1 + pad * 1.8)
+        ax.set_ylabel("Price")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+        direction = trade.get("direction") or ""
+        ind_title = []
+        if show_st:
+            ind_title.append("ST" + ("✓" if st_plotted else "?"))
+        if show_vwap:
+            ind_title.append("VWAP" + ("✓" if vwap_plotted else "?"))
+        ind_sfx = (" + " + "/".join(ind_title)) if ind_title else ""
+        ax.set_title(
+            f"{cfg.symbol} {tf_folder} — {direction} — prior + signal + exit{ind_sfx}",
+            fontsize=11,
+        )
+        fig.tight_layout()
+
+    def _draw_pen_color(self) -> str:
+        return getattr(self, "_draw_color", "#F9AB00") or "#F9AB00"
+
+    def _refresh_color_preview(self) -> None:
+        c = self._draw_pen_color()
+        if hasattr(self, "_color_preview"):
+            border = "#5F6368" if c.upper() in ("#FFFFFF", "#FFF") else "#202124"
+            self._color_preview.setStyleSheet(
+                f"QPushButton {{ background-color: {c}; border: 2px solid {border}; "
+                f"border-radius: 3px; }}"
+            )
+            self._color_preview.setToolTip(f"Current color {c} — click for full palette")
+
+    def _set_draw_color(self, hex_color: str) -> None:
+        if not hex_color:
+            return
+        if not str(hex_color).startswith("#"):
+            hex_color = "#" + str(hex_color)
+        self._draw_color = str(hex_color).upper()
+        # Sync swatch checked state (custom colors may not be in palette)
+        matched = False
+        for c, btn in getattr(self, "_color_swatch_buttons", {}).items():
+            on = c.upper() == self._draw_color
+            btn.setChecked(on)
+            matched = matched or on
+        if not matched:
+            for btn in getattr(self, "_color_swatch_buttons", {}).values():
+                btn.setChecked(False)
+        self._refresh_color_preview()
+
+    def _pick_custom_color(self) -> None:
+        initial = QColor(self._draw_pen_color())
+        chosen = QColorDialog.getColor(initial, self, "Drawing color")
+        if chosen.isValid():
+            self._set_draw_color(chosen.name())
+
+    def _set_draw_mode(self, mode: str) -> None:
+        self._draw_mode = mode
+        self._cancel_pending()
+        hints = {
+            "cursor": "Cursor: hover for price · use toolbar to pan/zoom",
+            "hline": "H-Line: click once on the chart to place a horizontal line",
+            "vline": "V-Line: click once to place a vertical line",
+            "trend": "Trendline: click start point, then end point",
+            "ray": "Ray: click start, then direction — extends across the chart",
+        }
+        if hasattr(self, "_draw_hint"):
+            self._draw_hint.setText(hints.get(mode, ""))
+        if self._canvas is not None:
+            self._canvas.setCursor(Qt.CrossCursor if mode != "cursor" else Qt.ArrowCursor)
+            self._canvas.setFocus()
+
+    def _install_draw_events(self) -> None:
+        if self._canvas is None or self._ax is None:
+            return
+        self._cid_click = self._canvas.mpl_connect("button_press_event", self._on_draw_click)
+        self._cid_move = self._canvas.mpl_connect("motion_notify_event", self._on_draw_move)
+        self._cid_key = self._canvas.mpl_connect("key_press_event", self._on_draw_key)
+        self._canvas.setFocus()
+
+    def _data_xy(self, event):
+        if event is None or event.inaxes is not self._ax:
+            return None
+        if event.xdata is None or event.ydata is None:
+            return None
+        return float(event.xdata), float(event.ydata)
+
+    def _clear_preview(self) -> None:
+        for art in self._preview_artists:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        self._preview_artists = []
+
+    def _cancel_pending(self) -> None:
+        self._pending_point = None
+        self._clear_preview()
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _on_draw_key(self, event) -> None:
+        key = (event.key or "").lower()
+        if key == "escape":
+            self._cancel_pending()
+            if "cursor" in self._draw_mode_buttons:
+                self._draw_mode_buttons["cursor"].setChecked(True)
+            self._set_draw_mode("cursor")
+        elif key in ("backspace", "delete"):
+            self._undo_drawing()
+
+    def _on_draw_move(self, event) -> None:
+        xy = self._data_xy(event)
+        if xy is None:
+            return
+        x, y = xy
+        if hasattr(self, "_coord_label"):
+            self._coord_label.setText(f"Bar ≈ {x:.1f}   Price {y:,.2f}")
+
+        # Crosshair
+        if self._ax is not None:
+            if self._crosshair_h is None:
+                self._crosshair_h = self._ax.axhline(
+                    y, color="#9AA0A6", linewidth=0.7, linestyle=":", alpha=0.85, zorder=20,
+                )
+                self._crosshair_v = self._ax.axvline(
+                    x, color="#9AA0A6", linewidth=0.7, linestyle=":", alpha=0.85, zorder=20,
+                )
+            else:
+                self._crosshair_h.set_ydata([y, y])
+                self._crosshair_v.set_xdata([x, x])
+
+        # Live preview for 2-click tools
+        pen = self._draw_pen_color()
+        if self._pending_point is not None and self._draw_mode in ("trend", "ray"):
+            self._clear_preview()
+            x0, y0 = self._pending_point
+            if self._draw_mode == "trend":
+                (ln,) = self._ax.plot(
+                    [x0, x], [y0, y], color=pen, linewidth=1.4, linestyle="--",
+                    alpha=0.8, zorder=19,
+                )
+                self._preview_artists.append(ln)
+            else:
+                xs, ys = self._extend_ray(x0, y0, x, y)
+                (ln,) = self._ax.plot(
+                    xs, ys, color=pen, linewidth=1.4, linestyle="--",
+                    alpha=0.8, zorder=19,
+                )
+                self._preview_artists.append(ln)
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _on_draw_click(self, event) -> None:
+        if event.button != 1:
+            return
+        # Don't draw while using nav pan/zoom tools
+        if getattr(self, "_nav", None) is not None:
+            mode = getattr(self._nav, "mode", "")
+            if mode:
+                return
+        if self._draw_mode == "cursor":
+            return
+        xy = self._data_xy(event)
+        if xy is None:
+            return
+        x, y = xy
+        pen = self._draw_pen_color()
+
+        if self._draw_mode == "hline":
+            self._add_hline(y)
+            return
+        if self._draw_mode == "vline":
+            self._add_vline(x)
+            return
+        if self._draw_mode in ("trend", "ray"):
+            if self._pending_point is None:
+                self._pending_point = (x, y)
+                (mk,) = self._ax.plot(
+                    [x], [y], marker="o", markersize=5, color=pen, zorder=19,
+                )
+                self._preview_artists.append(mk)
+                self._canvas.draw_idle()
+                if hasattr(self, "_draw_hint"):
+                    self._draw_hint.setText("Click the second point… (Esc to cancel)")
+            else:
+                x0, y0 = self._pending_point
+                if self._draw_mode == "trend":
+                    self._add_trendline(x0, y0, x, y)
+                else:
+                    self._add_ray(x0, y0, x, y)
+                self._cancel_pending()
+                if hasattr(self, "_draw_hint"):
+                    self._draw_hint.setText(
+                        "Trendline: click start, then end"
+                        if self._draw_mode == "trend"
+                        else "Ray: click start, then direction — extends across the chart"
+                    )
+
+    def _extend_ray(self, x0, y0, x1, y1):
+        """Extend segment through axes limits (TradingView-style ray both ways)."""
+        xlim = self._ax.get_xlim()
+        ylim = self._ax.get_ylim()
+        dx = x1 - x0
+        dy = y1 - y0
+        if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+            return [x0, x1], [y0, y1]
+        if abs(dx) < 1e-12:
+            return [x0, x0], [ylim[0], ylim[1]]
+        m = dy / dx
+        b = y0 - m * x0
+        xs = [xlim[0], xlim[1]]
+        ys = [m * xs[0] + b, m * xs[1] + b]
+        return xs, ys
+
+    def _commit_artists(self, artists, note: str = "") -> None:
+        self._user_drawings.append(artists)
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+        if note and hasattr(self, "_coord_label"):
+            self._coord_label.setText(note)
+
+    def _add_hline(self, y: float) -> None:
+        pen = self._draw_pen_color()
+        ln = self._ax.axhline(y, color=pen, linewidth=1.5, linestyle="-", zorder=18)
+        txt = self._ax.text(
+            self._ax.get_xlim()[1], y, f"  {y:,.2f}",
+            color=pen, fontsize=8, va="center", ha="left", zorder=18,
+            clip_on=False,
+        )
+        self._commit_artists([ln, txt], f"H-Line @ {y:,.2f}")
+
+    def _add_vline(self, x: float) -> None:
+        pen = self._draw_pen_color()
+        ln = self._ax.axvline(x, color=pen, linewidth=1.3, linestyle="--", zorder=18)
+        self._commit_artists([ln], f"V-Line @ bar {x:.1f}")
+
+    def _add_trendline(self, x0, y0, x1, y1) -> None:
+        pen = self._draw_pen_color()
+        (ln,) = self._ax.plot(
+            [x0, x1], [y0, y1], color=pen, linewidth=1.8, zorder=18,
+        )
+        (a,) = self._ax.plot([x0], [y0], marker="o", markersize=4, color=pen, zorder=18)
+        (b,) = self._ax.plot([x1], [y1], marker="o", markersize=4, color=pen, zorder=18)
+        self._commit_artists([ln, a, b], f"Trendline {y0:,.2f} → {y1:,.2f}")
+
+    def _add_ray(self, x0, y0, x1, y1) -> None:
+        pen = self._draw_pen_color()
+        xs, ys = self._extend_ray(x0, y0, x1, y1)
+        (ln,) = self._ax.plot(xs, ys, color=pen, linewidth=1.6, zorder=18)
+        (a,) = self._ax.plot([x0], [y0], marker="o", markersize=4, color=pen, zorder=18)
+        (b,) = self._ax.plot([x1], [y1], marker="o", markersize=4, color=pen, zorder=18)
+        self._commit_artists([ln, a, b], f"Ray {y0:,.2f} → {y1:,.2f}")
+
+    def _undo_drawing(self) -> None:
+        if not self._user_drawings:
+            return
+        arts = self._user_drawings.pop()
+        for art in arts:
+            try:
+                art.remove()
+            except Exception:
+                pass
+        if self._canvas is not None:
+            self._canvas.draw_idle()
+
+    def _clear_drawings(self) -> None:
+        self._cancel_pending()
+        while self._user_drawings:
+            self._undo_drawing()
+
+    @staticmethod
+    def _resolve_timeframe_folder(raw) -> str:
+        if not raw:
+            return "1hour"
+        s = str(raw)
+        reverse = {v: v for v in TIMEFRAME_TO_FOLDER.values()}
+        reverse.update(TIMEFRAME_TO_FOLDER)
+        return reverse.get(s, s)
 
 
 class ClickableImageLabel(QLabel):

@@ -3,17 +3,20 @@ hammer_context_logic.py
 ========================
 Multi-candle hammer context pattern (separate from single-candle Hammer in logic.py).
 
-BUY setup:
-    Signal bar = classic hammer (long lower wick) that closes GREEN,
-    unless buy_require_wick is False — then any GREEN candle whose body
-    is at most Body % of the range (wick up/down ignored; color still required).
+BUY setup (wick on):
+    Signal bar = classic hammer (long lower wick) that closes GREEN.
     Prior N candles: every close must be >= signal low.
 
-SELL setup:
-    Signal bar = inverted hammer (long upper wick) that closes RED,
-    unless sell_require_wick is False — then any RED candle whose body
-    is at most Body % of the range (wick up/down ignored; color still required).
+SELL setup (wick on):
+    Signal bar = inverted hammer (long upper wick) that closes RED.
     Prior N candles: every close must be <= signal high.
+
+When wick is OFF (body-only):
+    Signal bar color does NOT matter — only body ≤ Body % of range
+    (wick up/down ignored). Direction comes from the IMMEDIATE previous candle:
+        previous RED   → signal bar → BUY
+        previous GREEN → signal bar → SELL
+    Prior N close context vs signal low/high still applies when lookback > 0.
 
 Entry / SL / TP reuse logic.py helpers. BUY uses classic entry+SL fields;
 SELL uses inverted entry+SL fields.
@@ -34,7 +37,8 @@ class HammerContextConfig:
     lookback_candles: int = 5
     enable_buy: bool = True
     enable_sell: bool = True
-    # When False, that side matches on body % + color only (wick up/down ignored).
+    # When False, that side matches on body % only (wick + signal color ignored);
+    # direction uses the previous candle color (red→BUY, green→SELL).
     buy_require_wick: bool = True
     sell_require_wick: bool = True
 
@@ -159,12 +163,30 @@ def body_only_ok(
     ratios: logic.HammerRatioConfig,
     min_range: float = 1e-9,
 ) -> Tuple[bool, str]:
-    """Legal when body % of range is at most Body % (wick ignored; color checked separately)."""
+    """Legal when body % of range is at most Body % (wick and signal color ignored)."""
     actual = body_pct_of_candle(candle, min_range)
     cap = body_only_max_pct(ratios)
     if actual > cap:
         return False, f"Body {actual:.1f}% above max {cap:g}%"
     return True, ""
+
+
+def previous_candle_direction(
+    candles: List[logic.Candle],
+    signal_index: int,
+) -> Tuple[Optional[logic.TradeDirection], str]:
+    """
+    Wick-off direction: previous candle RED → BUY, GREEN → SELL.
+    Signal candle color is ignored.
+    """
+    if signal_index < 1:
+        return None, "Need previous candle for direction (wick off)"
+    prev = candles[signal_index - 1]
+    if prev.is_red:
+        return logic.TradeDirection.BUY, ""
+    if prev.is_green:
+        return logic.TradeDirection.SELL, ""
+    return None, "Previous candle has no color (doji) — wick-off needs red→BUY or green→SELL"
 
 
 def describe_hammer_context_rules(config: HammerContextConfig) -> str:
@@ -183,8 +205,8 @@ def describe_hammer_context_rules(config: HammerContextConfig) -> str:
         else:
             buy_hi = body_only_max_pct(config.buy_hammer_ratios)
             buy_shape = (
-                f"green candle, body ≤ {buy_hi:g}% "
-                f"(rest is wick; upper/lower ignored)"
+                f"body ≤ {buy_hi:g}% (signal color ignored; prev red → BUY; "
+                f"wick upper/lower ignored)"
             )
         parts.append(f"BUY: {buy_shape} + {buy_ctx}")
     if config.enable_sell:
@@ -193,8 +215,8 @@ def describe_hammer_context_rules(config: HammerContextConfig) -> str:
         else:
             sell_hi = body_only_max_pct(config.sell_hammer_ratios)
             sell_shape = (
-                f"red candle, body ≤ {sell_hi:g}% "
-                f"(rest is wick; upper/lower ignored)"
+                f"body ≤ {sell_hi:g}% (signal color ignored; prev green → SELL; "
+                f"wick upper/lower ignored)"
             )
         parts.append(f"SELL: {sell_shape} + {sell_ctx}")
     note = " | ".join(parts) if parts else "Both BUY and SELL setups disabled"
@@ -275,8 +297,9 @@ def detect_buy_setup(
         return f"Need {lookback} candles before signal bar"
     signal = candles[signal_index]
     if not config.buy_require_wick:
-        if not signal.is_green:
-            return "Not a green candle"
+        direction, dir_msg = previous_candle_direction(candles, signal_index)
+        if direction != logic.TradeDirection.BUY:
+            return dir_msg or "Previous candle is not red (wick-off BUY needs prev red)"
         ok_body, msg = body_only_ok(
             signal, config.buy_hammer_ratios, config.min_range,
         )
@@ -306,8 +329,9 @@ def detect_sell_setup(
         return f"Need {lookback} candles before signal bar"
     signal = candles[signal_index]
     if not config.sell_require_wick:
-        if not signal.is_red:
-            return "Not a red candle"
+        direction, dir_msg = previous_candle_direction(candles, signal_index)
+        if direction != logic.TradeDirection.SELL:
+            return dir_msg or "Previous candle is not green (wick-off SELL needs prev green)"
         ok_body, msg = body_only_ok(
             signal, config.sell_hammer_ratios, config.min_range,
         )

@@ -110,3 +110,61 @@ def test_backtest_session_filter_skips_disabled_session():
     assert session_ignored, "Expected some signals skipped by session filter"
     for sig in session_ignored:
         assert sessions.classify_session(sig.entry_candle.timestamp) != sessions.SESSION_LONDON
+
+
+def test_broker_to_ist_winter_and_summer():
+    # Broker 10:00 GMT+2 → IST 13:30
+    broker = datetime(2026, 1, 15, 10, 0, 0)
+    ist = sessions.broker_to_ist(broker, sessions.BROKER_UTC_OFFSET_WINTER)
+    assert ist.hour == 13 and ist.minute == 30
+    # Broker 10:00 GMT+3 → IST 12:30
+    ist_s = sessions.broker_to_ist(broker, sessions.BROKER_UTC_OFFSET_SUMMER)
+    assert ist_s.hour == 12 and ist_s.minute == 30
+
+
+def test_ic_markets_offset_auto_from_date():
+    # US DST 2026: 2nd Sunday March = Mar 8 → 1st Sunday Nov = Nov 1
+    assert sessions.ic_markets_utc_offset_hours(datetime(2026, 1, 15)) == 2.0
+    assert sessions.ic_markets_utc_offset_hours(datetime(2026, 3, 7)) == 2.0
+    assert sessions.ic_markets_utc_offset_hours(datetime(2026, 3, 8)) == 3.0
+    assert sessions.ic_markets_utc_offset_hours(datetime(2026, 7, 1)) == 3.0
+    assert sessions.ic_markets_utc_offset_hours(datetime(2026, 11, 1)) == 2.0
+    # Auto broker_to_ist (None): Jan 10:00 → 13:30 IST; Jul 10:00 → 12:30 IST
+    jan = sessions.broker_to_ist(datetime(2026, 1, 15, 10, 0, 0), None)
+    jul = sessions.broker_to_ist(datetime(2026, 7, 1, 10, 0, 0), None)
+    assert jan.hour == 13 and jan.minute == 30
+    assert jul.hour == 12 and jul.minute == 30
+
+
+def test_classify_session_ist_clock():
+    # Broker 06:00 winter (+2) → IST 09:30 → London bucket on IST clock
+    broker = datetime(2026, 1, 15, 6, 0, 0)
+    assert sessions.classify_session(broker, clock="broker") == sessions.SESSION_ASIAN
+    assert sessions.classify_session(
+        broker, clock="ist", broker_utc_offset_hours=2.0,
+    ) == sessions.SESSION_LONDON
+
+
+def test_ist_time_window_and_overnight():
+    broker = datetime(2026, 1, 15, 6, 0, 0)  # → 09:30 IST winter
+    assert sessions.in_time_window(
+        broker, "09:15", "15:30", clock="ist", broker_utc_offset_hours=2.0,
+    )
+    assert not sessions.in_time_window(
+        broker, "10:00", "15:30", clock="ist", broker_utc_offset_hours=2.0,
+    )
+    # Overnight: 22:00–06:00 IST — 09:30 should fail
+    assert not sessions.in_time_window(
+        broker, "22:00", "06:00", clock="ist", broker_utc_offset_hours=2.0,
+    )
+    late = datetime(2026, 1, 15, 18, 0, 0)  # → 21:30 IST winter — still before 22
+    assert not sessions.in_time_window(
+        late, "22:00", "06:00", clock="ist", broker_utc_offset_hours=2.0,
+    )
+    later = datetime(2026, 1, 15, 19, 0, 0)  # → 22:30 IST
+    assert sessions.in_time_window(
+        later, "22:00", "06:00", clock="ist", broker_utc_offset_hours=2.0,
+    )
+    # Auto summer: broker 07:00 Jul → 09:30 IST (GMT+3)
+    summer = datetime(2026, 7, 1, 7, 0, 0)
+    assert sessions.in_time_window(summer, "09:15", "15:30", clock="ist")

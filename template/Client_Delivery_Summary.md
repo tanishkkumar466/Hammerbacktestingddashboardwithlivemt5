@@ -1,9 +1,10 @@
-# Hammer Candle Backtest Dashboard — Delivery Summary
+# Hammer Candle Backtest Dashboard — Client Delivery Summary
 
-> **Share with client:** Edit and send **`Client_Delivery_Summary.txt`** (plain text — opens in Word, Google Docs, email). This `.md` file is the same content in Markdown for repo viewing.
+> **Share with client:** Send **`Client_Delivery_Summary.txt`** (plain text — opens in Word, Google Docs, email). This `.md` file mirrors that document for the repo.
 
-**Project:** Hammer / Doji Candle Backtest Dashboard (XAUUSD) + Live Trading (MT5)  
-**Version:** 1.2 (session analytics, fixed SL, expanded run history)  
+**Project:** Hammer Candle Backtest Dashboard (XAUUSD) + Live Trading (MT5)  
+**Version:** 1.2  
+**Build focus:** Session analytics · Fixed stop loss · Expanded run history · Hammer with candles  
 **Document date:** 20 August 2026  
 
 **Prepared for:** _______________________________  
@@ -14,169 +15,113 @@
 
 ## 1. Executive summary
 
-This document summarizes the **Hammer Candle Backtest Dashboard** delivered for candlestick strategy research on historical XAUUSD data, plus an integrated **Live Trading** module for MetaTrader 5 (MT5).
+This document confirms delivery of the **Hammer Candle Backtest Dashboard** for candlestick strategy research on historical XAUUSD data, plus an integrated **Live Trading** module for MetaTrader 5 (MT5).
 
-The application provides a modern desktop interface (PySide6/Qt), live visual previews of pattern rules, configurable backtests, metrics and charts, run history aligned with your Strategy Configurator workbook schema, optional packaging as a Windows executable, and **live signal polling / optional order execution** using the **same strategy and indicator settings** as backtest.
+**What you receive:**
 
-Work completed across phases includes **full Doji support**, **hammer type and direction controls**, **SuperTrend and VWAP indicators** (extensible), **results UX** (colors, trades, compare, export), **optional JSON presets**, and **live trading** with **client-facing risk limits**, **dry-run default**, and **stability-focused threading** on the live loop.
+- Desktop application (PySide6 / Qt) with parameter tabs, live pattern preview, multi-timeframe backtests, metrics, charts, and run history  
+- Three pattern engines: **Hammer**, **Hammer with candles**, and **Doji**  
+- SuperTrend and VWAP indicator filters (same rules in backtest and live)  
+- Results broken down by timeframe, direction, **session**, year, and month  
+- Optional Windows executable via GitHub Actions packaging  
+- Live MT5 signal polling and optional order execution using the **same strategy settings** as backtest (dry-run default and safety limits)
 
-Saving a “preset” is **optional** (Run Settings). Live orders use **Safety limits on the Live Trading panel only**, not backtest commission/slippage fields.
+Saving a preset is **optional** (Run Settings). Live order risk controls live on the **Live Trading panel only** — not on backtest commission / slippage fields.
 
-**Platform note:** Backtest and UI run on **macOS and Windows**. **MT5 live connection and orders require Windows** with the MT5 terminal and `MetaTrader5` Python package installed.
+**Platform note:** Backtest and UI run on **macOS and Windows**. **MT5 live connection and orders require Windows** with the MT5 terminal and `MetaTrader5` Python package.
 
 ---------------------------------------
 
 ## 2. Scope delivered
 
-### 2.1 Core application (foundation)
+### 2.1 Core application
 
 | Area | Delivered |
 |------|-----------|
-| Desktop dashboard | `dashboard.py` — parameter tabs, dockable panels, menus (View, Live, Run, Help) |
-| Hammer engine | `logic.py` — shape rules, entry/SL/target, direction, classic vs inverted hammer |
-| Doji engine | `doji_logic.py` — styles, direction modes |
-| Backtest engine | `backtest.py` — multi-timeframe runs, three exit models, CSV exports, indicator filters |
-| Charts | `plotting.py` — equity and summary plots |
-| Live trading | `live.py` — poll loop, safety gates, optional orders; `broker.py` — MT5 wrapper |
-| CLI entry | `main.py` — gui / backtest / plots modes |
-| Dependencies | `requirements.txt` (MetaTrader5 / Ray noted as optional for live) |
-| Windows packaging | `.github/workflows/build-windows-exe.yml` + packaging notes; live modules included in build |
+| Desktop dashboard | Parameter tabs, dockable panels, menus (View, Live, Run, Help) |
+| Hammer engine | Shape rules, entry / SL / target, classic vs inverted, direction matrix |
+| Hammer with candles | Prior-N context, separate BUY/SELL body & wick rules, wick on/off |
+| Doji engine | Styles and direction modes (including CANDLE_COLOR) |
+| Backtest engine | Multi-timeframe runs, three exit models, session filter, CSV exports, indicator filters |
+| Charts | Equity, drawdown, session, timeframe, and summary plots |
+| Live trading | Poll loop, safety gates, optional orders (MT5) |
+| CLI entry | GUI / backtest / plots modes |
+| Dependencies | `requirements.txt` |
+| Windows packaging | GitHub Actions workflow + packaging notes |
 | Data layout | Historical CSVs under `data/<symbol>/<timeframe>/` |
-| Client template | `template/Client_Delivery_Summary.md` (this document) |
+| Client document | This delivery summary |
 
-### 2.2 Pattern & preview (UI)
+### 2.2 Patterns and preview
 
-- **Candle pattern selector:** Hammer and Doji with pattern-specific fields shown/hidden automatically.
-- **Pattern preview — Signal Shape:** Live candle drawing from body/wick tolerance settings; loosest/tightest valid shapes.
-- **Pattern preview — Pattern in Context:** Illustrative chart per timeframe with entry, SL, TP, support/resistance; follows Doji style when Doji is selected.
-- **Hammer — Direction tab:** Green/red candle direction; classic vs inverted hammer; allow/block BUY/SELL per type.
-- **Doji — Doji Direction tab:** Doji style and direction mode (including **CANDLE_COLOR**); per-side enable flags.
-- **Body / Wicks tabs:** Separate hammer and doji ratio fields with tooltips.
+- Pattern selector: **Hammer · Hammer with candles · Doji** (fields show/hide automatically)  
+- Signal Shape preview; Pattern in Context charts with entry, SL, TP  
+- Hammer Direction tab; Hammer with candles Context tab (lookback N, separate BUY/SELL, optional wick)  
+- Doji Direction tab; Body / Wicks / Entry-Exit tabs with tooltips  
 
-### 2.3 Timeframes & run configuration
+### 2.3 Timeframes and run settings
 
-- **Combined Timeframes tab:** Per-timeframe **Include in run**, **RR multiple**, **Max SL ($)**, **signal risk filters**, and **trading session checkboxes** (Asian / London / US).
-- **Run Settings tab:** Symbol, data folder, date range, position sizing, overlap, commission, slippage, etc.
-- **Optional saved parameter sets:** Save/load/delete JSON in `presets/` — **not required** to run a backtest or to start live (but recommended to document a approved setup).
+- **Timeframes tab:** include TF, RR, Max SL ($), signal risk filters, **session checkboxes** (Asian / London / US — backtest filter; not live yet)  
+- **Run Settings:** symbol, data folder, date range, sizing, overlap, commission, slippage  
+- Optional JSON presets in `presets/`  
 
-### 2.4 Indicators (SuperTrend & VWAP)
+### 2.4 Indicators (SuperTrend and VWAP)
 
-- **Extensible package:** `indicators/` — config, SuperTrend, VWAP, registry, filter pipeline.
-- **Indicators tab:** Dropdown add; per-indicator settings; **Combine filters (ALL / ANY)** when 2+ indicators active.
-- **Documented filter rules:** View rules / open `indicators/filter.py`.
-- **Backtest & live:** Filters apply to **Hammer and Doji** in backtest and in the **live signal loop** when indicators are enabled.
+- Extensible registry; Indicators tab; ALL / ANY combine mode  
+- Same filters in backtest and live when enabled  
 
-### 2.5 Results & reporting
+### 2.5 Results and reporting
 
-- **Dock:** **Results** panel (F8) — separate from Live Trading.
-- **Metrics:** Overall, By Timeframe, By Direction, **By Session**, **By Year**, **By Month** — **color key:** green = BUY, red = SELL, blue = candle-bias exit model.
-- **Session analytics:** Trades grouped into **Asian / London / US** using **IC Markets MT5 server time** (GMT+2 winter / GMT+3 US daylight saving — same as CSV data). Filter which sessions to include on the **Timeframes** tab.
-- **Fixed stop loss:** Optional **fixed distance from entry** (not only candle low/high) on Entry/Exit tab — Hammer, Hammer with candles, and Doji.
-- **Trades tab:** Trade list from last run (UI row cap; full `trade_ledger.csv` on disk).
-- **Charts tab:** Thumbnails with click-to-zoom.
-- **History tab:** SQLite `run_history.db` with **expanded metrics** and **Backtest_Metrics_Breakdown** (session, timeframe, direction, year, month); double-click to open run folder; **Export to Excel**.
-- **Compare tab:** Two Strategy IDs side-by-side — **overall by exit model** plus **by session (worst case)** for Asian / London / US.
-- **Toolbar:** Open output folder · Open ledger · Export last run metrics · Open charts folder.
+- Metrics: Overall · By Timeframe · By Direction · **By Session** · **By Year** · **By Month**  
+- Colour key: green = BUY · red = SELL · blue = candle-bias  
+- Three exit models: Best case · Candle bias · Worst case  
+- **Sessions (IC Markets MT5 server time):** Asian 00:00–07:59 · London 08:00–15:59 · US 16:00–23:59 (GMT+2 / GMT+3)  
+- Session Net PnL / wins / losses **add to Overall**; session Max DD / Return % are **as if that session alone**  
+- Fixed stop loss from entry (optional) alongside candle-extreme SL  
+- Trades, Charts (incl. session), History (`run_history.db` + breakdown), Compare (overall + by session), Excel export  
 
 ### 2.6 Live trading (MT5)
 
-- **Dock:** **Live Trading** panel (F9) — structured layout: strategy summary, MT5 connection, execution, safety limits, activity log.
-- **Strategy alignment:** Pattern selector (Hammer/Doji) synced with Backtest Parameters; summary shows preset, indicators, chart symbol/timeframe.
-- **Same rules as backtest:** Uses current dashboard config (or loaded preset) for hammer/doji logic and indicator stack.
-- **MT5 connection:** Terminal path (optional), login, password, server; connect/disconnect; demo and **live/real accounts supported**.
-- **Execution fields:** Symbol, timeframe, lot size, magic number, max open positions, poll interval.
-- **Safety limits (enforced on real orders only from this panel):**
-  - Max trades per day  
-  - Max daily loss ($) — **required before live orders** on real accounts  
-  - Cooldown (minutes between trades)  
-  - Max spread (points)  
-  - Max lot cap  
-  - Optional “restrict to demo accounts only”  
-- **Dry run:** Default **on** — logs signals, does not send orders.
-- **Menu — Live → Performance** (advanced, for operator use): dry run toggle, thread pool for signal CPU, optional Ray if installed.
-- **Worker thread:** Live poll loop runs on a **background QThread** so the dashboard UI stays responsive; heartbeat monitoring; consecutive-error stop to avoid runaway loops.
-- **Confirmations:** Warning when turning off dry run; risk validation before sending orders to a live account.
-
-**Client environment for live:**
+- Live panel (F9); pattern synced with backtest (Hammer / Hammer with candles / Doji)  
+- Safety limits: max trades/day, max daily loss ($), cooldown, spread, lot cap, optional demo-only  
+- Dry run default **ON**; background worker; confirmations before live orders  
 
 | Requirement | Notes |
 |-------------|--------|
 | OS | **Windows** for MT5 API |
-| MT5 terminal | Installed and logged in (demo or live) |
+| MT5 terminal | Installed and logged in |
 | Python package | `pip install MetaTrader5` |
-| macOS | Use for backtest/UI development only; connect/start live on Windows |
+| macOS | Backtest / UI only |
 
-### 2.7 Desktop layout & stability
+### 2.7 Layout and packaging
 
-- **Dockable panels:** Backtest Parameters (top), Pattern & Preview (left), Results (F3/F4/F8), Live Trading (F9).
-- **Arrange panels:** Drag title bars to dock side-by-side or **tab** panels together; drag splitters to resize.
-- **F2 — Reset layout:** Restores default panel arrangement if layout looks wrong.
-- **Saved window size:** Main window geometry remembered between sessions.
-- **macOS:** Floating panels in separate windows **disabled** to prevent Qt/AppKit crashes with results tables; tabbing and docking **inside** the main window remain available.
-- **Windows:** Full dock behavior including floatable panels (as in standard Qt apps).
-
-### 2.8 Packaging & operations
-
-- Path anchoring: `data/`, `output/`, `plots/`, `presets/`, `run_history.db` next to app/exe.
-- GitHub Actions: Windows exe build includes dashboard, live, broker modules.
-- Run outputs unchanged for backtest; live writes to MT5 and **Activity log** in the UI.
+- Dockable panels; F2 reset layout; path anchoring for `data/`, `output/`, `plots/`, `presets/`, `run_history.db`  
+- Windows exe via GitHub Actions  
 
 ---------------------------------------
 
 ## 3. Module overview
 
-### Module 1 — Strategy configuration
-
-- Hammer and Doji parameters across Body, Wicks, Direction, Entry/Exit, Risk, Timeframes, Run Settings.
-- Live preview; optional JSON presets.
-
-### Module 2 — Backtest execution
-
-- Multi-timeframe batch runs; three exit models; indicator filters.
-
-### Module 3 — Results & history
-
-- Metrics, trades, charts, history, compare, Excel export, row colors.
-
-### Module 4 — Indicators (extensibility)
-
-- Registry-driven catalog; SuperTrend & VWAP shipped; filter rules documented.
-
-### Module 5 — Live trading (MT5)
-
-- Connect, dry-run/live modes, safety limits, background worker, same strategy as backtest.
+1. **Strategy configuration** — Hammer / Hammer with candles / Doji + presets  
+2. **Backtest** — multi-TF, three exit models, session filter, indicators  
+3. **Results & history** — metrics, charts, compare, Excel  
+4. **Indicators** — SuperTrend & VWAP  
+5. **Live trading** — MT5, dry-run, safety limits  
 
 ---------------------------------------
 
-## 4. Inputs
+## 4–5. Inputs and outputs
 
-- Historical OHLC(V) CSVs under `data/`.
-- Dashboard parameters (or optional preset).
-- **Live:** MT5 credentials, symbol/timeframe aligned with strategy, safety limits set on Live panel.
+**Inputs:** OHLC CSVs under `data/` (IC Markets / MT5 server time); dashboard params or preset; live MT5 credentials + safety limits.  
 
----------------------------------------
-
-## 5. Outputs
-
-- Backtest: per-run folder under `output/`, plots under `plots/`, `run_history.db`, optional Excel.
-- Presets: `presets/*.json`.
-- Live: MT5 orders (when dry run off and safety checks pass); in-app **Activity log**.
+**Outputs:** `output/<run>/` (ledger + summaries including session), `plots/`, `run_history.db`, `presets/*.json`, live Activity log / MT5 orders.
 
 ---------------------------------------
 
 ## 6. Technologies
 
-| Layer | Technology |
-|-------|------------|
-| Desktop UI | Python 3.11+, PySide6 (Qt) |
-| Backtest / data | Polars, NumPy |
-| Charts | Matplotlib |
-| History / export | SQLite, openpyxl |
-| Live (Windows) | MetaTrader5 Python API, custom `broker.py` / `live.py` |
-| Optional live CPU | Thread pool (default); Ray optional via menu |
-| Packaging | PyInstaller (Windows via GitHub Actions) |
+Python 3.11+, PySide6, Polars, NumPy, Matplotlib, SQLite, openpyxl, MetaTrader5 (Windows), PyInstaller.
 
-**Not included in this delivery:** mobile app, cloud hosting, built-in parameter optimization sweeps, guaranteed SLA on broker/MT5 uptime, or financial advice / live account management as a managed service.
+**Not included:** mobile/cloud, UI optimization sweeps, broker uptime SLA, managed live trading, **live session filter** (backtest only for now).
 
 ---------------------------------------
 
@@ -184,123 +129,51 @@ Saving a “preset” is **optional** (Run Settings). Live orders use **Safety l
 
 | Deliverable | Status |
 |-------------|--------|
-| Source: dashboard, logic, doji_logic, backtest, plotting, indicators | ✓ |
-| Source: `broker.py`, `live.py` | ✓ |
-| Sample data layout (`data/XAUUSD/…`) | ✓ |
-| Requirements file | ✓ |
-| Windows exe build workflow + packaging guide | ✓ |
-| Client delivery summary (this document) | ✓ |
-| Example presets (`presets/`) | ✓ (optional use) |
-| Installer (.exe from CI) | ✓ (artifact via GitHub Actions) |
+| Source: dashboard, logic, hammer_context_logic, doji_logic, backtest, plotting, sessions, indicators | Done |
+| Source: broker.py, live.py, live_journal.py | Done |
+| Sample data layout (`data/XAUUSD/…`) | Done |
+| Requirements + Windows exe workflow | Done |
+| Client delivery summary | Done |
+| Example presets | Done |
+| Installer (.exe from CI) | Done (GitHub artifact) |
 
 ---------------------------------------
 
-## 8. How the client uses the application
+## 8. How to use
 
-### Backtest workflow
+**Backtest:** Launch → choose Hammer / Hammer with candles / Doji → set Timeframes & sessions → Run (F5) → review Metrics / Trades / Charts / History / Compare → optional preset.  
 
-1. Launch: `python dashboard.py` or packaged `.exe`.
-2. Choose **Hammer** or **Doji**, adjust tabs, **Run Backtest** (F5).
-3. Review **Results** → Metrics, Trades, Charts; **Compare** past runs if needed.
-4. Optionally save settings under **Run Settings** → preset file.
+**Live (Windows):** Tune on backtest → Live (F9) → safety limits → dry run ON → Connect MT5 → Start live → disable dry run only when ready.  
 
-### Live workflow (Windows + MT5)
-
-1. Tune strategy on backtest; optionally **load preset**.
-2. Open **Live Trading** (F9): confirm **Strategy** summary (pattern, indicators, symbol/timeframe).
-3. Set **Safety limits** (daily loss, max trades, lot cap, etc.).
-4. Leave **Live → Performance → Dry run** **on** until signals in **Activity log** look correct.
-5. **Connect MT5** → **Start live** → monitor log; turn off dry run only when ready for real/demo orders (confirmations apply).
-
-### Layout tips
-
-- **F2** — reset panel layout.  
-- Drag panel **titles** to tab or dock side-by-side.  
-- **F1** — keyboard shortcuts help.
+**Shortcuts:** F1 help · F2 reset layout · F5 run · F8 Results · F9 Live.
 
 ---------------------------------------
 
-## 9. Support (as per proposal template)
+## 9–10. Support and cost
 
-**Included:** _____ days bug fix / minor clarification support from delivery date: __________  
+**Support included:** _____ days bug-fix / clarification from delivery date: __________  
+**Excluded:** New features after sign-off unless change-ordered.
 
-**Excluded:** New features after sign-off unless covered by a change order.
-
----------------------------------------
-
-## 10. Cost & payment
-
-*(Fill in before presenting to client.)*
-
-| Item | Amount |
-|------|--------|
-| **Total project cost** | ________________ |
-| Advance (on approval) | ________________ |
-| Milestone 1 — Core dashboard + hammer/doji backtest | ________________ |
-| Milestone 2 — Indicators, results UX, history/compare/presets | ________________ |
-| Milestone 3 — Live trading module (MT5, safety, UI integration) | ________________ |
-| Final payment (on delivery sign-off) | ________________ |
-| **Currency** | ________________ |
-| **Payment terms / notes** | ________________ |
+*(Fill cost / payment table in the `.txt` before presenting.)*
 
 ---------------------------------------
 
-## 11. Change log (enhancements in this build)
+## 11. Change log (v1.2 highlights)
 
-### Backtest & UI (earlier phase)
+21–29: Session analytics & filter · Fixed SL from entry · By Year / By Month · Compare by session · Expanded run history DB · Hammer with candles · Metrics integrity tests · Risk controls on Timeframes · PyInstaller `sessions` module.
 
-1. Doji fully integrated in UI and preview.  
-2. Hammer classic/inverted direction gating.  
-3. Doji direction: CANDLE_COLOR + green/red mapping.  
-4. Indicators: SuperTrend, VWAP, dropdown, combine mode, filter docs.  
-5. Indicator filters for Doji backtests.  
-6. Combined Timeframes tab (include + RR + max SL).  
-7. Results color coding; Trades tab; export/open shortcuts.  
-8. Run comparison (two Strategy IDs).  
-9. Optional presets (Run Settings).  
-10. Packaging, CI Windows exe, startup stability improvements.
-
-### Live trading & operations (this phase)
-
-11. **`broker.py` / `live.py`** — MT5 connect, rates, positions, market orders with SL/TP.  
-12. **Live Trading dock** — strategy selector + summary, MT5 credentials, execution, safety limits, log.  
-13. **Same config as backtest** — hammer/doji + indicators; preset load refreshes live summary.  
-14. **Safety limits** — daily loss/trades, spread, cooldown, lot cap; demo-only optional; validation before real orders.  
-15. **Dry run default**; advanced toggles under **Live → Performance** menu.  
-16. **Background QThread** live worker; error budget; optional thread pool / Ray for signal CPU.  
-17. **Results vs Live** — separate docks (F8 / F9).  
-18. **Live panel UX** — structured scroll layout (strategy / MT5 / execution / safety / log).  
-19. **Layout tools** — F2 reset, tabbed docking; macOS crash mitigation (no float windows).  
-20. **Client document** — this template updated for live scope and platform notes.
-
-### Analytics & research (v1.2)
-
-21. **Trading sessions** — Asian / London / US breakdown in Results, charts, CSV, and run history (IC Markets server clock).  
-22. **Session backtest filter** — Include/exclude sessions on Timeframes tab before running.  
-23. **Fixed stop loss from entry** — `FIXED_FROM_ENTRY` mode alongside candle-extreme SL.  
-24. **Metrics tabs** — By Year and By Month added to Results UI.  
-25. **Compare by session** — History compare shows worst-case session rows for Run A vs Run B.  
-26. **Run history DB** — Full metrics on `Backtest_Results` + granular `Backtest_Metrics_Breakdown` table.  
-27. **Hammer with candles** — Context pattern (lookback, separate BUY/SELL wick rules) fully integrated in UI and backtest.
+Full numbered changelog is in **`Client_Delivery_Summary.txt`**.
 
 ---------------------------------------
 
 ## 12. Client approval
 
-By signing below, the client confirms receipt of the deliverables described in this document and acceptance of scope as delivered (subject to any agreed support period).
-
 **Client name:** _______________________________  
-
-**Signature:** _______________________________  
-
-**Date:** _______________________________  
+**Signature / Date:** _______________________________  
 
 **Developer name:** _______________________________  
-
-**Signature:** _______________________________  
-
-**Date:** _______________________________  
+**Signature / Date:** _______________________________  
 
 ---------------------------------------
 
-*End of document*
+*End of document — client handoff copy: `Client_Delivery_Summary.txt`*

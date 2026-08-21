@@ -191,11 +191,19 @@ class BacktestConfig:
     # ---- overlap handling ----
     allow_overlapping_trades: bool = False
 
-    # ---- session filter (IC Markets server clock on entry bar) ----
-    # Subset of sessions.SESSION_ORDER; default all three = no filter.
+    # ---- session / time-of-day filter ----
+    # Subset of sessions.SESSION_ORDER; default all three = no session filter.
     sessions_enabled: List[str] = field(default_factory=lambda: [
         "Asian", "London", "US",
     ])
+    # Clock for Asian/London/US buckets: "broker" (CSV/MT5) or "ist" (India).
+    session_clock: str = "broker"
+    # IC Markets UTC offset for IST conversion; None = auto from bar date (US DST).
+    broker_utc_offset_hours: Optional[float] = None
+    # Optional allow-list of IST clock times (independent of session checkboxes).
+    ist_time_filter_enabled: bool = False
+    ist_time_start: str = "00:00"
+    ist_time_end: str = "23:59"
 
     # ---- costs (set to 0 to ignore, fully optional) ----
     commission_per_trade: float = 0.0        # flat $ per trade (round turn)
@@ -210,14 +218,62 @@ class BacktestConfig:
 # SECTION 2: DATA LOADING (Polars -- reads fetcher.py's CSV output structure)
 # ============================================================================
 
+def resolve_data_root(data_root: str, anchor_dir: Optional[str] = None) -> str:
+    """
+    Make data_root absolute and stable across launch cwd.
+
+    Relative paths (e.g. "data") are resolved against the app/package
+    directory first, then the process cwd. This fixes the common failure
+    where CSVs "aren't detected" until restart when the dashboard was
+    launched from a different working directory.
+    """
+    raw = (data_root or "").strip() or "data"
+    raw = os.path.expanduser(raw)
+    if os.path.isabs(raw):
+        return os.path.normpath(raw)
+
+    anchor = anchor_dir or os.path.dirname(os.path.abspath(__file__))
+    candidate_app = os.path.normpath(os.path.join(anchor, raw))
+    candidate_cwd = os.path.normpath(os.path.abspath(raw))
+    if os.path.isdir(candidate_app):
+        return candidate_app
+    if os.path.isdir(candidate_cwd):
+        return candidate_cwd
+    return candidate_app
+
+
+def resolve_symbol_folder(data_root: str, symbol: str) -> str:
+    """Return the on-disk symbol folder name (case-insensitive match)."""
+    sym = (symbol or "").strip()
+    if not sym:
+        return sym
+    direct = os.path.join(data_root, sym)
+    if os.path.isdir(direct):
+        return sym
+    if not os.path.isdir(data_root):
+        return sym
+    lower = sym.lower()
+    try:
+        for name in os.listdir(data_root):
+            path = os.path.join(data_root, name)
+            if os.path.isdir(path) and name.lower() == lower:
+                return name
+    except OSError:
+        pass
+    return sym
+
+
 def find_csv_files(data_root: str, symbol: str, timeframe_folder: str) -> List[str]:
     """
     Finds every monthly CSV file for one symbol+timeframe under
     fetcher.py's folder structure:
         data_root/<symbol>/<timeframe_folder>/<year>/<symbol>_<tf>_<year>-<month>.csv
-    Also picks up the *_FULL.csv if present (used as fallback if no
-    monthly files exist). Returns paths sorted chronologically.
+    Also picks up CSVs directly in the timeframe folder (including *_FULL.csv)
+    when no year subfolders with CSVs are found. Returns paths sorted
+    chronologically.
     """
+    data_root = resolve_data_root(data_root)
+    symbol = resolve_symbol_folder(data_root, symbol)
     base = os.path.join(data_root, symbol, timeframe_folder)
     if not os.path.isdir(base):
         return []
@@ -233,10 +289,13 @@ def find_csv_files(data_root: str, symbol: str, timeframe_folder: str) -> List[s
     if monthly_files:
         return sorted(monthly_files)
 
-    # fallback: FULL.csv directly in the timeframe folder
-    full_path = os.path.join(base, f"{symbol}_{timeframe_folder}_FULL.csv")
-    if os.path.exists(full_path):
-        return [full_path]
+    # fallback: any CSV directly in the timeframe folder (FULL or loose files)
+    loose = []
+    for fname in sorted(os.listdir(base)):
+        if fname.endswith(".csv") and os.path.isfile(os.path.join(base, fname)):
+            loose.append(os.path.join(base, fname))
+    if loose:
+        return loose
 
     return []
 
@@ -258,6 +317,8 @@ def load_candles_df(
     optional date range filter -- all as vectorized Polars expressions,
     not Python loops.
     """
+    data_root = resolve_data_root(data_root)
+    symbol = resolve_symbol_folder(data_root, symbol)
     files = find_csv_files(data_root, symbol, timeframe_folder)
     if not files:
         return pl.DataFrame(schema={
@@ -277,11 +338,22 @@ def load_candles_df(
         except Exception as e:
             print(f"    [WARN] Could not read {filepath}: {e}")
             continue
+        if "datetime" not in df.columns:
+            print(f"    [WARN] No datetime column in {filepath} — skipped")
+            continue
         # parse datetime column explicitly (format matches fetcher.py's
-        # "%Y-%m-%d %H:%M:%S" output)
-        df = df.with_columns(
-            pl.col("datetime").str.strptime(pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False)
+        # "%Y-%m-%d %H:%M:%S" output); fall back to flexible parse if needed
+        parsed = pl.col("datetime").str.strptime(
+            pl.Datetime, format="%Y-%m-%d %H:%M:%S", strict=False,
         )
+        df = df.with_columns(parsed.alias("datetime"))
+        if df.filter(pl.col("datetime").is_not_null()).height == 0:
+            try:
+                df = df.with_columns(
+                    pl.col("datetime").str.to_datetime(strict=False).alias("datetime")
+                )
+            except Exception:
+                pass
         frames.append(df)
 
     if not frames:
@@ -718,22 +790,29 @@ def simulate_timeframe_outcomes(
         all_signals = apply_indicator_filters(all_signals, df, config.indicator_stack)
 
     enabled_sessions = set(config.sessions_enabled or sessions.SESSION_ORDER)
-    if enabled_sessions != set(sessions.SESSION_ORDER):
-        session_skipped = 0
-        for sig in all_signals:
-            if sig.ignored:
-                continue
-            sess = sessions.classify_session(sig.entry_candle.timestamp)
-            if sess not in enabled_sessions:
-                sig.ignored = True
-                sig.ignore_reason = f"Session filter ({sess} not enabled)"
-                session_skipped += 1
+    session_skipped, ist_skipped = sessions.apply_session_and_time_filters(
+        all_signals,
+        sessions_enabled=list(enabled_sessions),
+        session_clock=getattr(config, "session_clock", sessions.CLOCK_BROKER),
+        broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
+        ist_time_filter_enabled=bool(getattr(config, "ist_time_filter_enabled", False)),
+        ist_time_start=getattr(config, "ist_time_start", "00:00"),
+        ist_time_end=getattr(config, "ist_time_end", "23:59"),
+    )
+    if session_skipped or ist_skipped:
+        clock = getattr(config, "session_clock", sessions.CLOCK_BROKER)
+        enabled_names = [s for s in sessions.SESSION_ORDER if s in enabled_sessions]
+        bits = []
         if session_skipped:
-            enabled_names = [s for s in sessions.SESSION_ORDER if s in enabled_sessions]
-            print(
-                f"    [{timeframe_folder}] Session filter: skipped {session_skipped} signal(s) "
-                f"(enabled: {', '.join(enabled_names)})"
+            bits.append(
+                f"session skipped {session_skipped} ({', '.join(enabled_names) or 'none'}; clock={clock})"
             )
+        if ist_skipped:
+            bits.append(
+                f"IST time skipped {ist_skipped} "
+                f"({getattr(config, 'ist_time_start', '00:00')}–{getattr(config, 'ist_time_end', '23:59')} IST)"
+            )
+        print(f"    [{timeframe_folder}] Filter: " + "; ".join(bits))
 
     taken_signals = [s for s in all_signals if not s.ignored]
     ignored_signals = [s for s in all_signals if s.ignored]
@@ -924,7 +1003,12 @@ def run_full_backtest(config: BacktestConfig) -> Tuple[List[SimulatedTrade], Lis
 # SECTION 7: LEDGER -> POLARS DATAFRAME (bridge into vectorized metrics)
 # ============================================================================
 
-def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
+def ledger_to_polars(
+    trades: List[SimulatedTrade],
+    *,
+    session_clock: str = "broker",
+    broker_utc_offset_hours: Optional[float] = None,
+) -> pl.DataFrame:
     """
     Flattens the SimulatedTrade list into a long-format Polars DataFrame
     with ONE ROW PER (trade, exit_model) -- this shape is what makes all
@@ -935,19 +1019,22 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
         return pl.DataFrame(schema={
             "timeframe": pl.Utf8, "direction": pl.Utf8, "hammer_color": pl.Utf8,
             "pattern_variant": pl.Utf8,
-            "entry_time": pl.Datetime, "entry_price": pl.Float64,
+            "entry_time": pl.Datetime, "entry_time_ist": pl.Datetime,
+            "entry_price": pl.Float64,
             "stop_loss": pl.Float64, "target": pl.Float64,
             "risk_price_distance": pl.Float64, "rr_multiple_target": pl.Float64,
             "position_size": pl.Float64, "risk_usd": pl.Float64,
             "exit_model": pl.Utf8, "outcome": pl.Utf8,
-            "exit_price": pl.Float64, "exit_time": pl.Datetime,
+            "exit_price": pl.Float64, "exit_time": pl.Datetime, "exit_time_ist": pl.Datetime,
             "bars_held": pl.Int64, "pnl_usd": pl.Float64, "equity_after": pl.Float64,
             "year": pl.Int32, "month_key": pl.Utf8, "session": pl.Utf8,
+            "session_clock": pl.Utf8,
         })
 
     rows = []
     for t in trades:
         sig = t.signal
+        entry_ist = sessions.broker_to_ist(t.entry_time, broker_utc_offset_hours)
         base = {
             "timeframe": t.timeframe_folder,
             "direction": sig.direction.value,
@@ -955,6 +1042,7 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
                 "RED" if sig.hammer_candle.is_red else "DOJI"),
             "pattern_variant": getattr(sig, "pattern_variant", None) or "",
             "entry_time": t.entry_time,
+            "entry_time_ist": entry_ist,
             "entry_price": sig.entry_price,
             "stop_loss": sig.stop_loss,
             "target": sig.target,
@@ -962,6 +1050,7 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             "rr_multiple_target": sig.rr_multiple,
             "year": t.entry_time.year,
             "month_key": f"{t.entry_time.year:04d}-{t.entry_time.month:02d}",
+            "session_clock": session_clock,
         }
         for exit_model in ALL_EXIT_MODELS:
             outcome, exit_price, exit_time, bars_held = t.outcomes[exit_model]
@@ -974,13 +1063,18 @@ def ledger_to_polars(trades: List[SimulatedTrade]) -> pl.DataFrame:
             row["outcome"] = outcome.value
             row["exit_price"] = exit_price
             row["exit_time"] = exit_time
+            row["exit_time_ist"] = sessions.broker_to_ist(exit_time, broker_utc_offset_hours)
             row["bars_held"] = bars_held
             row["pnl_usd"] = t.pnl[exit_model]
             row["equity_after"] = t.equity_after[exit_model]
             rows.append(row)
 
     df = pl.DataFrame(rows)
-    return sessions.add_session_column(df)
+    return sessions.add_session_column(
+        df,
+        clock=session_clock,
+        broker_utc_offset_hours=broker_utc_offset_hours,
+    )
 
 
 # ============================================================================
@@ -1296,6 +1390,15 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
             print(f"[WARN] Could not print Hammer-with-candles rules: {e}")
     print(f"Overlap allowed: {config.allow_overlapping_trades} | "
           f"Sizing: {_sizing_mode(config).value}")
+    print(sessions.describe_sessions(
+        clock=getattr(config, "session_clock", "broker"),
+        broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
+    ))
+    if getattr(config, "ist_time_filter_enabled", False):
+        print(
+            f"IST time filter: {config.ist_time_start}–{config.ist_time_end} IST "
+            f"(IC Markets → IST auto GMT+2/GMT+3 by bar date)"
+        )
     print("=" * 70)
 
     ledger, ignored = run_full_backtest(config)
@@ -1304,7 +1407,11 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
         print("\n[WARN] No trades were generated. Check your data folder, "
               "symbol name, and date range.")
 
-    df = ledger_to_polars(ledger)
+    df = ledger_to_polars(
+        ledger,
+        session_clock=getattr(config, "session_clock", "broker"),
+        broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
+    )
 
     out_dir = os.path.join(config.output_root, config.run_name)
     os.makedirs(out_dir, exist_ok=True)

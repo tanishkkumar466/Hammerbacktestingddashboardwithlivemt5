@@ -21,6 +21,7 @@ import polars as pl
 import doji_logic
 import hammer_context_logic
 import logic
+import sessions
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
@@ -97,6 +98,13 @@ class LiveRunConfig:
     max_entry_deviation_points: float = 200.0
     # limit_offset: base limit price on current bid/ask instead of strategy entry (live-friendly)
     limit_offset_from_market: bool = True
+    # Same Asian/London/US gate as backtest Timeframes tab (server/broker or IST clock)
+    sessions_enabled: Optional[List[str]] = None
+    session_clock: str = "broker"
+    broker_utc_offset_hours: Optional[float] = None  # None = auto IC Markets by bar date
+    ist_time_filter_enabled: bool = False
+    ist_time_start: str = "00:00"
+    ist_time_end: str = "23:59"
 
 
 def reanchor_sl_tp_to_fill(
@@ -223,6 +231,12 @@ def find_bar_signal_outcome(
     pattern_type: str,
     strategy_config,
     indicator_stack,
+    sessions_enabled: Optional[List[str]] = None,
+    session_clock: str = "broker",
+    broker_utc_offset_hours: Optional[float] = None,
+    ist_time_filter_enabled: bool = False,
+    ist_time_start: str = "00:00",
+    ist_time_end: str = "23:59",
 ) -> Tuple[Optional[logic.TradeSignal], Optional[logic.TradeSignal]]:
     """
     Returns (actionable_signal, ignored_on_this_bar).
@@ -255,6 +269,16 @@ def find_bar_signal_outcome(
     if indicator_stack.enabled_indicator_ids():
         df = _candles_to_polars(closed, forming)
         signals = apply_indicator_filters(signals, df, indicator_stack)
+
+    sessions.apply_session_and_time_filters(
+        signals,
+        sessions_enabled=sessions_enabled,
+        session_clock=session_clock,
+        broker_utc_offset_hours=broker_utc_offset_hours,
+        ist_time_filter_enabled=ist_time_filter_enabled,
+        ist_time_start=ist_time_start,
+        ist_time_end=ist_time_end,
+    )
 
     signal_bar_ts = closed[-1].timestamp
     entry_bar_ts = forming.timestamp
@@ -298,6 +322,12 @@ def find_actionable_signal(
     pattern_type: str,
     strategy_config,
     indicator_stack,
+    sessions_enabled: Optional[List[str]] = None,
+    session_clock: str = "broker",
+    broker_utc_offset_hours: Optional[float] = None,
+    ist_time_filter_enabled: bool = False,
+    ist_time_start: str = "00:00",
+    ist_time_end: str = "23:59",
 ) -> Optional[logic.TradeSignal]:
     """Signal on last closed bar with entry on the forming bar.
 
@@ -305,6 +335,12 @@ def find_actionable_signal(
     """
     actionable, _ignored = find_bar_signal_outcome(
         closed, forming, timeframe_logic_label, pattern_type, strategy_config, indicator_stack,
+        sessions_enabled=sessions_enabled,
+        session_clock=session_clock,
+        broker_utc_offset_hours=broker_utc_offset_hours,
+        ist_time_filter_enabled=ist_time_filter_enabled,
+        ist_time_start=ist_time_start,
+        ist_time_end=ist_time_end,
     )
     return actionable
 
@@ -361,9 +397,23 @@ class LiveTradingEngine:
                 ray.init(ignore_reinit_error=True, num_cpus=2, include_dashboard=False, logging_level="ERROR")
 
             @ray.remote
-            def _ray_find(closed, forming, logic_tf, pattern_type, strategy_config, indicator_stack):
+            def _ray_find(
+                closed, forming, logic_tf, pattern_type, strategy_config, indicator_stack,
+                sessions_enabled=None,
+                session_clock="broker",
+                broker_utc_offset_hours=None,
+                ist_time_filter_enabled=False,
+                ist_time_start="00:00",
+                ist_time_end="23:59",
+            ):
                 return find_bar_signal_outcome(
                     closed, forming, logic_tf, pattern_type, strategy_config, indicator_stack,
+                    sessions_enabled=sessions_enabled,
+                    session_clock=session_clock,
+                    broker_utc_offset_hours=broker_utc_offset_hours,
+                    ist_time_filter_enabled=ist_time_filter_enabled,
+                    ist_time_start=ist_time_start,
+                    ist_time_end=ist_time_end,
                 )
 
             self._ray_remote = _ray_find
@@ -382,12 +432,30 @@ class LiveTradingEngine:
         indicator_stack,
         pattern_type: str,
         pattern_label: str,
+        sessions_enabled: Optional[List[str]] = None,
+        session_clock: Optional[str] = None,
+        broker_utc_offset_hours: Optional[float] = None,
+        ist_time_filter_enabled: Optional[bool] = None,
+        ist_time_start: Optional[str] = None,
+        ist_time_end: Optional[str] = None,
     ) -> None:
         """Call from the UI thread after parameter changes — no need to Stop/Start live."""
         self.strategy_config = strategy_config
         self.indicator_stack = indicator_stack
         self.pattern_type = pattern_type
         self.pattern_label = pattern_label
+        if sessions_enabled is not None:
+            self.live_config.sessions_enabled = list(sessions_enabled)
+        if session_clock is not None:
+            self.live_config.session_clock = session_clock
+        # None = auto IC Markets GMT+2/GMT+3 by bar date
+        self.live_config.broker_utc_offset_hours = broker_utc_offset_hours
+        if ist_time_filter_enabled is not None:
+            self.live_config.ist_time_filter_enabled = bool(ist_time_filter_enabled)
+        if ist_time_start is not None:
+            self.live_config.ist_time_start = str(ist_time_start)
+        if ist_time_end is not None:
+            self.live_config.ist_time_end = str(ist_time_end)
         extra = ""
         if hasattr(strategy_config, "lookback_candles"):
             extra = (
@@ -631,6 +699,12 @@ class LiveTradingEngine:
         args = (
             closed, forming, logic_tf, self.pattern_type,
             self.strategy_config, self.indicator_stack,
+            self.live_config.sessions_enabled,
+            getattr(self.live_config, "session_clock", "broker"),
+            getattr(self.live_config, "broker_utc_offset_hours", None),
+            bool(getattr(self.live_config, "ist_time_filter_enabled", False)),
+            getattr(self.live_config, "ist_time_start", "00:00"),
+            getattr(self.live_config, "ist_time_end", "23:59"),
         )
         if self._ray_remote is not None:
             try:
@@ -953,7 +1027,7 @@ class LiveTradingEngine:
             )
             if sig.direction == logic.TradeDirection.BUY:
                 wick_note = (
-                    "body only, wick ignored"
+                    "body only, prev red→BUY, signal color ignored"
                     if not getattr(cfg, "buy_require_wick", True)
                     else "classic wick required"
                 )
@@ -964,7 +1038,7 @@ class LiveTradingEngine:
                 )
             else:
                 wick_note = (
-                    "body only, wick ignored"
+                    "body only, prev green→SELL, signal color ignored"
                     if not getattr(cfg, "sell_require_wick", True)
                     else "inverted wick required"
                 )
