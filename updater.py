@@ -273,11 +273,15 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
         pts = 0
         if name.endswith(".exe"):
             pts += 200
-            # Real Windows bundle is 80MB+; tiny exe = broken or wrong file
+            # Full Windows bundle ~380–450 MB; tiny = broken, ~325 MB = missing ray/MT5
             if size and size < 50_000_000:
                 pts -= 200
-            elif size >= 80_000_000:
-                pts += 40
+            elif size and size < 300_000_000:
+                pts -= 80
+            elif size >= 380_000_000:
+                pts += 50
+            elif size >= 350_000_000:
+                pts += 30
         if name == "hammercandlebacktestdashboard.exe":
             pts += 60
         if "windows" in name:

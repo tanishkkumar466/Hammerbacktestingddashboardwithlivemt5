@@ -39,15 +39,16 @@ jobs:
           import sqlite3, _sqlite3
           import PySide6, shiboken6
           import polars, numpy, matplotlib, PIL, openpyxl, psutil
+          import ray
           print('sqlite3', sqlite3.sqlite_version)
-          print('PySide6 OK')
+          print('ray', ray.__version__)
           "@
           python -c "import MetaTrader5; print('MetaTrader5 OK')"
 
       - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
-      - name: Verify EXE size (real build is 80MB+, never ~300KB)
+      - name: Verify EXE size (full build ~380–450 MB with ray + MT5 + Qt)
         shell: pwsh
         run: |
           $exe = "dist/HammerCandleBacktestDashboard.exe"
@@ -55,8 +56,11 @@ jobs:
           $size = (Get-Item $exe).Length
           $mb = [math]::Round($size / 1MB, 1)
           Write-Host "Built $exe ($mb MB, $size bytes)"
-          if ($size -lt 80MB) {
-            throw "EXE too small ($mb MB) — bundle is incomplete. Expected 80MB+ with PySide6/polars."
+          if ($size -lt 350MB) {
+            throw "EXE too small ($mb MB) — expected ~380-450 MB with ray, MT5, PySide6, polars."
+          }
+          if ($size -lt 380MB) {
+            Write-Warning "EXE is $mb MB (expected closer to 420 MB). Check PyInstaller bundle."
           }
 
       - name: Upload EXE to GitHub Release

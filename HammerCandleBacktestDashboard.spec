@@ -90,7 +90,7 @@ def _collect_package(name: str) -> None:
         print(f"[spec] collect_all({name}) skipped: {exc}")
 
 
-# Heavy deps — must be fully bundled (missing = tiny broken exe / ModuleNotFoundError)
+# Heavy deps — must be fully bundled (missing = smaller exe + ModuleNotFoundError)
 for _pkg in (
     "PySide6",
     "shiboken6",
@@ -102,6 +102,12 @@ for _pkg in (
     "psutil",
 ):
     _collect_package(_pkg)
+
+# Windows-only: match local ~420 MB builds (ray + MT5 are large but required for Live)
+if sys.platform == "win32":
+    for _pkg in ("MetaTrader5", "ray"):
+        _collect_package(_pkg)
+    hiddenimports += ["ray", "ray._private"]
 
 try:
     hiddenimports += collect_submodules("indicators")
@@ -145,7 +151,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=_runtime_hooks,
-    excludes=["ray", "tkinter", "pytest", "IPython"],  # optional / unused
+    excludes=["tkinter", "pytest", "IPython", "jupyter", "notebook"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
