@@ -1,8 +1,8 @@
 # PyInstaller spec — Windows one-file HammerCandleBacktestDashboard.exe
 # Local:  pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 #
-# Bundles every runtime library Hammer needs on Windows 10/11 (~400–450 MB one-file).
-# Do NOT exclude ray — live optional compute requires the full ray tree.
+# Bundles EVERY library from requirements.txt + requirements-build.txt.
+# Target ~420–450 MB one-file exe on Windows 10/11.
 
 import os
 import sys
@@ -16,6 +16,37 @@ entry_script = str(ROOT / "main.py")
 
 datas = []
 binaries = []
+
+# Every pip package Hammer may need — keep in sync with requirements-build.txt
+_ALL_PACKAGES = (
+    # requirements.txt
+    "PySide6", "shiboken6", "matplotlib", "polars", "pyarrow", "numpy", "PIL",
+    "openpyxl", "et_xmlfile", "tzdata", "psutil", "MetaTrader5", "ray",
+    # HTTPS / networking
+    "certifi", "charset_normalizer", "idna", "urllib3", "requests",
+    # matplotlib stack
+    "kiwisolver", "fonttools", "contourpy", "cycler", "pyparsing",
+    "packaging", "dateutil", "six",
+    # excel
+    "defusedxml",
+    # data IO
+    "fsspec",
+    # ray core
+    "cloudpickle", "filelock", "jsonschema", "jsonschema_specifications",
+    "msgpack", "protobuf", "grpcio", "yaml", "click",
+    # ray [default]
+    "aiohttp", "aiohttp_cors", "aiohappyeyeballs", "aiorwlock", "aiosignal",
+    "attrs", "colorful", "distlib", "frozenlist", "multidict",
+    "opencensus", "opencensus_context", "platformdirs", "prometheus_client",
+    "pydantic", "pydantic_core", "annotated_types", "typing_extensions",
+    "referencing", "rpds", "rich", "smart_open", "virtualenv", "watchfiles", "yarl",
+    # transitive
+    "markdown_it", "mdurl", "pygments",
+    "google", "google.protobuf",     "google.api_core", "google.auth", "googleapis_common_protos",
+    "proto", "cachetools", "pyasn1", "pyasn1_modules", "rsa",
+    "lz4", "ormsgpack",
+)
+
 hiddenimports = [
     # --- app modules ---
     "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker", "live",
@@ -24,50 +55,52 @@ hiddenimports = [
     "update_workers", "update_window",
     "indicators", "indicators.config", "indicators.filter", "indicators.registry",
     "indicators.supertrend", "indicators.vwap",
-    # --- stdlib (sqlite, ssl/https, multiprocessing for ray) ---
-    "sqlite3", "_sqlite3",
-    "ssl", "_ssl", "hashlib", "_hashlib",
+    # --- stdlib ---
+    "sqlite3", "_sqlite3", "ssl", "_ssl", "hashlib", "_hashlib",
     "encodings", "encodings.utf_8", "encodings.cp1252",
     "multiprocessing", "multiprocessing.spawn", "multiprocessing.popen_spawn_win32",
-    "zoneinfo",
-    # --- UI: PySide6 / Qt ---
+    "zoneinfo", "socket", "_socket", "select", "ctypes", "_ctypes",
+    # --- PySide6 / Qt ---
     "shiboken6", "shiboken6.Shiboken",
     "PySide6", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",
     "PySide6.QtNetwork", "PySide6.support", "PySide6.support.deprecated",
-    # --- charts: matplotlib (Agg PNG export + Qt inspect dialog) ---
+    # --- matplotlib (Agg + Qt backends) ---
     "matplotlib", "matplotlib.backends", "matplotlib.backends.backend_agg",
     "matplotlib.backends.backend_qtagg", "matplotlib.backends.backend_qt",
     "matplotlib.backends.backend_qt5agg", "matplotlib.figure",
     "matplotlib.pyplot", "matplotlib.dates", "matplotlib.patches",
-    # --- data / backtest ---
+    "matplotlib._c_internal_utils", "matplotlib.ft2font",
+    # --- data ---
     "numpy", "numpy.core", "numpy.core._multiarray_umath",
-    "polars", "pyarrow",
+    "polars", "pyarrow", "fsspec",
     # --- images ---
-    "PIL", "PIL.Image", "PIL._imaging",
-    # --- excel export chain ---
+    "PIL", "PIL.Image", "PIL._imaging", "PIL._imagingtk",
+    # --- excel ---
     "openpyxl", "openpyxl.styles", "openpyxl.cell", "openpyxl.workbook", "openpyxl.utils",
     "et_xmlfile", "defusedxml", "defusedxml.ElementTree",
-    # --- live / system ---
-    "psutil", "_psutil_windows",
-    # --- HTTPS (updater + telegram via urllib/ssl) ---
-    "certifi", "charset_normalizer", "idna", "urllib3",
-    # --- matplotlib deps ---
-    "kiwisolver", "fonttools", "contourpy", "cycler", "pyparsing",
-    "packaging", "dateutil", "six",
-    # --- timezones (Windows) ---
-    "tzdata",
-    # --- Windows live: MT5 + ray ---
-    "MetaTrader5",
+    # --- live ---
+    "psutil", "_psutil_windows", "MetaTrader5",
+    # --- ray full tree ---
     "ray", "ray._private", "ray._private.object_ref_generator",
     "ray._private.worker", "ray._private.services", "ray._private.runtime_env",
-    # --- ray transitive (ray[default] — must match local ~430 MB build) ---
-    "cloudpickle", "filelock", "jsonschema", "jsonschema_specifications", "msgpack", "yaml",
-    "google.protobuf", "grpc", "grpcio",
-    "aiohttp", "aiohttp_cors", "aiohappyeyeballs", "aiosignal", "attrs",
-    "frozenlist", "multidict", "yarl", "referencing", "rpds",
+    "ray._private.gcs_utils", "ray._private.utils",
+    # --- HTTPS ---
+    "certifi", "charset_normalizer", "idna", "urllib3", "requests",
+    # --- matplotlib deps ---
+    "kiwisolver", "fonttools", "contourpy", "cycler", "pyparsing",
+    "packaging", "dateutil", "six", "tzdata",
+    # --- ray core + [default] + transitive ---
+    "cloudpickle", "filelock", "jsonschema", "jsonschema_specifications",
+    "msgpack", "google.protobuf", "grpc", "grpcio", "yaml",
+    "aiohttp", "aiohttp_cors", "aiohappyeyeballs", "aiorwlock", "aiosignal",
+    "attrs", "colorful", "distlib", "frozenlist", "multidict", "yarl",
+    "opencensus", "opencensus_context", "platformdirs", "prometheus_client",
     "pydantic", "pydantic_core", "annotated_types", "typing_extensions",
-    "click", "colorful", "virtualenv", "watchfiles", "prometheus_client",
-    "requests", "rich", "smart_open", "opencensus", "fsspec",
+    "referencing", "rpds", "click", "virtualenv", "watchfiles",
+    "rich", "smart_open", "markdown_it", "mdurl", "pygments",
+    "google.api_core", "google.auth", "googleapis_common_protos",
+    "proto", "cachetools", "pyasn1", "pyasn1_modules", "rsa",
+    "lz4", "ormsgpack", "lz4.frame",
 ]
 
 for asset_name in ("logo.ico", "app_icon.ico", "app_icon.png", "logo.png"):
@@ -87,105 +120,52 @@ def _collect_package(name: str) -> None:
         print(f"[spec] collect_all({name}) skipped: {exc}")
 
 
-# requirements.txt + requirements-build.txt (target ~430 MB one-file exe on Windows)
-_RUNTIME_PACKAGES = (
-    # UI
-    "PySide6",
-    "shiboken6",
-    # data / charts
-    "polars",
-    "pyarrow",
-    "numpy",
-    "matplotlib",
-    "PIL",
-    # excel
-    "openpyxl",
-    "et_xmlfile",
-    "defusedxml",
-    # live helpers
-    "psutil",
-    # HTTPS / CA bundle
-    "certifi",
-    "charset_normalizer",
-    "requests",
-    # matplotlib stack
-    "kiwisolver",
-    "fonttools",
-    "contourpy",
-    "cycler",
-    "pyparsing",
-    "packaging",
-    "dateutil",
-    "six",
-    # timezones / IO
-    "tzdata",
-    "fsspec",
-    # ray core deps
-    "cloudpickle",
-    "filelock",
-    "jsonschema",
-    "jsonschema_specifications",
-    "msgpack",
-    "protobuf",
-    "grpcio",
-    "PyYAML",
-    "click",
-    # ray[default] extras (biggest CI vs local size gap)
-    "aiohttp",
-    "aiohttp_cors",
-    "aiohappyeyeballs",
-    "aiosignal",
-    "attrs",
-    "frozenlist",
-    "multidict",
-    "yarl",
-    "referencing",
-    "rpds",
-    "pydantic",
-    "pydantic_core",
-    "annotated_types",
-    "typing_extensions",
-    "colorful",
-    "virtualenv",
-    "watchfiles",
-    "prometheus_client",
-    "rich",
-    "smart_open",
-    "opencensus",
-)
-
-for _pkg in _RUNTIME_PACKAGES:
+# collect_all every package (skip MetaTrader5 off Windows)
+for _pkg in _ALL_PACKAGES:
+    if _pkg == "MetaTrader5" and sys.platform != "win32":
+        continue
     _collect_package(_pkg)
 
-if sys.platform == "win32":
-    for _pkg in ("MetaTrader5", "ray"):
-        _collect_package(_pkg)
-
-# Full submodule trees — ray._private.* fixes "No module named ray._private.object_ref_generator"
-for _mod in ("indicators", "ray", "ray._private", "matplotlib.backends"):
+# Full submodule trees for packages PyInstaller often misses
+for _mod in (
+    "indicators",
+    "ray", "ray._private",
+    "matplotlib.backends",
+    "aiohttp",
+    "pydantic",
+    "grpc",
+    "google.protobuf",
+    "opencensus",
+    "PySide6",
+):
     try:
         hiddenimports += collect_submodules(_mod)
+        print(f"[spec] collect_submodules({_mod}): OK")
     except Exception as exc:
         print(f"[spec] collect_submodules({_mod}) skipped: {exc}")
 
-# Data files not always picked up by collect_all alone
-for _data_pkg in ("matplotlib", "certifi", "tzdata", "pyarrow", "PySide6"):
+# Data files (fonts, CA certs, Qt plugins, tzdata, arrow libs)
+for _data_pkg in (
+    "matplotlib", "certifi", "tzdata", "pyarrow", "PySide6",
+    "shiboken6", "polars", "ray", "grpc", "google",
+):
     try:
         datas += collect_data_files(_data_pkg)
+        print(f"[spec] collect_data_files({_data_pkg}): OK")
     except Exception as exc:
         print(f"[spec] collect_data_files({_data_pkg}) skipped: {exc}")
 
-# Windows native extensions (sqlite3, OpenSSL for HTTPS)
+# Windows native .pyd / .dll (sqlite, ssl, xml, compression)
 if sys.platform == "win32":
     _win_native = (
-        "_sqlite3.pyd",
-        "sqlite3.dll",
-        "_ssl.pyd",
-        "_hashlib.pyd",
-        "libcrypto-3.dll",
-        "libssl-3.dll",
-        "pyexpat.pyd",
-        "_elementtree.pyd",
+        "_sqlite3.pyd", "sqlite3.dll",
+        "_ssl.pyd", "_hashlib.pyd",
+        "libcrypto-3.dll", "libssl-3.dll",
+        "pyexpat.pyd", "_elementtree.pyd",
+        "_bz2.pyd", "_lzma.pyd",
+        "_ctypes.pyd", "_socket.pyd", "select.pyd",
+        "unicodedata.pyd", "_decimal.pyd",
+        "_multiprocessing.pyd",
     )
     for base in (
         sysconfig.get_path("stdlib"),
@@ -198,6 +178,14 @@ if sys.platform == "win32":
             fpath = os.path.join(base, fname)
             if os.path.isfile(fpath):
                 binaries.append((fpath, "."))
+                print(f"[spec] bundled {fname}")
+    # libffi (ctypes)
+    for base in (os.path.join(sys.base_prefix, "DLLs"), sys.base_prefix):
+        if not base or not os.path.isdir(base):
+            continue
+        for fname in os.listdir(base):
+            if fname.lower().startswith("libffi") and fname.lower().endswith(".dll"):
+                binaries.append((os.path.join(base, fname), "."))
                 print(f"[spec] bundled {fname}")
 
 _exe_icon = None
@@ -225,8 +213,6 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
-# One-file exe — default _MEI temp (required for PyInstaller 6.22+ security validation).
-# Do NOT set runtime_tmpdir to a custom name — breaks "parent process" security checks.
 exe = EXE(
     pyz,
     a.scripts,

@@ -1,38 +1,83 @@
-# Hammer Candle Dashboard — Python 3.11 build / PyInstaller
+# Hammer Candle Dashboard — Python 3.11 FULL Windows build / PyInstaller
 # GitHub Actions and local Windows packaging must use 3.11.
 #
 #   python3.11 -m pip install -r requirements-build.txt
 #   pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 #
-# IMPORTANT: plain "ray" is core-only (~80 MB smaller in the exe).
-# Local ~430 MB builds include ray[default] extras — CI must install the same.
+# Installs EVERY runtime + transitive library Hammer may import on Windows 10/11.
+# Target one-file exe: ~420–450 MB (matches local working builds).
 
 -r requirements.txt
 
 setuptools>=69
 wheel>=0.43
-# 6.22.2+ fixes Windows security-validation when exe is launched after self-update
 pyinstaller>=6.22.2,<7
 
-# --- Ray [default] stack (explicit so PyInstaller always sees them on CI) ---
-aiohttp>=3.7
+# =============================================================================
+# HTTPS / networking (updater, Telegram, ray)
+# =============================================================================
+certifi
+charset-normalizer
+idna
+urllib3
+requests
+
+# =============================================================================
+# matplotlib full stack (PNG charts + Qt inspect dialog)
+# =============================================================================
+kiwisolver
+fonttools
+contourpy
+cycler
+pyparsing
+packaging
+python-dateutil
+six
+
+# =============================================================================
+# Excel export chain
+# =============================================================================
+defusedxml
+
+# =============================================================================
+# polars / pyarrow / numpy IO
+# =============================================================================
+fsspec
+
+# =============================================================================
+# Ray CORE (always required when ray is enabled in live)
+# =============================================================================
+cloudpickle
+filelock
+jsonschema
+jsonschema-specifications
+msgpack
+protobuf
+grpcio
+PyYAML
+click
+
+# =============================================================================
+# Ray [default] extras — MUST match local ~430 MB exe (not core-only ~408 MB)
+# =============================================================================
+aiohttp
 aiohttp-cors
 aiohappyeyeballs
+aiorwlock
 aiosignal
 annotated-types
 attrs
-click
 colorful
+distlib
 frozenlist
-jsonschema
-jsonschema-specifications
 multidict
 opencensus
+opencensus-context
+platformdirs
 prometheus-client
 pydantic>=2.5,<3
 pydantic-core
 referencing
-requests
 rich
 rpds-py
 smart-open
@@ -41,8 +86,23 @@ virtualenv
 watchfiles
 yarl
 
-# --- matplotlib / openpyxl / polars transitive (CI parity) ---
-defusedxml
-python-dateutil
-six
-fsspec
+# =============================================================================
+# Rich / jsonschema / virtualenv / grpc transitive
+# =============================================================================
+markdown-it-py
+mdurl
+pygments
+googleapis-common-protos
+proto-plus
+google-api-core
+google-auth
+cachetools
+pyasn1
+pyasn1-modules
+rsa
+
+# =============================================================================
+# Extra ray/grpc helpers (Windows-safe; bundled if installed)
+# =============================================================================
+lz4
+ormsgpack

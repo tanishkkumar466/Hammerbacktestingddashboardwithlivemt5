@@ -20,7 +20,11 @@ tzdata>=2024.1
 
 # --- Live trading ---
 psutil>=5.9
-# [default] extras match local ~430 MB Windows exe (aiohttp, pydantic, virtualenv, …)
+# [default] extras — aiohttp, pydantic, virtualenv, etc. (full ~430 MB exe)
 ray[default]>=2.9
 # Official MetaTrader5 wheel is Windows-only (live MT5 + fetch.py).
 MetaTrader5>=5.0.45; sys_platform == "win32"
+
+# --- HTTPS (updater + Telegram + ray) ---
+certifi
+requests
