@@ -60,9 +60,14 @@ hiddenimports = [
     "MetaTrader5",
     "ray", "ray._private", "ray._private.object_ref_generator",
     "ray._private.worker", "ray._private.services", "ray._private.runtime_env",
-    # --- ray transitive (collect_all also pulls these; explicit = safer in CI) ---
-    "cloudpickle", "filelock", "jsonschema", "msgpack", "yaml",
+    # --- ray transitive (ray[default] — must match local ~430 MB build) ---
+    "cloudpickle", "filelock", "jsonschema", "jsonschema_specifications", "msgpack", "yaml",
     "google.protobuf", "grpc", "grpcio",
+    "aiohttp", "aiohttp_cors", "aiohappyeyeballs", "aiosignal", "attrs",
+    "frozenlist", "multidict", "yarl", "referencing", "rpds",
+    "pydantic", "pydantic_core", "annotated_types", "typing_extensions",
+    "click", "colorful", "virtualenv", "watchfiles", "prometheus_client",
+    "requests", "rich", "smart_open", "opencensus", "fsspec",
 ]
 
 for asset_name in ("logo.ico", "app_icon.ico", "app_icon.png", "logo.png"):
@@ -82,7 +87,7 @@ def _collect_package(name: str) -> None:
         print(f"[spec] collect_all({name}) skipped: {exc}")
 
 
-# requirements.txt + every audited dependency (target ~420 MB one-file exe)
+# requirements.txt + requirements-build.txt (target ~430 MB one-file exe on Windows)
 _RUNTIME_PACKAGES = (
     # UI
     "PySide6",
@@ -102,6 +107,7 @@ _RUNTIME_PACKAGES = (
     # HTTPS / CA bundle
     "certifi",
     "charset_normalizer",
+    "requests",
     # matplotlib stack
     "kiwisolver",
     "fonttools",
@@ -111,16 +117,41 @@ _RUNTIME_PACKAGES = (
     "packaging",
     "dateutil",
     "six",
-    # timezones
+    # timezones / IO
     "tzdata",
-    # ray deps (ray collect_all pulls more; these cover partial CI installs)
+    "fsspec",
+    # ray core deps
     "cloudpickle",
     "filelock",
     "jsonschema",
+    "jsonschema_specifications",
     "msgpack",
     "protobuf",
     "grpcio",
     "PyYAML",
+    "click",
+    # ray[default] extras (biggest CI vs local size gap)
+    "aiohttp",
+    "aiohttp_cors",
+    "aiohappyeyeballs",
+    "aiosignal",
+    "attrs",
+    "frozenlist",
+    "multidict",
+    "yarl",
+    "referencing",
+    "rpds",
+    "pydantic",
+    "pydantic_core",
+    "annotated_types",
+    "typing_extensions",
+    "colorful",
+    "virtualenv",
+    "watchfiles",
+    "prometheus_client",
+    "rich",
+    "smart_open",
+    "opencensus",
 )
 
 for _pkg in _RUNTIME_PACKAGES:

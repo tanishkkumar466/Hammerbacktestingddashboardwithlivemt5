@@ -3,6 +3,9 @@
 #
 #   python3.11 -m pip install -r requirements-build.txt
 #   pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
+#
+# IMPORTANT: plain "ray" is core-only (~80 MB smaller in the exe).
+# Local ~430 MB builds include ray[default] extras — CI must install the same.
 
 -r requirements.txt
 
@@ -10,3 +13,36 @@ setuptools>=69
 wheel>=0.43
 # 6.22.2+ fixes Windows security-validation when exe is launched after self-update
 pyinstaller>=6.22.2,<7
+
+# --- Ray [default] stack (explicit so PyInstaller always sees them on CI) ---
+aiohttp>=3.7
+aiohttp-cors
+aiohappyeyeballs
+aiosignal
+annotated-types
+attrs
+click
+colorful
+frozenlist
+jsonschema
+jsonschema-specifications
+multidict
+opencensus
+prometheus-client
+pydantic>=2.5,<3
+pydantic-core
+referencing
+requests
+rich
+rpds-py
+smart-open
+typing-extensions
+virtualenv
+watchfiles
+yarl
+
+# --- matplotlib / openpyxl / polars transitive (CI parity) ---
+defusedxml
+python-dateutil
+six
+fsspec

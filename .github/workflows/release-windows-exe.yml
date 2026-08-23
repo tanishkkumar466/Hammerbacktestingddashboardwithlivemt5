@@ -43,6 +43,7 @@ jobs:
           import et_xmlfile, defusedxml, tzdata
           import ray
           import ray._private.object_ref_generator
+          import aiohttp, pydantic, pydantic_core, virtualenv, watchfiles, colorful
           print('sqlite3', sqlite3.sqlite_version)
           print('ray', ray.__version__)
           "@
@@ -59,11 +60,11 @@ jobs:
           $size = (Get-Item $exe).Length
           $mb = [math]::Round($size / 1MB, 1)
           Write-Host "Built $exe ($mb MB, $size bytes)"
-          if ($size -lt 380MB) {
-            throw "EXE too small ($mb MB) — expected ~400-450 MB with full library bundle."
-          }
           if ($size -lt 400MB) {
-            Write-Warning "EXE is $mb MB (target ~420 MB). Some optional libs may be missing."
+            throw "EXE too small ($mb MB) — expected ~420-450 MB with full ray[default] bundle."
+          }
+          if ($size -lt 420MB) {
+            Write-Warning "EXE is $mb MB (target ~430 MB). Check ray[default] deps in requirements-build.txt."
           }
 
       - name: Upload EXE to GitHub Release
