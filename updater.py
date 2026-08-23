@@ -269,9 +269,17 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
 
     def score(asset: dict) -> int:
         name = str(asset.get("name", "")).lower()
+        size = int(asset.get("size", 0) or 0)
         pts = 0
         if name.endswith(".exe"):
             pts += 200
+            # Real Windows bundle is 80MB+; tiny exe = broken or wrong file
+            if size and size < 50_000_000:
+                pts -= 200
+            elif size >= 80_000_000:
+                pts += 40
+        if name == "hammercandlebacktestdashboard.exe":
+            pts += 60
         if "windows" in name:
             pts += 90
         if "hammercandle" in name:
@@ -280,7 +288,9 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
             pts += 30
         if name.endswith(".zip"):
             pts += 20
-        # git-archive source drops (Hammer-1.0.4.zip) — wrong for frozen Windows exe
+            # Source-only git archive (~300 KB) — never use for frozen Windows
+            if size and size < 5_000_000:
+                pts -= 150
         if getattr(sys, "frozen", False) and name.endswith(".zip"):
             if "windows" not in name and not name.endswith(".exe"):
                 if name.startswith("hammer-") or name.endswith("src.zip"):

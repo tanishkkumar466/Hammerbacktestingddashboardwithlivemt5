@@ -1,5 +1,5 @@
-# Builds the Windows one-file exe and attaches it to the GitHub Release for this tag.
-# Push a tag (e.g. v1.0.7) — clients on older .exe builds can self-update from Help → Check for Updates.
+# Build full Windows one-file exe and attach ONLY to the GitHub Release for this tag.
+# Real exe is ~150–450 MB. If you see ~300 KB on the release, that is the source .zip — not the exe.
 
 name: Release Windows EXE
 
@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -28,22 +28,40 @@ jobs:
             requirements-build.txt
 
       - name: Install build dependencies
-        run: pip install -r requirements-build.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
+
+      - name: Verify runtime imports (must pass before PyInstaller)
+        shell: pwsh
+        run: |
+          python -c @"
+          import sqlite3, _sqlite3
+          import PySide6, shiboken6
+          import polars, numpy, matplotlib, PIL, openpyxl, psutil
+          print('sqlite3', sqlite3.sqlite_version)
+          print('PySide6 OK')
+          "@
+          python -c "import MetaTrader5; print('MetaTrader5 OK')"
 
       - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
-      - name: Smoke-check EXE
+      - name: Verify EXE size (real build is 80MB+, never ~300KB)
         shell: pwsh
         run: |
           $exe = "dist/HammerCandleBacktestDashboard.exe"
           if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
           $size = (Get-Item $exe).Length
-          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes)" }
-          Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
+          $mb = [math]::Round($size / 1MB, 1)
+          Write-Host "Built $exe ($mb MB, $size bytes)"
+          if ($size -lt 80MB) {
+            throw "EXE too small ($mb MB) — bundle is incomplete. Expected 80MB+ with PySide6/polars."
+          }
 
       - name: Upload EXE to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/HammerCandleBacktestDashboard.exe
-          generate_release_notes: true
+          fail_on_unmatched_files: true
+          generate_release_notes: false

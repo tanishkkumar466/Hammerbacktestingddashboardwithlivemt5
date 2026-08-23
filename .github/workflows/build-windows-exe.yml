@@ -17,6 +17,7 @@ on:
       - "live_journal.py"
       - "fetch.py"
       - "indicators/**"
+      - "pyinstaller/**"
       - "requirements.txt"
       - "requirements-build.txt"
       - "HammerCandleBacktestDashboard.spec"
@@ -31,7 +32,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -41,35 +42,29 @@ jobs:
             requirements-build.txt
 
       - name: Install build dependencies
-        run: pip install -r requirements-build.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-build.txt
 
-      - name: Verify source tree
+      - name: Verify runtime imports
         shell: pwsh
         run: |
-          $required = @(
-            "main.py", "dashboard.py", "logic.py", "doji_logic.py", "backtest.py",
-            "plotting.py", "broker.py", "live.py", "live_journal.py",
-            "hammer_context_logic.py",
-            "HammerCandleBacktestDashboard.spec"
-          )
-          foreach ($f in $required) {
-            if (-not (Test-Path $f)) { throw "Missing required file: $f" }
-          }
-          if (-not (Test-Path "indicators/__init__.py")) { throw "Missing indicators package" }
+          python -c "import sqlite3, _sqlite3, PySide6, polars, numpy, matplotlib; print('imports OK')"
 
-      - name: Build one-file executable (PyInstaller spec)
+      - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
-      - name: Smoke-check EXE
+      - name: Verify EXE size
         shell: pwsh
         run: |
           $exe = "dist/HammerCandleBacktestDashboard.exe"
-          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
           $size = (Get-Item $exe).Length
-          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
-          Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
+          $mb = [math]::Round($size / 1MB, 1)
+          Write-Host "Built $exe ($mb MB)"
+          if ($size -lt 80MB) { throw "EXE too small ($mb MB) — incomplete bundle" }
 
-      - name: Package delivery zip (exe + readme)
+      - name: Package delivery zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "dist/HammerCandleBacktestDashboard" | Out-Null
@@ -77,11 +72,11 @@ jobs:
           @"
           Hammer Candle Backtest Dashboard (Windows)
 
-          1. Put this folder next to your data/ CSVs (or copy data/ here).
-          2. Double-click HammerCandleBacktestDashboard.exe
-          3. If SmartScreen appears: More info -> Run anyway (unsigned app).
+          1. Put HammerCandleBacktestDashboard.exe next to your data/ folder.
+          2. Double-click the exe (NOT the small Hammer-x.y.z.zip source file on GitHub).
+          3. Real exe size is about 150-450 MB.
 
-          Self-update: Help -> Check for Updates (needs .exe on GitHub Release — auto on each tag).
+          Self-update: Help -> Check for Updates (downloads HammerCandleBacktestDashboard.exe).
           "@ | Set-Content -Encoding UTF8 "dist/HammerCandleBacktestDashboard/README.txt"
           Compress-Archive -Path "dist/HammerCandleBacktestDashboard/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
 
@@ -92,7 +87,7 @@ jobs:
           path: dist/HammerCandleBacktestDashboard.exe
           if-no-files-found: error
 
-      - name: Upload artifact (zip with readme)
+      - name: Upload artifact (delivery zip)
         uses: actions/upload-artifact@v4
         with:
           name: HammerCandleBacktestDashboard-windows-zip
