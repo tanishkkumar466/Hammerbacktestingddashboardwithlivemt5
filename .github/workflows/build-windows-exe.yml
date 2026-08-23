@@ -70,37 +70,36 @@ jobs:
       - name: Smoke-check EXE
         shell: pwsh
         run: |
-          $exe = "dist/HammerCandleBacktestDashboard.exe"
+          $exe = "dist/HammerCandleBacktestDashboard/HammerCandleBacktestDashboard.exe"
           if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
           $size = (Get-Item $exe).Length
-          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
+          if ($size -lt 1MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
           Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
 
       - name: Package delivery folder
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path "dist/HammerCandleBacktestDashboard" | Out-Null
-          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard/"
+          $folder = "dist/HammerCandleBacktestDashboard"
           @"
           Hammer Candle Backtest Dashboard (Windows)
 
-          1. Copy your data/ folder (XAUUSD CSVs) next to the .exe if not already present.
-          2. Double-click HammerCandleBacktestDashboard.exe
+          1. Copy the whole HammerCandleBacktestDashboard folder next to your data/ folder.
+          2. Double-click HammerCandleBacktestDashboard.exe inside that folder.
           3. If SmartScreen appears: More info -> Run anyway (unsigned app).
 
-          Live MT5: Windows only — install MetaTrader 5 terminal and pip MetaTrader5 on dev machine;
-          the frozen exe includes the MetaTrader5 package for import on client PC with MT5 installed.
-          "@ | Set-Content -Encoding UTF8 "dist/HammerCandleBacktestDashboard/README.txt"
-          Compress-Archive -Path "dist/HammerCandleBacktestDashboard/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
+          Live MT5: Windows only — install MetaTrader 5 terminal.
+          Self-update: attach HammerCandleBacktestDashboard-windows.zip to GitHub Releases.
+          "@ | Set-Content -Encoding UTF8 "$folder/README.txt"
+          Compress-Archive -Path "$folder/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
 
-      - name: Upload artifact (exe)
+      - name: Upload artifact (onedir folder)
         uses: actions/upload-artifact@v4
         with:
           name: HammerCandleBacktestDashboard-windows
-          path: dist/HammerCandleBacktestDashboard.exe
+          path: dist/HammerCandleBacktestDashboard/
           if-no-files-found: error
 
-      - name: Upload artifact (zip with readme)
+      - name: Upload artifact (windows zip for releases)
         uses: actions/upload-artifact@v4
         with:
           name: HammerCandleBacktestDashboard-windows-zip

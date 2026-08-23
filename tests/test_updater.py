@@ -30,7 +30,8 @@ def test_skip_user_data_paths():
     assert not updater._should_skip_path("indicators/supertrend.py")
 
 
-def test_pick_zip_for_source_mode():
+def test_pick_zip_for_source_mode(monkeypatch):
+    monkeypatch.delattr(updater.sys, "frozen", raising=False)
     assets = [
         {"name": "notes.txt"},
         {"name": "Hammer-src.zip", "browser_download_url": "https://x/z", "size": 10},
@@ -39,6 +40,25 @@ def test_pick_zip_for_source_mode():
     picked = updater._pick_release_asset(assets)
     assert picked is not None
     assert picked["name"].endswith(".zip")
+
+
+def test_pick_windows_zip_when_frozen(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    assets = [
+        {"name": "Hammer-1.0.4.zip", "browser_download_url": "https://x/src", "size": 100},
+        {"name": "HammerCandleBacktestDashboard-windows.zip", "browser_download_url": "https://x/win", "size": 200},
+    ]
+    picked = updater._pick_release_asset(assets)
+    assert picked is not None
+    assert "windows" in picked["name"]
+
+
+def test_tree_has_source_only_layout(tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "main.py").write_text("#")
+    (root / "dashboard.py").write_text("#")
+    assert updater._tree_has_source_only_layout(str(root))
 
 
 def test_load_token_from_txt_filename(monkeypatch):

@@ -19,6 +19,28 @@ def _app_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _cleanup_stale_update_artifacts() -> None:
+    """Remove leftover PyInstaller / updater temp folders next to the app."""
+    if not getattr(sys, "frozen", False):
+        return
+    root = _app_dir()
+    for name in (
+        "_hammer_update_staging",
+        "_hammer_update_extract",
+        "_hammer_apply_update.bat",
+        "_hammer_relaunch.bat",
+    ):
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path):
+                import shutil
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def _run_dashboard() -> None:
     os.chdir(_app_dir())
     # Import the module (not runpy on a .py path). Frozen onefile has no
@@ -59,6 +81,7 @@ def _run_plots() -> int:
 
 
 def main() -> int:
+    _cleanup_stale_update_artifacts()
     parser = argparse.ArgumentParser(description="Hammer candle backtest dashboard")
     parser.add_argument(
         "command",

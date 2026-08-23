@@ -171,6 +171,8 @@ _SKIP_DIR_NAMES = {
     "dist",
     ".pytest_cache",
     ".cursor",
+    "_hammer_update_staging",
+    "_hammer_update_extract",
 }
 _SKIP_FILE_NAMES = {
     "run_history.db",
@@ -183,6 +185,8 @@ _SKIP_FILE_NAMES = {
     "credentials.json",
     "secrets.json",
     ".DS_Store",
+    "_hammer_apply_update.bat",
+    "_hammer_relaunch.bat",
 }
 
 
@@ -256,28 +260,35 @@ def _api_request(url: str, *, not_found_message: Optional[str] = None):
 
 
 def _pick_release_asset(assets: list) -> Optional[dict]:
-    """Prefer EXE when frozen; otherwise prefer a .zip of source."""
+    """Prefer Windows delivery assets when frozen; source .zip when running from code."""
     if not assets:
         return None
-    exes = [a for a in assets if str(a.get("name", "")).lower().endswith(".exe")]
-    zips = [a for a in assets if str(a.get("name", "")).lower().endswith(".zip")]
 
-    if getattr(sys, "frozen", False):
-        # Prefer branded exe name if present
-        for a in exes:
-            if "hammer" in str(a.get("name", "")).lower():
-                return a
-        if exes:
-            return exes[0]
-        if zips:
-            return zips[0]
+    def score(asset: dict) -> int:
+        name = str(asset.get("name", "")).lower()
+        pts = 0
+        if name.endswith(".exe"):
+            pts += 200
+        if "windows" in name:
+            pts += 90
+        if "hammercandle" in name:
+            pts += 50
+        elif "hammer" in name:
+            pts += 30
+        if name.endswith(".zip"):
+            pts += 20
+        # git-archive source drops (Hammer-1.0.4.zip) — wrong for frozen Windows exe
+        if getattr(sys, "frozen", False) and name.endswith(".zip"):
+            if "windows" not in name and not name.endswith(".exe"):
+                if name.startswith("hammer-") or name.endswith("src.zip"):
+                    pts -= 120
+        return pts
+
+    ranked = sorted(assets, key=score, reverse=True)
+    best = ranked[0]
+    if getattr(sys, "frozen", False) and score(best) < 40:
         return None
-
-    if zips:
-        return zips[0]
-    if exes:
-        return exes[0]
-    return None
+    return best
 
 
 def check_for_update() -> Optional[ReleaseInfo]:
@@ -328,6 +339,13 @@ def check_for_update() -> Optional[ReleaseInfo]:
 
     asset = _pick_release_asset(data.get("assets") or [])
     if not asset:
+        if getattr(sys, "frozen", False):
+            raise UpdateError(
+                "Latest release has no Windows .exe or *-windows.zip asset.\n\n"
+                "Frozen Hammer needs a built Windows package on the release — not the "
+                "source-only Hammer-x.y.z.zip. Attach HammerCandleBacktestDashboard.exe "
+                "or HammerCandleBacktestDashboard-windows.zip from GitHub Actions."
+            )
         raise UpdateError(
             "Latest release has no .zip or .exe asset attached. "
             "Attach a source .zip (or Windows .exe for frozen builds)."
@@ -438,36 +456,117 @@ def _copy_over_app(source_root: str, dest_root: str) -> None:
             shutil.copy2(os.path.join(root, fname), os.path.join(target_dir, fname))
 
 
+def _find_hammer_exe_in_tree(root: str) -> Optional[str]:
+    """Locate HammerCandleBacktestDashboard.exe (or similar) under an extracted update."""
+    preferred: Optional[str] = None
+    fallback: Optional[str] = None
+    for dirpath, _, files in os.walk(root):
+        for fname in files:
+            if not fname.lower().endswith(".exe"):
+                continue
+            path = os.path.join(dirpath, fname)
+            low = fname.lower()
+            if low == "hammercandlebacktestdashboard.exe":
+                return path
+            if "hammer" in low:
+                fallback = fallback or path
+    return preferred or fallback
+
+
+def _tree_has_source_only_layout(root: str) -> bool:
+    """True when the zip is a Python source tree (cannot update a frozen one-file exe)."""
+    if _find_hammer_exe_in_tree(root):
+        return False
+    return os.path.isfile(os.path.join(root, "main.py")) and os.path.isfile(
+        os.path.join(root, "dashboard.py")
+    )
+
+
+def _is_onedir_payload(payload_root: str) -> bool:
+    return os.path.isdir(os.path.join(payload_root, "_internal"))
+
+
+# Windows: apply update after this process exits (exe swap or onedir folder copy)
+_WINDOWS_UPDATE_BAT: list = [None]
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _write_windows_update_bat(*, pid: int, lines: list[str]) -> str:
+    """Batch script that waits for Hammer to exit, then runs update commands."""
+    bat = os.path.join(app_root(), "_hammer_apply_update.bat")
+    script = ["@echo off", "setlocal EnableExtensions"]
+    label = f"wait_{pid}"
+    script.append(f":{label}")
+    script.append(f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul')
+    script.append("if %ERRORLEVEL%==0 (")
+    script.append("  timeout /t 1 /nobreak >nul")
+    script.append(f"  goto {label}")
+    script.append(")")
+    script.append("timeout /t 2 /nobreak >nul")
+    script.extend(lines)
+    script.append('del /F /Q "%~f0" 2>nul')
+    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\r\n".join(script) + "\r\n")
+    return bat
+
+
+def _spawn_detached(cmd: list[str]) -> None:
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    subprocess.Popen(cmd, **kwargs)
+
+
+def _schedule_windows_onedir_update(payload_root: str, status_cb: Callable[[str], None]) -> str:
+    """Stage a PyInstaller onedir folder; copy over app after exit."""
+    root = app_root()
+    staging = os.path.join(root, "_hammer_update_staging")
+    if os.path.isdir(staging):
+        shutil.rmtree(staging, ignore_errors=True)
+    status_cb("Staging update folder...")
+    shutil.copytree(payload_root, staging)
+
+    exe_name = os.path.basename(sys.executable)
+    target_exe = os.path.join(root, exe_name)
+    bat = _write_windows_update_bat(
+        pid=os.getpid(),
+        lines=[
+            f'xcopy /E /Y /I /Q "{staging}\\*" "{root}\\" >nul',
+            f'start "" /D "{root}" "{target_exe}"',
+            f'rmdir /S /Q "{staging}" 2>nul',
+        ],
+    )
+    _WINDOWS_UPDATE_BAT[0] = bat
+    status_cb("Update staged — will apply after the app closes.")
+    return root
+
+
 def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
-    """Replace the running frozen EXE (Windows). Returns app_root."""
+    """Replace the running frozen EXE (Windows one-file or onedir launcher)."""
     root = app_root()
     if not getattr(sys, "frozen", False):
-        # Script mode receiving an exe: drop it next to the app for the user
         dest = os.path.join(root, os.path.basename(downloaded_exe))
         status_cb("Saving new executable...")
         shutil.copy2(downloaded_exe, dest)
         return root
 
-    current_exe = sys.executable
+    current_exe = os.path.abspath(sys.executable)
     dest_name = os.path.basename(current_exe)
     staged = os.path.join(root, dest_name + ".new")
     status_cb("Staging new executable...")
     shutil.copy2(downloaded_exe, staged)
 
-    # On Windows, replace after this process exits (file lock).
     if os.name == "nt":
-        bat = os.path.join(tempfile.gettempdir(), "hammer_replace_exe.bat")
-        with open(bat, "w", encoding="utf-8") as f:
-            f.write("@echo off\r\n")
-            f.write("timeout /t 2 /nobreak > nul\r\n")
-            f.write(f'copy /Y "{staged}" "{current_exe}"\r\n')
-            f.write(f'del /F /Q "{staged}"\r\n')
-            f.write(f'start "" "{current_exe}"\r\n')
-            f.write('del "%~f0"\r\n')
-        # Relaunch is handled by the bat; mark for exit-only path
-        status_cb("Executable staged — will replace on relaunch.")
-        # Stash bat path for relaunch_and_exit
-        _EXE_REPLACE_BAT[0] = bat
+        bat = _write_windows_update_bat(
+            pid=os.getpid(),
+            lines=[
+                f'copy /Y "{staged}" "{current_exe}" >nul',
+                f'del /F /Q "{staged}" 2>nul',
+                f'start "" /D "{root}" "{current_exe}"',
+            ],
+        )
+        _WINDOWS_UPDATE_BAT[0] = bat
+        status_cb("Executable staged — will replace after the app closes.")
     else:
         status_cb("Replacing executable...")
         shutil.move(staged, current_exe)
@@ -478,8 +577,8 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
     return root
 
 
-# Shared between install and relaunch when a Windows exe swap is pending
-_EXE_REPLACE_BAT: list = [None]
+# Back-compat alias used by relaunch path
+_EXE_REPLACE_BAT = _WINDOWS_UPDATE_BAT
 
 
 def relaunch_and_exit(root: Optional[str] = None) -> None:
@@ -488,35 +587,77 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
     python_exe = sys.executable
     main_script = os.path.join(root, "main.py")
 
-    replace_bat = _EXE_REPLACE_BAT[0]
-    if replace_bat and os.path.isfile(replace_bat):
-        subprocess.Popen(
-            ["cmd", "/c", replace_bat],
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-        )
+    update_bat = _WINDOWS_UPDATE_BAT[0]
+    if update_bat and os.path.isfile(update_bat):
+        _spawn_detached(["cmd", "/c", update_bat])
         os._exit(0)
 
     if os.name == "nt":
-        relauncher = os.path.join(tempfile.gettempdir(), "hammer_relaunch.bat")
-        with open(relauncher, "w", encoding="utf-8") as f:
+        relauncher = os.path.join(root, "_hammer_relaunch.bat")
+        with open(relauncher, "w", encoding="utf-8", newline="\r\n") as f:
             f.write("@echo off\r\n")
-            f.write("timeout /t 1 /nobreak > nul\r\n")
+            f.write("timeout /t 1 /nobreak >nul\r\n")
             if getattr(sys, "frozen", False):
-                f.write(f'start "" "{python_exe}"\r\n')
+                f.write(f'start "" /D "{root}" "{python_exe}"\r\n')
             else:
-                f.write(f'start "" "{python_exe}" "{main_script}"\r\n')
-            f.write('del "%~f0"\r\n')
-        subprocess.Popen(
-            ["cmd", "/c", relauncher],
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-        )
+                f.write(f'start "" /D "{root}" "{python_exe}" "{main_script}"\r\n')
+            f.write('del /F /Q "%~f0" 2>nul\r\n')
+        _spawn_detached(["cmd", "/c", relauncher])
     else:
         if getattr(sys, "frozen", False):
-            subprocess.Popen([python_exe])
+            subprocess.Popen([python_exe], cwd=root)
         else:
-            subprocess.Popen([python_exe, main_script])
+            subprocess.Popen([python_exe, main_script], cwd=root)
 
     os._exit(0)
+
+
+def _install_from_zip(
+    asset_path: str,
+    status_cb: Callable[[str], None],
+) -> str:
+    """Install a release .zip — source tree (dev) or Windows onedir/exe payload (frozen)."""
+    status_cb("Extracting update...")
+    extract_parent = os.path.join(app_root(), "_hammer_update_extract")
+    if os.path.isdir(extract_parent):
+        shutil.rmtree(extract_parent, ignore_errors=True)
+    os.makedirs(extract_parent, exist_ok=True)
+    try:
+        with zipfile.ZipFile(asset_path, "r") as zf:
+            zf.extractall(extract_parent)
+        source_root = _find_source_root(extract_parent)
+
+        if getattr(sys, "frozen", False):
+            if _tree_has_source_only_layout(source_root):
+                raise UpdateError(
+                    "This release zip is source code only and cannot update the "
+                    "Windows .exe.\n\n"
+                    "The maintainer must attach HammerCandleBacktestDashboard.exe or "
+                    "HammerCandleBacktestDashboard-windows.zip (from GitHub Actions) "
+                    "to the GitHub Release."
+                )
+            exe_in_tree = _find_hammer_exe_in_tree(source_root)
+            if exe_in_tree:
+                payload_root = os.path.dirname(exe_in_tree)
+                if _is_onedir_payload(payload_root):
+                    if os.name == "nt":
+                        return _schedule_windows_onedir_update(payload_root, status_cb)
+                    status_cb("Installing update...")
+                    _copy_over_app(payload_root, app_root())
+                    status_cb("Update installed.")
+                    return app_root()
+                return _install_exe(exe_in_tree, status_cb)
+            raise UpdateError(
+                "Could not find HammerCandleBacktestDashboard.exe inside the release zip."
+            )
+
+        status_cb("Installing update...")
+        root = app_root()
+        _copy_over_app(source_root, root)
+        status_cb("Update installed.")
+        return root
+    finally:
+        shutil.rmtree(extract_parent, ignore_errors=True)
 
 
 def download_and_install(
@@ -537,17 +678,6 @@ def download_and_install(
         if release.asset_kind == "exe" or release.asset_name.lower().endswith(".exe"):
             return _install_exe(asset_path, status_cb)
 
-        status_cb("Extracting update...")
-        extract_dir = os.path.join(tmp_dir, "extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        with zipfile.ZipFile(asset_path, "r") as zf:
-            zf.extractall(extract_dir)
-        source_root = _find_source_root(extract_dir)
-
-        status_cb("Installing update...")
-        root = app_root()
-        _copy_over_app(source_root, root)
-        status_cb("Update installed.")
-        return root
+        return _install_from_zip(asset_path, status_cb)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
