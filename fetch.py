@@ -9,9 +9,14 @@ import argparse
 import random
 import re
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import csv
+
+try:
+    from broker import ensure_mt5_symbol_visible
+except ImportError:
+    ensure_mt5_symbol_visible = None  # type: ignore
 
 
 # ============================================================================
@@ -341,26 +346,67 @@ def disconnect_from_mt5(mt5, *, owned: bool = True, log=None):
     _log("[OK] MT5 connection closed.")
 
 
-def verify_symbol(mt5, symbol: str) -> bool:
+def _mt5_timestamp(dt: datetime) -> int:
+    """Unix seconds for MT5 API (reliable on Windows vs naive/aware datetime)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def verify_symbol(mt5, symbol: str, log=None) -> Tuple[bool, str]:
     """
-    Confirms the symbol exists and is enabled in Market Watch before we
-    waste time looping through 20 years of chunks for a symbol that
-    doesn't exist on this broker.
+    Confirm symbol exists, resolve broker aliases (XAUUSD → XAUUSDm), enable
+    in Market Watch. Returns (ok, resolved_symbol).
     """
+    _log = log or (lambda msg: print(msg))
+    if ensure_mt5_symbol_visible is not None:
+        ok, resolved_or_msg = ensure_mt5_symbol_visible(mt5, symbol)
+        if not ok:
+            _log(f"[FAIL] {resolved_or_msg}")
+            return False, symbol
+        if resolved_or_msg != symbol:
+            _log(f"[INFO] Symbol resolved: {symbol} → {resolved_or_msg}")
+        else:
+            _log(f"[OK] Symbol ready: {resolved_or_msg}")
+        return True, resolved_or_msg
+
     info = mt5.symbol_info(symbol)
     if info is None:
-        print(f"[FAIL] Symbol '{symbol}' not found on this broker. "
-              f"Check the exact symbol name in MT5's Market Watch panel "
-              f"(some brokers use 'XAUUSD.m', 'GOLD', etc.).")
-        return False
+        _log(
+            f"[FAIL] Symbol '{symbol}' not found on this broker. "
+            f"Check the exact symbol name in MT5's Market Watch panel "
+            f"(some brokers use 'XAUUSD.m', 'GOLD', etc.)."
+        )
+        return False, symbol
 
     if not info.visible:
-        print(f"[INFO] Symbol '{symbol}' not visible in Market Watch, enabling it...")
+        _log(f"[INFO] Symbol '{symbol}' not visible in Market Watch, enabling it...")
         if not mt5.symbol_select(symbol, True):
-            print(f"[FAIL] Could not enable symbol '{symbol}'.")
-            return False
+            _log(f"[FAIL] Could not enable symbol '{symbol}'.")
+            return False, symbol
 
-    return True
+    return True, symbol
+
+
+def warmup_mt5_history(mt5, symbol: str, mt5_timeframe_name: str, log=None) -> None:
+    """
+    Nudge MT5 to download history for symbol/timeframe before copy_rates_range.
+    Empty [] results are common on Windows when the terminal never loaded that chart.
+    """
+    _log = log or (lambda msg: print(msg))
+    try:
+        tf = getattr(mt5, mt5_timeframe_name)
+        mt5.symbol_select(symbol, True)
+        seed = mt5.copy_rates_from_pos(symbol, tf, 0, 500)
+        if seed is not None and len(seed) > 0:
+            _log(f"[OK] MT5 history warm-up: {len(seed)} recent bar(s) for {symbol} [{mt5_timeframe_name}]")
+        else:
+            _log(
+                f"[WARN] MT5 returned no recent bars for {symbol} [{mt5_timeframe_name}]. "
+                "Open that symbol on a chart in MT5, wait for history to load, then retry."
+            )
+    except Exception as exc:
+        _log(f"[WARN] History warm-up failed for {symbol}: {exc}")
 
 
 def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, end: datetime):
@@ -371,13 +417,23 @@ def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, e
     over a 20-year pull, transient failures WILL happen occasionally.
     """
     timeframe_const = getattr(mt5, mt5_timeframe_name)
+    ts_from = _mt5_timestamp(start)
+    ts_to = _mt5_timestamp(end)
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
-        rates = mt5.copy_rates_range(symbol, timeframe_const, start, end)
+        rates = mt5.copy_rates_range(symbol, timeframe_const, ts_from, ts_to)
 
         if rates is not None:
-            if len(rates) == 0:
+            if len(rates) == 0 and attempt == 1:
+                # Terminal may not have synced history yet — trigger download once
+                try:
+                    mt5.copy_rates_from(symbol, timeframe_const, ts_to, 5000)
+                    rates = mt5.copy_rates_range(symbol, timeframe_const, ts_from, ts_to)
+                except Exception:
+                    pass
+
+            if rates is not None and len(rates) == 0:
                 return []  # genuinely no data for this period (e.g. before history starts)
 
             candles = []
@@ -728,7 +784,8 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
                     start: datetime, end: datetime, use_mock: bool,
                     output_root: Optional[str] = None,
                     update_existing: bool = False,
-                    log=None) -> dict:
+                    log=None,
+                    history_warmed: bool = False) -> dict:
     """
     Fetches + saves one symbol+timeframe across the date range.
 
@@ -739,6 +796,9 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
     total_saved = 0
     failed_chunks = []
     all_candles: List[dict] = []
+
+    if not use_mock and mt5 is not None and not history_warmed:
+        warmup_mt5_history(mt5, symbol, mt5_timeframe_name, log=_log)
 
     full_path = full_history_csv_path(symbol, timeframe_label, output_root=output_root)
 
@@ -839,15 +899,18 @@ def run_fetcher(use_mock: bool) -> None:
     try:
         for symbol in SYMBOLS:
             if not use_mock:
-                if not verify_symbol(mt5, symbol):
+                ok, mt5_symbol = verify_symbol(mt5, symbol)
+                if not ok:
                     print(f"[SKIP] Skipping symbol '{symbol}' entirely -- not found/enabled.")
                     continue
+            else:
+                mt5_symbol = symbol
 
             for timeframe_label, mt5_timeframe_name in TIMEFRAMES.items():
-                print(f"\nFetching {symbol} [{timeframe_label}] ...")
+                print(f"\nFetching {mt5_symbol} [{timeframe_label}] ...")
                 result = fetch_and_save(
                     mt5=mt5,
-                    symbol=symbol,
+                    symbol=mt5_symbol,
                     timeframe_label=timeframe_label,
                     mt5_timeframe_name=mt5_timeframe_name,
                     start=START_DATE,
@@ -991,19 +1054,23 @@ def run_fetch_job(
 
     all_results = []
     write_roots_used = set()
+    up_to_date_count = 0
     try:
         for symbol in syms:
             if stop():
                 _log("[STOP] Fetch cancelled.")
                 break
-            if not use_mock and not verify_symbol(mt5, symbol):
-                _log(f"[SKIP] Symbol '{symbol}' not found on this broker.")
-                continue
+            mt5_symbol = symbol
+            if not use_mock:
+                ok, mt5_symbol = verify_symbol(mt5, symbol, log=_log)
+                if not ok:
+                    _log(f"[SKIP] Symbol '{symbol}' not found on this broker.")
+                    continue
 
             if forced_market:
                 sym_market = forced_market
                 detected = (
-                    detect_market_type_from_mt5(mt5, symbol)
+                    detect_market_type_from_mt5(mt5, mt5_symbol)
                     if (auto_detect_market and mt5) else classify_market_type(symbol)
                 )
                 if detected != sym_market:
@@ -1013,14 +1080,17 @@ def run_fetch_job(
                     )
             else:
                 sym_market = (
-                    detect_market_type_from_mt5(mt5, symbol)
+                    detect_market_type_from_mt5(mt5, mt5_symbol)
                     if mt5 else classify_market_type(symbol)
                 )
 
             write_root = resolve_write_root(root, symbol, sym_market)
             write_roots_used.add(write_root)
             _log(f"\n=== {symbol} → {sym_market.upper()} @ {write_root} ===")
+            if mt5_symbol != symbol:
+                _log(f"MT5 symbol: {mt5_symbol}")
 
+            history_warmed = False
             for timeframe_label in tfs:
                 if stop():
                     _log("[STOP] Fetch cancelled.")
@@ -1051,7 +1121,8 @@ def run_fetch_job(
                     )
 
                 if tf_start >= end:
-                    _log(f"  Already up to date (nothing newer than {tf_start}).")
+                    _log(f"  Already up to date (latest on disk: {latest if updating else 'n/a'}).")
+                    up_to_date_count += 1
                     all_results.append((symbol, timeframe_label, {
                         "total_saved": 0,
                         "failed_chunks": [],
@@ -1071,7 +1142,7 @@ def run_fetch_job(
 
                 result = fetch_and_save(
                     mt5=mt5,
-                    symbol=symbol,
+                    symbol=mt5_symbol,
                     timeframe_label=timeframe_label,
                     mt5_timeframe_name=mt5_tf,
                     start=tf_start,
@@ -1080,7 +1151,9 @@ def run_fetch_job(
                     output_root=write_root,
                     update_existing=updating or update_existing,
                     log=_log,
+                    history_warmed=history_warmed,
                 )
+                history_warmed = True
                 result["market_type"] = sym_market
                 result["write_root"] = write_root
                 all_results.append((symbol, timeframe_label, result))
@@ -1096,6 +1169,17 @@ def run_fetch_job(
     grand = sum(r["total_saved"] for _, _, r in all_results)
     _log("-" * 60)
     _log(f"DONE. Candles written this run: {grand}")
+    if grand == 0 and up_to_date_count > 0:
+        _log(
+            f"[INFO] {up_to_date_count} timeframe(s) already up to date — "
+            "0 new bars is normal. Try 'Full re-fetch from start year' for a fresh pull."
+        )
+    elif grand == 0 and all_results:
+        _log(
+            "[WARN] 0 candles written. Check: (1) exact symbol in MT5 Market Watch, "
+            "(2) open a chart for that symbol and wait for history, "
+            "(3) try Full re-fetch mode, (4) some brokers do not offer 3min/10min bars."
+        )
     _log(f"Data folder: {root}")
     for wr in sorted(write_roots_used):
         _log(f"  Wrote under: {wr}")
@@ -1111,6 +1195,7 @@ def run_fetch_job(
             all_results[0][2].get("market_type") if all_results else MARKET_SPOT
         ),
         "total_saved": grand,
+        "up_to_date_count": up_to_date_count,
         "results": all_results,
     }
 

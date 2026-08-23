@@ -468,10 +468,21 @@ def find_csv_files(
         return []
 
     monthly_files = []
-    for entry in sorted(os.listdir(base)):
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError as e:
+        print(f"    [WARN] Cannot list {base}: {e}")
+        return []
+
+    for entry in entries:
         year_dir = os.path.join(base, entry)
         if os.path.isdir(year_dir) and entry.isdigit():
-            for fname in sorted(os.listdir(year_dir)):
+            try:
+                year_files = sorted(os.listdir(year_dir))
+            except OSError as e:
+                print(f"    [WARN] Cannot list {year_dir}: {e}")
+                continue
+            for fname in year_files:
                 if fname.endswith(".csv"):
                     monthly_files.append(os.path.join(year_dir, fname))
 
@@ -480,7 +491,11 @@ def find_csv_files(
 
     # fallback: any CSV directly in the timeframe folder (FULL or loose files)
     loose = []
-    for fname in sorted(os.listdir(base)):
+    try:
+        loose_names = sorted(os.listdir(base))
+    except OSError:
+        loose_names = []
+    for fname in loose_names:
         if fname.endswith(".csv") and os.path.isfile(os.path.join(base, fname)):
             loose.append(os.path.join(base, fname))
     if loose:
@@ -511,7 +526,9 @@ def load_candles_df(
     data_root, symbol = resolve_symbol_data_root(
         data_root, symbol, preferred=preferred,
     )
-    files = find_csv_files(data_root, symbol, timeframe_folder)
+    files = find_csv_files(
+        data_root, symbol, timeframe_folder, preferred=preferred,
+    )
     if not files:
         return pl.DataFrame(schema={
             "datetime": pl.Datetime, "open": pl.Float64, "high": pl.Float64,
@@ -934,6 +951,18 @@ def calculate_pnl(
 # SECTION 6: MAIN BACKTEST LOOP (per timeframe)
 # ============================================================================
 
+def market_preferred_for_config(config: "BacktestConfig") -> str:
+    """spot | futures — never 'both' (use sub-config per market for BOTH runs)."""
+    md = getattr(config, "market_data", MarketDataSource.SPOT)
+    if isinstance(md, MarketDataSource):
+        pref = md.value
+    else:
+        pref = str(md or MarketDataSource.SPOT.value).strip().lower()
+    if pref in ("", "auto", "legacy", "default", "both"):
+        return MarketDataSource.SPOT.value
+    return pref
+
+
 def simulate_timeframe_outcomes(
     timeframe_folder: str,
     config: BacktestConfig,
@@ -943,10 +972,12 @@ def simulate_timeframe_outcomes(
     and apply per-timeframe overlap. Does not size positions.
     """
     logic_label = config.timeframe_folder_to_logic_label.get(timeframe_folder, timeframe_folder)
+    preferred = market_preferred_for_config(config)
 
     df = load_candles_df(
         config.data_root, config.symbol, timeframe_folder,
         config.start_date, config.end_date,
+        preferred=preferred,
     )
 
     if df.height < 3:

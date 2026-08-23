@@ -91,6 +91,13 @@ from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperT
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
 import telegram_notify
+from telegram_workers import TelegramTestWorker
+
+try:
+    from shiboken6 import isValid as _qt_widget_valid
+except ImportError:
+    def _qt_widget_valid(_w) -> bool:  # type: ignore[misc]
+        return True
 import fetch as data_fetcher
 from broker import BrokerCredentials, MT5Broker
 from live_journal import append_session_log, live_journal_dir, session_log_path
@@ -488,6 +495,7 @@ class RunDatabase:
                 "FixedRiskUsd": "REAL",
                 "DateRangeStart": "TEXT",
                 "DateRangeEnd": "TEXT",
+                "MarketData": "TEXT",
             })
             _migrate_table_columns(conn, "Backtest_Results", {
                 col: "REAL" if col not in ("Verdict",) else "TEXT"
@@ -618,6 +626,10 @@ class RunDatabase:
         fixed_risk = config_dict.get("fixed_risk_usd")
         date_start = str(config_dict.get("start_date") or "")
         date_end = str(config_dict.get("end_date") or "")
+        market_data = config_dict.get("market_data")
+        if hasattr(market_data, "value"):
+            market_data = market_data.value
+        market_data = str(market_data or "spot")
         stop_loss_mode_col = sl_mode or strategy.get("buffer_mode")
 
         with self._connect() as conn:
@@ -648,8 +660,9 @@ class RunDatabase:
                         GridMaxLevels, Status, Notes, ParamHash, BodyPct, DominantWickPct, SmallWickPct,
                         WickSide, BodyTolerance, DominantWickTolerance, SmallWickTolerance,
                         TimeframesTested, PatternType, SlMode, SlFixedDistance, LookbackCandles,
-                        AllowOverlappingTrades, FixedRiskUsd, DateRangeStart, DateRangeEnd, CreatedAt
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        AllowOverlappingTrades, FixedRiskUsd, DateRangeStart, DateRangeEnd,
+                        MarketData, CreatedAt
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         f"{pattern_label}_{symbol}_{primary_tf}", "Candlestick Pattern", symbol, primary_tf,
                         None, None, None, None, None, entry_signal,
@@ -668,7 +681,7 @@ class RunDatabase:
                         wick_side, body_tol,
                         dominant_wick_tol, small_wick_tol,
                         ",".join(timeframes), pattern_type, sl_mode, sl_fixed, lookback,
-                        allow_overlap, fixed_risk, date_start, date_end, now,
+                        allow_overlap, fixed_risk, date_start, date_end, market_data, now,
                     ),
                 )
                 strategy_id = cur.lastrowid
@@ -741,6 +754,7 @@ class RunDatabase:
             conn.row_factory = sqlite3.Row
             cur = conn.execute("""
                 SELECT s.StrategyID, s.CreatedAt, s.PatternType, s.Symbol, s.TimeframesTested,
+                       s.MarketData,
                        s.BodyPct, s.DominantWickPct, s.PositionSizingMethod, s.SlMode,
                        s.LookbackCandles, s.AllowOverlappingTrades, s.FixedRiskUsd,
                        t.InitialDeposit,
@@ -750,16 +764,19 @@ class RunDatabase:
                        wc.TotalTrades AS TotalTradesWC,
                        wc.MaxDrawdownPercent AS MaxDrawdownWC,
                        wc.TotalReturnPct AS TotalReturnWC,
-                       (SELECT OutputDir FROM Backtest_Results
-                        WHERE Backtest_Results.StrategyID = s.StrategyID LIMIT 1) AS OutputDir,
+                       wc.OutputDir AS OutputDir,
                        (SELECT GroupName FROM Backtest_Metrics_Breakdown b
                         WHERE b.StrategyID = s.StrategyID AND b.BreakdownType = 'session'
                               AND b.ExitModel = 'worst_case' AND b.ProfitFactor IS NOT NULL
                         ORDER BY b.ProfitFactor DESC, b.NetProfit DESC LIMIT 1) AS BestSessionWC
                 FROM Strategies_Master s
                 LEFT JOIN Tester_Config t ON t.StrategyID = s.StrategyID
-                LEFT JOIN Backtest_Results wc ON wc.StrategyID = s.StrategyID
-                    AND wc.ExitModel = 'worst_case'
+                LEFT JOIN Backtest_Results wc ON wc.rowid = (
+                    SELECT rowid FROM Backtest_Results
+                    WHERE StrategyID = s.StrategyID AND ExitModel = 'worst_case'
+                    ORDER BY TestDate DESC
+                    LIMIT 1
+                )
                 ORDER BY s.StrategyID DESC
             """)
             return [dict(r) for r in cur.fetchall()]
@@ -2522,6 +2539,8 @@ class FetchDataDialog(QDialog):
         intro = QLabel(
             "Pulls candles from the <b>same MT5 terminal as Live</b> "
             "(Live Settings path / login / server — never a second connection). "
+            "Tip: <b>Live → Connect MT5</b> first, or open the symbol on a chart in MT5 "
+            "so history is loaded. "
             "<b>Spot</b> and <b>futures</b> are stored separately "
             "(<code>data/spot/…</code> and <code>data/futures/…</code>). "
             "Update mode only downloads newer bars and merges them."
@@ -2840,6 +2859,7 @@ class FetchDataDialog(QDialog):
 
     def _on_fetch_ok(self, result: dict):
         total = result.get("total_saved", 0)
+        up_to_date = int(result.get("up_to_date_count") or 0)
         market = result.get("market_type") or "spot"
         write_root = result.get("write_root") or result.get("output_root") or ""
         self._append_log(
@@ -2850,11 +2870,30 @@ class FetchDataDialog(QDialog):
         w = self._dash.field_widgets.get("data_root") if hasattr(self._dash, "field_widgets") else None
         if isinstance(w, QLineEdit) and write_root:
             w.setText(write_root)
-        QMessageBox.information(
-            self, "Fetch complete",
-            f"Done.\n\nMarket: {market}\nCandles written: {total}\n\n"
-            f"Backtest data folder set to:\n{write_root}",
-        )
+        if total == 0 and up_to_date > 0:
+            detail = (
+                f"Done — data already current ({up_to_date} timeframe(s) up to date).\n\n"
+                f"Market: {market}\nFolder: {write_root}\n\n"
+                "To force a full download, choose "
+                "'Full re-fetch from start year' and run again."
+            )
+        elif total == 0:
+            detail = (
+                f"Done — 0 candles written.\n\n"
+                f"Market: {market}\nFolder: {write_root}\n\n"
+                "Try:\n"
+                "• Use the exact symbol from MT5 Market Watch (e.g. XAUUSDm)\n"
+                "• Open that symbol on a chart in MT5 and wait for history\n"
+                "• Live → Connect MT5 first, then Fetch again\n"
+                "• 'Full re-fetch from start year' instead of Update\n"
+                "• Uncheck 3min/10min if your broker does not offer them"
+            )
+        else:
+            detail = (
+                f"Done.\n\nMarket: {market}\nCandles written: {total}\n\n"
+                f"Backtest data folder set to:\n{write_root}"
+            )
+        QMessageBox.information(self, "Fetch complete", detail)
 
     def _on_fetch_failed(self, detail: str):
         self._append_log(detail)
@@ -2898,11 +2937,17 @@ class LiveNotificationsDialog(QDialog):
 
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        d.live_telegram_enabled.setText("Send Telegram alerts for all order events")
-        form.addRow(d.live_telegram_enabled)
-        form.addRow("Bot token", d.live_telegram_token)
-        form.addRow("Chat ID", d.live_telegram_chat_id)
-        root.addLayout(form)
+        widgets = d._live_notifications_field_widgets()
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            d.live_telegram_enabled.setText("Send Telegram alerts for all order events")
+            form.addRow(d.live_telegram_enabled)
+            form.addRow("Bot token", d.live_telegram_token)
+            form.addRow("Chat ID", d.live_telegram_chat_id)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
 
         if not hasattr(d, "live_telegram_status"):
             d.live_telegram_status = QLabel("Off")
@@ -2910,11 +2955,11 @@ class LiveNotificationsDialog(QDialog):
         d._refresh_live_telegram_status()
         root.addWidget(d.live_telegram_status)
 
-        test_btn = QPushButton("Send test notification")
-        test_btn.setObjectName("secondaryButton")
-        test_btn.setToolTip("Verify bot token and chat id (with retries).")
-        test_btn.clicked.connect(d._test_telegram_notification)
-        root.addWidget(test_btn)
+        self._test_btn = QPushButton("Send test notification")
+        self._test_btn.setObjectName("secondaryButton")
+        self._test_btn.setToolTip("Verify bot token and chat id (with retries).")
+        self._test_btn.clicked.connect(self._on_test_clicked)
+        root.addWidget(self._test_btn)
 
         hint = QLabel(
             "Create a bot with <b>@BotFather</b>, paste the token, then message your bot once. "
@@ -2931,22 +2976,27 @@ class LiveNotificationsDialog(QDialog):
         buttons.rejected.connect(self._on_cancel)
         root.addWidget(buttons)
 
+    def _on_test_clicked(self):
+        self._dash._test_telegram_notification(test_button=self._test_btn)
+
     def _release_widgets(self):
         self._dash._stash_live_notifications_widgets()
 
     def _on_cancel(self):
+        self._dash._cancel_telegram_test_worker()
         self._release_widgets()
         self.reject()
 
     def _on_save(self):
-        self._dash._save_live_settings()
+        self._dash._save_telegram_settings()
+        self._dash._apply_live_telegram_settings()
         self._dash._refresh_live_telegram_status()
-        self._dash._on_live_telegram_changed()
         self._dash._live_log("Telegram notification settings saved.")
         self._release_widgets()
         self.accept()
 
     def closeEvent(self, event):
+        self._dash._cancel_telegram_test_worker()
         self._release_widgets()
         super().closeEvent(event)
 
@@ -3227,6 +3277,7 @@ class BacktestDashboard(QMainWindow):
             pass
         self._live_engine: Optional[live_trading.LiveTradingEngine] = None
         self._live_thread: Optional[LiveTradingThread] = None
+        self._telegram_test_worker: Optional[TelegramTestWorker] = None
         self._active_live_journal_dir: Optional[str] = None
         self._live_health_timer = QTimer(self)
         self._live_health_timer.setInterval(8000)
@@ -3843,6 +3894,13 @@ class BacktestDashboard(QMainWindow):
         )
         update_action.triggered.connect(self._check_for_updates)
         help_menu.addAction(update_action)
+
+        token_action = QAction("GitHub Update Token…", self)
+        token_action.setToolTip(
+            "Save a GitHub Personal Access Token for private release updates."
+        )
+        token_action.triggered.connect(self._show_github_token_dialog)
+        help_menu.addAction(token_action)
         help_menu.addSeparator()
 
         shortcuts_action = QAction("Keyboard Shortcuts", self)
@@ -3865,7 +3923,7 @@ class BacktestDashboard(QMainWindow):
         # garbage-collected once this method returns.
         self._shortcut_actions = [
             run_action, output_action, charts_action, export_action,
-            shortcuts_action, update_action, about_action, guide_action,
+            shortcuts_action, update_action, token_action, about_action, guide_action,
             verify_dir_action,
         ]
 
@@ -3913,6 +3971,68 @@ class BacktestDashboard(QMainWindow):
             return
         open_update_window(self)
 
+    def _show_github_token_dialog(self):
+        import updater
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("GitHub Update Token")
+        dlg.setMinimumWidth(460)
+        layout = QVBoxLayout(dlg)
+
+        intro = QLabel(
+            "For private GitHub Releases, paste a Personal Access Token "
+            "(classic with <b>repo</b> scope, or fine-grained with read access "
+            "to this repo). It is saved as a plain text file next to the app — "
+            "not inside the exe."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        token_edit = QLineEdit()
+        token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        token_edit.setPlaceholderText("ghp_… or github_pat_…")
+        if updater.GITHUB_TOKEN:
+            token_edit.setText(updater.GITHUB_TOKEN)
+        form.addRow("Token:", token_edit)
+        layout.addLayout(form)
+
+        path_label = QLabel(f"Will save to:\n{updater._primary_token_path()}")
+        path_label.setWordWrap(True)
+        path_label.setStyleSheet("color: #666666; font-size: 11px;")
+        layout.addWidget(path_label)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            saved_path = updater.save_github_token(token_edit.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid token", str(e))
+            return
+        except OSError as e:
+            QMessageBox.warning(
+                self,
+                "Could not save token",
+                f"Could not write the token file:\n{e}",
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Token saved",
+            f"GitHub token saved to:\n{saved_path}\n\n"
+            "Try Help → Check for Updates…",
+        )
+
     def _show_about_dialog(self):
         try:
             from version import __version__ as app_version
@@ -3926,9 +4046,9 @@ class BacktestDashboard(QMainWindow):
             "Hammer & Doji backtesting, indicators, run history, compare, and "
             "optional MT5 live trading (Windows).<br><br>"
             "<b>Updates:</b> Help → Check for Updates…<br>"
-            "If the repo is private, put a GitHub Personal Access Token in a file "
-            "named <code>.hammer_github_token</code> next to the app "
-            "(classic token with <code>repo</code> scope), then try again.<br>"
+            "Private repo: Help → GitHub Update Token… (or a plain text file "
+            "<code>.hammer_github_token</code> / <code>hammer_github_token.txt</code> "
+            "next to the exe). Classic token needs <code>repo</code> scope.<br>"
             "You must also publish a GitHub <b>Release</b> with a <code>.zip</code> "
             "asset for updates to appear.<br><br>"
             "Press <b>F1</b> for keyboard shortcuts.",
@@ -6380,9 +6500,10 @@ class BacktestDashboard(QMainWindow):
         )
         self.live_telegram_status = QLabel("Off")
         self.live_telegram_status.setObjectName("liveNotifyStatus")
-        self.live_telegram_enabled.toggled.connect(self._on_live_telegram_changed)
-        self.live_telegram_token.editingFinished.connect(self._on_live_telegram_changed)
-        self.live_telegram_chat_id.editingFinished.connect(self._on_live_telegram_changed)
+        self.live_telegram_enabled.toggled.connect(
+            self._refresh_live_telegram_status, Qt.ConnectionType.UniqueConnection
+        )
+        # Apply on Save in Notifications dialog — not on every keystroke (avoids UI stalls).
 
         self.live_settings_strategy_info = QLabel("Strategy summary will appear when you open Settings.")
         self.live_settings_strategy_info.setWordWrap(True)
@@ -6501,12 +6622,57 @@ class BacktestDashboard(QMainWindow):
                 "Stop live before changing settings, then Start again.",
             )
             return
+        host = getattr(self, "_live_settings_host", None)
+        if host is not None:
+            for w in self._live_settings_field_widgets():
+                if _qt_widget_valid(w) and w.parent() is not host:
+                    w.setParent(host)
         dlg = LiveSettingsDialog(self)
         dlg.exec()
 
     def _open_live_notifications(self):
+        host = getattr(self, "_live_notifications_host", None)
+        if host is not None:
+            for w in self._live_notifications_field_widgets():
+                if _qt_widget_valid(w) and w.parent() is not host:
+                    w.setParent(host)
         dlg = LiveNotificationsDialog(self)
         dlg.exec()
+
+    def _telegram_field_values(self) -> tuple[bool, str, str]:
+        if not self._telegram_widgets_valid():
+            return False, "", ""
+        return (
+            self.live_telegram_enabled.isChecked(),
+            self.live_telegram_token.text().strip(),
+            self.live_telegram_chat_id.text().strip(),
+        )
+
+    def _telegram_widgets_valid(self) -> bool:
+        for w in self._live_notifications_field_widgets():
+            if not _qt_widget_valid(w):
+                return False
+        return True
+
+    def _save_telegram_settings(self) -> None:
+        if not self._telegram_widgets_valid():
+            return
+        enabled, token, chat_id = self._telegram_field_values()
+        s = self._settings
+        s.setValue("live/telegram_enabled", enabled)
+        s.setValue("live/telegram_token", token)
+        s.setValue("live/telegram_chat_id", chat_id)
+
+    def _apply_live_telegram_settings(self) -> None:
+        if not self._telegram_widgets_valid():
+            return
+        enabled, token, chat_id = self._telegram_field_values()
+        if self._live_engine is not None and self._live_worker_running():
+            self._live_engine.update_telegram_settings(
+                enabled=enabled,
+                bot_token=token,
+                chat_id=chat_id,
+            )
 
     def _live_notifications_field_widgets(self):
         widgets = [
@@ -6716,14 +6882,13 @@ class BacktestDashboard(QMainWindow):
         self.live_config_summary.setText(html)
 
     def _refresh_live_telegram_status(self) -> None:
-        if not hasattr(self, "live_telegram_status"):
+        if not hasattr(self, "live_telegram_status") or not _qt_widget_valid(self.live_telegram_status):
             return
-        enabled = (
-            hasattr(self, "live_telegram_enabled")
-            and self.live_telegram_enabled.isChecked()
-        )
-        token = self.live_telegram_token.text().strip() if hasattr(self, "live_telegram_token") else ""
-        chat_id = self.live_telegram_chat_id.text().strip() if hasattr(self, "live_telegram_chat_id") else ""
+        if not self._telegram_widgets_valid():
+            return
+        enabled = self.live_telegram_enabled.isChecked()
+        token = self.live_telegram_token.text().strip()
+        chat_id = self.live_telegram_chat_id.text().strip()
         badge = self.live_telegram_status
         if not enabled:
             badge.setText("Off")
@@ -6738,18 +6903,10 @@ class BacktestDashboard(QMainWindow):
         badge.style().polish(badge)
 
     def _on_live_telegram_changed(self) -> None:
-        self._save_live_settings()
+        """Legacy hook — prefer _save_telegram_settings + _apply_live_telegram_settings."""
+        self._save_telegram_settings()
         self._refresh_live_telegram_status()
-        if self._live_engine is not None and self._live_worker_running():
-            self._live_engine.update_runtime_strategy(
-                self._live_engine.strategy_config,
-                self._live_engine.indicator_stack,
-                self._live_engine.pattern_type,
-                self._live_engine.pattern_label,
-                telegram_enabled=self.live_telegram_enabled.isChecked(),
-                telegram_bot_token=self.live_telegram_token.text().strip(),
-                telegram_chat_id=self.live_telegram_chat_id.text().strip(),
-            )
+        self._apply_live_telegram_settings()
 
     def _on_live_pattern_combo_changed(self, pattern_name: str):
         if not pattern_name or not hasattr(self, "pattern_combo"):
@@ -6847,6 +7004,8 @@ class BacktestDashboard(QMainWindow):
 
     def _save_live_settings(self):
         s = self._settings
+        if not _qt_widget_valid(getattr(self, "live_mt5_path", None)):
+            return
         s.setValue("live/mt5_path", self.live_mt5_path.text())
         s.setValue("live/login", self.live_login.text())
         s.setValue("live/server", self.live_server.text())
@@ -6857,7 +7016,8 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/max_positions", self.live_max_positions.text())
         s.setValue("live/poll_sec", self.live_poll_sec.text())
         s.setValue("live/dry_run", self._live_dry_run_checked())
-        s.setValue("live/demo_only", self.live_demo_only.isChecked())
+        if hasattr(self, "live_demo_only") and _qt_widget_valid(self.live_demo_only):
+            s.setValue("live/demo_only", self.live_demo_only.isChecked())
         s.setValue("live/max_daily_trades", self.live_max_daily_trades.text())
         s.setValue("live/max_daily_loss", self.live_max_daily_loss.text())
         s.setValue("live/min_minutes_between", self.live_min_minutes_between.text())
@@ -6866,7 +7026,8 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/use_thread_pool", self._live_thread_pool_checked())
         s.setValue("live/use_ray", self._live_ray_checked())
         s.setValue("live/order_mode", self._live_order_mode_value())
-        s.setValue("live/limit_offset", self.live_limit_offset.text())
+        if hasattr(self, "live_limit_offset") and _qt_widget_valid(self.live_limit_offset):
+            s.setValue("live/limit_offset", self.live_limit_offset.text())
         s.setValue("live/max_entry_deviation", self.live_max_entry_deviation.text())
         s.setValue("live/limit_offset_from_market", self.live_limit_offset_from_market.isChecked())
         s.setValue("live/deviation", self.live_deviation.text())
@@ -6874,9 +7035,11 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/history_bars", self.live_history_bars.text())
         s.setValue("live/fallback_market", self.live_fallback_market.isChecked())
         s.setValue("live/warn_tf_mismatch", self.live_warn_tf_mismatch.isChecked())
-        s.setValue("live/telegram_enabled", self.live_telegram_enabled.isChecked())
-        s.setValue("live/telegram_token", self.live_telegram_token.text())
-        s.setValue("live/telegram_chat_id", self.live_telegram_chat_id.text())
+        if self._telegram_widgets_valid():
+            enabled, token, chat_id = self._telegram_field_values()
+            s.setValue("live/telegram_enabled", enabled)
+            s.setValue("live/telegram_token", token)
+            s.setValue("live/telegram_chat_id", chat_id)
 
     def _restore_live_settings(self):
         if not hasattr(self, "live_mt5_path"):
@@ -6921,9 +7084,17 @@ class BacktestDashboard(QMainWindow):
             self.live_fallback_market.setChecked(s.value("live/fallback_market", False, type=bool))
             self.live_warn_tf_mismatch.setChecked(s.value("live/warn_tf_mismatch", True, type=bool))
         if hasattr(self, "live_telegram_enabled"):
-            self.live_telegram_enabled.setChecked(s.value("live/telegram_enabled", False, type=bool))
-            self.live_telegram_token.setText(s.value("live/telegram_token", "", type=str))
-            self.live_telegram_chat_id.setText(s.value("live/telegram_chat_id", "", type=str))
+            self.live_telegram_enabled.blockSignals(True)
+            self.live_telegram_token.blockSignals(True)
+            self.live_telegram_chat_id.blockSignals(True)
+            try:
+                self.live_telegram_enabled.setChecked(s.value("live/telegram_enabled", False, type=bool))
+                self.live_telegram_token.setText(s.value("live/telegram_token", "", type=str))
+                self.live_telegram_chat_id.setText(s.value("live/telegram_chat_id", "", type=str))
+            finally:
+                self.live_telegram_enabled.blockSignals(False)
+                self.live_telegram_token.blockSignals(False)
+                self.live_telegram_chat_id.blockSignals(False)
         if hasattr(self, "live_dry_run_cb") and hasattr(self, "_live_action_dry_run"):
             self.live_dry_run_cb.blockSignals(True)
             self.live_dry_run_cb.setChecked(s.value("live/dry_run", True, type=bool))
@@ -7033,7 +7204,22 @@ class BacktestDashboard(QMainWindow):
             **{k: v for k, v in self._collect_time_filter_kwargs().items() if k != "time_filter_mode"},
         )
 
-    def _test_telegram_notification(self):
+    def _cancel_telegram_test_worker(self) -> None:
+        worker = getattr(self, "_telegram_test_worker", None)
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.wait(2000)
+        except RuntimeError:
+            pass
+        self._telegram_test_worker = None
+
+    def _test_telegram_notification(self, test_button: Optional[QPushButton] = None):
+        if not self._telegram_widgets_valid():
+            QMessageBox.warning(self, "Telegram", "Telegram fields are not available.")
+            return
         token = self.live_telegram_token.text().strip()
         chat_id = self.live_telegram_chat_id.text().strip()
         if not token or not chat_id:
@@ -7044,27 +7230,55 @@ class BacktestDashboard(QMainWindow):
                 "Token from @BotFather · chat id from @userinfobot",
             )
             return
-        ok, detail = telegram_notify.send_message(
+        if self._telegram_test_worker is not None and self._telegram_test_worker.isRunning():
+            QMessageBox.information(self, "Telegram", "A test is already running — please wait.")
+            return
+
+        if test_button is not None:
+            test_button.setEnabled(False)
+            test_button.setText("Sending test…")
+
+        self._telegram_test_worker = TelegramTestWorker(
             token,
             chat_id,
             "Hammer Live — test notification.\nIf you see this, Telegram alerts are configured.",
-            max_retries=telegram_notify.DEFAULT_MAX_RETRIES,
+            self,
         )
-        if ok:
-            QMessageBox.information(self, "Telegram", "Test message sent successfully.")
-            self._live_log("[TELEGRAM] Test notification sent.")
-            if hasattr(self, "live_telegram_status"):
-                self.live_telegram_status.setText("Test OK")
-                self.live_telegram_status.setProperty("ready", True)
-                self.live_telegram_status.style().unpolish(self.live_telegram_status)
-                self.live_telegram_status.style().polish(self.live_telegram_status)
-        else:
-            QMessageBox.warning(
-                self,
-                "Telegram",
-                f"Could not send test message after retries:\n\n{detail}",
-            )
-            self._live_log(f"[TELEGRAM] Test failed: {detail}")
+        self._telegram_test_worker.finished_ok.connect(
+            lambda _detail: self._on_telegram_test_ok(test_button)
+        )
+        self._telegram_test_worker.failed.connect(
+            lambda detail: self._on_telegram_test_fail(detail, test_button)
+        )
+        self._telegram_test_worker.finished.connect(self._on_telegram_test_worker_finished)
+        self._telegram_test_worker.start()
+
+    def _on_telegram_test_worker_finished(self):
+        self._telegram_test_worker = None
+
+    def _reset_telegram_test_button(self, test_button: Optional[QPushButton]) -> None:
+        if test_button is not None and _qt_widget_valid(test_button):
+            test_button.setEnabled(True)
+            test_button.setText("Send test notification")
+
+    def _on_telegram_test_ok(self, test_button: Optional[QPushButton]):
+        self._reset_telegram_test_button(test_button)
+        QMessageBox.information(self, "Telegram", "Test message sent successfully.")
+        self._live_log("[TELEGRAM] Test notification sent.")
+        if self._telegram_widgets_valid():
+            self.live_telegram_status.setText("Test OK")
+            self.live_telegram_status.setProperty("ready", True)
+            self.live_telegram_status.style().unpolish(self.live_telegram_status)
+            self.live_telegram_status.style().polish(self.live_telegram_status)
+
+    def _on_telegram_test_fail(self, detail: str, test_button: Optional[QPushButton]):
+        self._reset_telegram_test_button(test_button)
+        QMessageBox.warning(
+            self,
+            "Telegram",
+            f"Could not send test message after retries:\n\n{detail}",
+        )
+        self._live_log(f"[TELEGRAM] Test failed: {detail}")
 
     def _live_worker_running(self) -> bool:
         return self._live_thread is not None and self._live_thread.isRunning()
@@ -8172,7 +8386,7 @@ class BacktestDashboard(QMainWindow):
             return
 
         headers = [
-            "Strategy ID", "Created At", "Pattern", "Symbol", "Timeframes", "Body %",
+            "Strategy ID", "Created At", "Pattern", "Symbol", "Market", "Timeframes", "Body %",
             "Net PnL (WC)", "Win Rate (WC)", "PF (WC)", "Max DD % (WC)", "Best Session (WC)",
             "Dominant Wick %", "Position Sizing", "Initial Deposit", "Output Folder",
         ]
@@ -8186,6 +8400,7 @@ class BacktestDashboard(QMainWindow):
             wr = r.get("WinRateWC")
             values = [
                 r.get("StrategyID"), r.get("CreatedAt"), r.get("PatternType"), r.get("Symbol"),
+                r.get("MarketData") or "spot",
                 r.get("TimeframesTested"), r.get("BodyPct"),
                 f"{net:,.2f}" if isinstance(net, (int, float)) else net,
                 f"{wr:.1f}%" if isinstance(wr, (int, float)) else wr,
@@ -9813,6 +10028,7 @@ class TradeInspectDialog(QDialog):
         df = backtest.load_candles_df(
             cfg.data_root, cfg.symbol, tf_folder,
             getattr(cfg, "start_date", None), getattr(cfg, "end_date", None),
+            preferred=backtest.market_preferred_for_config(cfg),
         )
         if df.height == 0:
             ax.text(0.5, 0.5, f"No candles for {cfg.symbol}/{tf_folder}", ha="center", va="center")

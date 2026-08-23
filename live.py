@@ -382,6 +382,7 @@ class LiveTradingEngine:
         self._session_start_equity: Optional[float] = None
         self._last_order_time: float = 0.0
         self._broker_lock = threading.RLock()
+        self._strategy_lock = threading.RLock()
         self._consecutive_errors = 0
         self.last_heartbeat_mono: float = time.monotonic()
         self._poll_ticks: int = 0
@@ -449,51 +450,77 @@ class LiveTradingEngine:
         telegram_chat_id: Optional[str] = None,
     ) -> None:
         """Call from the UI thread after parameter changes — no need to Stop/Start live."""
-        self.strategy_config = strategy_config
-        self.indicator_stack = indicator_stack
-        self.pattern_type = pattern_type
-        self.pattern_label = pattern_label
-        if sessions_enabled is not None:
-            self.live_config.sessions_enabled = list(sessions_enabled)
-        if session_clock is not None:
-            self.live_config.session_clock = session_clock
-        # None = auto IC Markets GMT+2/GMT+3 by bar date
-        self.live_config.broker_utc_offset_hours = broker_utc_offset_hours
-        if ist_time_filter_enabled is not None:
-            self.live_config.ist_time_filter_enabled = bool(ist_time_filter_enabled)
-        if ist_time_start is not None:
-            self.live_config.ist_time_start = str(ist_time_start)
-        if ist_time_end is not None:
-            self.live_config.ist_time_end = str(ist_time_end)
-        if telegram_enabled is not None:
-            self.live_config.telegram_enabled = bool(telegram_enabled)
-        if telegram_bot_token is not None:
-            self.live_config.telegram_bot_token = str(telegram_bot_token)
-        if telegram_chat_id is not None:
-            self.live_config.telegram_chat_id = str(telegram_chat_id)
+        with self._strategy_lock:
+            self.strategy_config = strategy_config
+            self.indicator_stack = indicator_stack
+            self.pattern_type = pattern_type
+            self.pattern_label = pattern_label
+            if sessions_enabled is not None:
+                self.live_config.sessions_enabled = list(sessions_enabled)
+            if session_clock is not None:
+                self.live_config.session_clock = session_clock
+            # None = auto IC Markets GMT+2/GMT+3 by bar date
+            self.live_config.broker_utc_offset_hours = broker_utc_offset_hours
+            if ist_time_filter_enabled is not None:
+                self.live_config.ist_time_filter_enabled = bool(ist_time_filter_enabled)
+            if ist_time_start is not None:
+                self.live_config.ist_time_start = str(ist_time_start)
+            if ist_time_end is not None:
+                self.live_config.ist_time_end = str(ist_time_end)
+            if telegram_enabled is not None:
+                self.live_config.telegram_enabled = bool(telegram_enabled)
+            if telegram_bot_token is not None:
+                self.live_config.telegram_bot_token = str(telegram_bot_token)
+            if telegram_chat_id is not None:
+                self.live_config.telegram_chat_id = str(telegram_chat_id)
+            self._telegram.update(
+                enabled=self.live_config.telegram_enabled,
+                bot_token=self.live_config.telegram_bot_token,
+                chat_id=self.live_config.telegram_chat_id,
+            )
+        extra = ""
+        try:
+            if hasattr(strategy_config, "lookback_candles"):
+                extra = (
+                    f"{hammer_context_logic.describe_hammer_context_rules(strategy_config)} | "
+                    f"{hammer_context_logic.describe_hammer_context_entry_exit(strategy_config)} | "
+                )
+            elif hasattr(strategy_config, "classic_green"):
+                extra = (
+                    f"{logic.describe_hammer_direction_matrix(strategy_config)} | "
+                    f"{logic.describe_hammer_entry_exit(strategy_config)} | "
+                )
+        except Exception:
+            extra = ""
+        self.log(
+            f"[LIVE] Parameters refreshed — {pattern_label} | {extra}"
+            f"indicators: {', '.join(indicator_stack.enabled_indicator_ids()) or 'none'}"
+        )
+        try:
+            self.log(summarize_strategy_params(
+                strategy_config, self.live_config.timeframe_label, pattern_type,
+            ))
+        except Exception:
+            pass
+
+    def update_telegram_settings(
+        self,
+        *,
+        enabled: bool,
+        bot_token: str,
+        chat_id: str,
+    ) -> None:
+        """Lightweight Telegram-only refresh — safe from the notifications dialog."""
+        self.live_config.telegram_enabled = bool(enabled)
+        self.live_config.telegram_bot_token = str(bot_token or "")
+        self.live_config.telegram_chat_id = str(chat_id or "")
         self._telegram.update(
             enabled=self.live_config.telegram_enabled,
             bot_token=self.live_config.telegram_bot_token,
             chat_id=self.live_config.telegram_chat_id,
         )
-        extra = ""
-        if hasattr(strategy_config, "lookback_candles"):
-            extra = (
-                f"{hammer_context_logic.describe_hammer_context_rules(strategy_config)} | "
-                f"{hammer_context_logic.describe_hammer_context_entry_exit(strategy_config)} | "
-            )
-        elif hasattr(strategy_config, "classic_green"):
-            extra = (
-                f"{logic.describe_hammer_direction_matrix(strategy_config)} | "
-                f"{logic.describe_hammer_entry_exit(strategy_config)} | "
-            )
-        self.log(
-            f"[LIVE] Parameters refreshed — {pattern_label} | {extra}"
-            f"indicators: {', '.join(indicator_stack.enabled_indicator_ids()) or 'none'}"
-        )
-        self.log(summarize_strategy_params(
-            strategy_config, self.live_config.timeframe_label, pattern_type,
-        ))
+        state = "on" if self._telegram.enabled else "off"
+        self.log(f"[TELEGRAM] Alerts {state}.")
 
     def _record_trade_event(
         self,
@@ -731,16 +758,17 @@ class LiveTradingEngine:
         forming: logic.Candle,
         logic_tf: str,
     ) -> Tuple[Optional[logic.TradeSignal], Optional[logic.TradeSignal]]:
-        args = (
-            closed, forming, logic_tf, self.pattern_type,
-            self.strategy_config, self.indicator_stack,
-            self.live_config.sessions_enabled,
-            getattr(self.live_config, "session_clock", "broker"),
-            getattr(self.live_config, "broker_utc_offset_hours", None),
-            bool(getattr(self.live_config, "ist_time_filter_enabled", False)),
-            getattr(self.live_config, "ist_time_start", "00:00"),
-            getattr(self.live_config, "ist_time_end", "23:59"),
-        )
+        with self._strategy_lock:
+            args = (
+                closed, forming, logic_tf, self.pattern_type,
+                self.strategy_config, self.indicator_stack,
+                self.live_config.sessions_enabled,
+                getattr(self.live_config, "session_clock", "broker"),
+                getattr(self.live_config, "broker_utc_offset_hours", None),
+                bool(getattr(self.live_config, "ist_time_filter_enabled", False)),
+                getattr(self.live_config, "ist_time_start", "00:00"),
+                getattr(self.live_config, "ist_time_end", "23:59"),
+            )
         if self._ray_remote is not None:
             try:
                 import ray  # type: ignore
@@ -922,7 +950,9 @@ class LiveTradingEngine:
         if self._last_closed_bar_ts is None:
             self._last_closed_bar_ts = last_ts
             self.log(f"[LIVE] Watching bars — last closed {describe_candle(closed[-1])}")
-            snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
+            with self._strategy_lock:
+                ind_stack = self.indicator_stack
+            snapshot = indicator_snapshot_text(closed, forming, ind_stack)
             if snapshot:
                 self.log(
                     f"[LIVE] Indicators right now ({cfg.timeframe_label}, broker feed): {snapshot} — "

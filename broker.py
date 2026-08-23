@@ -43,6 +43,73 @@ class BrokerCredentials:
     server: str = ""
 
 
+def resolve_mt5_symbol_name(mt5, symbol: str) -> Optional[str]:
+    """
+    Find the broker-exact symbol name (e.g. XAUUSD → XAUUSDm).
+    Works with any open MetaTrader5 module (fetch or live).
+    """
+    sym = (symbol or "").strip()
+    if not sym or mt5 is None:
+        return sym or None
+    if mt5.symbol_info(sym) is not None:
+        return sym
+    wanted = sym.upper().replace("/", "").replace(" ", "")
+    candidates: List[str] = []
+    try:
+        all_syms = mt5.symbols_get(group="*")
+    except Exception:
+        all_syms = mt5.symbols_get()
+    if all_syms:
+        for info in all_syms:
+            name = getattr(info, "name", "") or ""
+            if name.upper().replace("/", "") == wanted:
+                return name
+        for info in all_syms:
+            name = getattr(info, "name", "") or ""
+            nu = name.upper().replace("/", "").replace(".", "")
+            if nu.startswith(wanted) or wanted.startswith(nu):
+                candidates.append(name)
+        for suffix in ("m", ".m", "_m", "M", ".i", ".pro", ".", "#"):
+            trial = sym + suffix
+            if mt5.symbol_info(trial) is not None:
+                return trial
+        # Common gold aliases when user types XAUUSD but broker lists GOLD / XAUUSDm
+        if wanted in ("XAUUSD", "GOLD", "XAUUSDM"):
+            for trial in ("XAUUSD", "XAUUSDm", "XAUUSD.", "XAUUSD#", "GOLD", "GOLDm", "GOLD."):
+                if mt5.symbol_info(trial) is not None:
+                    return trial
+            for info in all_syms:
+                name = getattr(info, "name", "") or ""
+                nu = name.upper()
+                if "XAU" in nu or nu.startswith("GOLD"):
+                    candidates.append(name)
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            for c in candidates:
+                if c.upper().replace(".", "").startswith(wanted):
+                    return c
+            return candidates[0]
+    return None
+
+
+def ensure_mt5_symbol_visible(mt5, symbol: str) -> Tuple[bool, str]:
+    """Enable symbol in Market Watch. Returns (ok, message)."""
+    resolved = resolve_mt5_symbol_name(mt5, symbol)
+    if not resolved:
+        return (
+            False,
+            f"Symbol '{symbol}' not found on this broker. "
+            "Use the exact name from MT5 Market Watch (e.g. XAUUSD vs XAUUSDm).",
+        )
+    info = mt5.symbol_info(resolved)
+    if info is None:
+        return False, f"Symbol '{resolved}' unavailable."
+    if not info.visible and not mt5.symbol_select(resolved, True):
+        return False, f"Could not enable '{resolved}' in Market Watch."
+    return True, resolved
+
+
 class MT5Broker:
     """Thin wrapper around MetaTrader5 Python API."""
 
@@ -181,40 +248,7 @@ class MT5Broker:
         """Find broker-exact symbol name (e.g. XAUUSD → XAUUSDm)."""
         if not self.is_connected:
             return (symbol or "").strip() or None
-        sym = (symbol or "").strip()
-        if not sym:
-            return None
-        mt5 = self._mt5
-        if mt5.symbol_info(sym) is not None:
-            return sym
-        wanted = sym.upper()
-        candidates: List[str] = []
-        try:
-            all_syms = mt5.symbols_get(group="*")
-        except Exception:
-            all_syms = mt5.symbols_get()
-        if all_syms:
-            for info in all_syms:
-                name = getattr(info, "name", "") or ""
-                if name.upper() == wanted:
-                    return name
-            for info in all_syms:
-                name = getattr(info, "name", "") or ""
-                nu = name.upper()
-                if nu.startswith(wanted) or wanted.startswith(nu.replace(".", "")):
-                    candidates.append(name)
-            for suffix in ("m", ".m", "_m", "M", ".i", ".pro"):
-                trial = sym + suffix
-                if mt5.symbol_info(trial) is not None:
-                    return trial
-            if len(candidates) == 1:
-                return candidates[0]
-            if candidates:
-                for c in candidates:
-                    if c.upper().startswith(wanted):
-                        return c
-                return candidates[0]
-        return None
+        return resolve_mt5_symbol_name(self._mt5, symbol)
 
     def resolve_and_ensure_symbol(self, symbol: str) -> Tuple[bool, str, str]:
         """Resolve broker symbol name and enable it in Market Watch."""
@@ -223,19 +257,10 @@ class MT5Broker:
         requested = (symbol or "").strip()
         if not requested:
             return False, "Symbol is empty.", requested
-        resolved = self.resolve_symbol_name(requested)
-        if not resolved:
-            return (
-                False,
-                f"Symbol '{requested}' not found on this broker. "
-                "Use the exact name from MT5 Market Watch (e.g. XAUUSD vs XAUUSDm).",
-                requested,
-            )
-        info = self._mt5.symbol_info(resolved)
-        if info is None:
-            return False, f"Symbol '{resolved}' unavailable.", requested
-        if not info.visible and not self._mt5.symbol_select(resolved, True):
-            return False, f"Could not enable '{resolved}' in Market Watch.", requested
+        ok, resolved_or_msg = ensure_mt5_symbol_visible(self._mt5, requested)
+        if not ok:
+            return False, resolved_or_msg, requested
+        resolved = resolved_or_msg
         note = f" (resolved from {requested})" if resolved != requested else ""
         return True, f"Symbol ready: {resolved}{note}", resolved
 

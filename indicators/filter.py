@@ -68,12 +68,20 @@ def _compute_indicator_arrays(
     stack: IndicatorStackConfig,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], List, np.ndarray, np.ndarray, np.ndarray]:
     high, low, close, vol, timestamps = _build_series(df)
-    st_line, st_dir = compute_supertrend(
-        high, low, close,
-        atr_period=stack.supertrend.atr_period,
-        multiplier=stack.supertrend.multiplier,
-    )
-    vwap = compute_vwap(high, low, close, vol, timestamps=timestamps)
+    n = len(close)
+    if stack.supertrend.enabled:
+        st_line, st_dir = compute_supertrend(
+            high, low, close,
+            atr_period=stack.supertrend.atr_period,
+            multiplier=stack.supertrend.multiplier,
+        )
+    else:
+        st_line = np.full(n, np.nan)
+        st_dir = np.zeros(n, dtype=np.int8)
+    if stack.vwap.enabled:
+        vwap = compute_vwap(high, low, close, vol, timestamps=timestamps)
+    else:
+        vwap = np.full(n, np.nan)
     return high, low, close, vol, timestamps, st_line, st_dir, vwap
 
 

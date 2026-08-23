@@ -495,6 +495,8 @@ def plot_price_line_with_trades(
 
     tf_folder = _pick_price_chart_timeframe(ledger, config)
     data_root = (config.data_root or "").strip()
+    if data_root:
+        data_root = bt.resolve_data_root(data_root)
     symbol = (config.symbol or "").strip()
 
     closes_t = []

@@ -26,6 +26,7 @@ hiddenimports = [
     "sessions",
     "hammer_context_logic",
     "telegram_notify",
+    "telegram_workers",
     "version",
     "updater",
     "update_workers",

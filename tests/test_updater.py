@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 import updater
 
 
@@ -22,6 +25,7 @@ def test_skip_user_data_paths():
     assert updater._should_skip_path("output/run/trade_ledger.csv")
     assert updater._should_skip_path("run_history.db")
     assert updater._should_skip_path("presets/client.json")
+    assert updater._should_skip_path(".hammer_github_token")
     assert not updater._should_skip_path("dashboard.py")
     assert not updater._should_skip_path("indicators/supertrend.py")
 
@@ -35,3 +39,19 @@ def test_pick_zip_for_source_mode():
     picked = updater._pick_release_asset(assets)
     assert picked is not None
     assert picked["name"].endswith(".zip")
+
+
+def test_load_token_from_txt_filename(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        token_path = os.path.join(tmp, "hammer_github_token.txt")
+        with open(token_path, "w", encoding="utf-8") as f:
+            f.write("ghp_testtoken1234567890123456789012345678")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setattr(updater, "_token_search_roots", lambda: [tmp])
+        assert updater._load_github_token() == "ghp_testtoken1234567890123456789012345678"
+
+
+def test_normalize_github_token_strips_quotes_and_bom():
+    assert updater._normalize_github_token('"ghp_abc"') == "ghp_abc"
+    assert updater._normalize_github_token("\ufeffghp_abc") == "ghp_abc"

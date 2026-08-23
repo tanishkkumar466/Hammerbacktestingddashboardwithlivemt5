@@ -1,6 +1,6 @@
 """Tests for fetch.py data-folder detect + merge helpers."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import fetch as fetcher
@@ -90,6 +90,37 @@ def test_write_or_merge_monthly(tmp_path: Path):
     assert n1 == 1
     assert n2 == 2
     assert len(fetcher.read_csv_candles(str(path))) == 2
+
+
+def test_mt5_timestamp_uses_utc():
+    dt = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    assert fetcher._mt5_timestamp(dt) == int(dt.timestamp())
+
+
+def test_verify_symbol_resolves_alias(monkeypatch):
+    class FakeInfo:
+        visible = True
+
+    class FakeMT5:
+        def symbol_info(self, sym):
+            if sym == "XAUUSDm":
+                return FakeInfo()
+            return None
+
+        def symbol_get(self):
+            return []
+
+        def symbol_select(self, sym, visible):
+            return True
+
+    monkeypatch.setattr(
+        fetcher,
+        "ensure_mt5_symbol_visible",
+        lambda mt5, sym: (True, "XAUUSDm"),
+    )
+    ok, resolved = fetcher.verify_symbol(FakeMT5(), "XAUUSD", log=lambda _m: None)
+    assert ok is True
+    assert resolved == "XAUUSDm"
 
 
 def test_resolve_write_root_legacy_spot(tmp_path: Path):

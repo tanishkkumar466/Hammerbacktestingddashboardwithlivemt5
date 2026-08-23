@@ -152,6 +152,7 @@ class TelegramNotifier:
         self._max_retries = max_retries
         self._retry_delay_sec = retry_delay_sec
         self._enabled_flag = bool(enabled)
+        self._lock = threading.Lock()
         self.enabled = self._enabled_flag and bool(self._token) and bool(self._chat_id)
 
     @classmethod
@@ -170,13 +171,14 @@ class TelegramNotifier:
         bot_token: Optional[str] = None,
         chat_id: Optional[str] = None,
     ) -> None:
-        if enabled is not None:
-            self._enabled_flag = bool(enabled)
-        if bot_token is not None:
-            self._token = bot_token.strip()
-        if chat_id is not None:
-            self._chat_id = chat_id.strip()
-        self.enabled = self._enabled_flag and bool(self._token) and bool(self._chat_id)
+        with self._lock:
+            if enabled is not None:
+                self._enabled_flag = bool(enabled)
+            if bot_token is not None:
+                self._token = bot_token.strip()
+            if chat_id is not None:
+                self._chat_id = chat_id.strip()
+            self.enabled = self._enabled_flag and bool(self._token) and bool(self._chat_id)
 
     def notify_order_event(
         self,
@@ -195,7 +197,9 @@ class TelegramNotifier:
         mt5_order_id: Optional[int] = None,
         mt5_message: str = "",
     ) -> None:
-        if not self.enabled or event not in ORDER_EVENTS:
+        with self._lock:
+            enabled = self.enabled
+        if not enabled or event not in ORDER_EVENTS:
             return
         text = format_order_alert(
             event,
@@ -220,12 +224,17 @@ class TelegramNotifier:
         ).start()
 
     def _send_and_log(self, event: str, text: str) -> None:
+        with self._lock:
+            token = self._token
+            chat_id = self._chat_id
+            max_retries = self._max_retries
+            retry_delay = self._retry_delay_sec
         ok, detail = send_message(
-            self._token,
-            self._chat_id,
+            token,
+            chat_id,
             text,
-            max_retries=self._max_retries,
-            retry_delay_sec=self._retry_delay_sec,
+            max_retries=max_retries,
+            retry_delay_sec=retry_delay,
         )
         if ok:
             self._log(f"[TELEGRAM] Alert sent ({event}).")

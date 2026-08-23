@@ -36,23 +36,117 @@ GITHUB_OWNER = "tanishkkumar466"
 GITHUB_REPO = "Hammerbacktestingddashboardwithlivemt5"
 
 
+_TOKEN_FILE_NAMES = (
+    ".hammer_github_token",
+    ".github_token",
+    # Windows Notepad often appends .txt or drops the leading dot:
+    "hammer_github_token.txt",
+    ".hammer_github_token.txt",
+    "hammer_github_token",
+)
+
+
+def _normalize_github_token(raw: str) -> Optional[str]:
+    token = (raw or "").strip().strip('"').strip("'")
+    if token.startswith("\ufeff"):
+        token = token.lstrip("\ufeff").strip()
+    if "\x00" in token:
+        return None
+    return token or None
+
+
+def _read_token_file(path: str) -> Optional[str]:
+    for encoding in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                token = _normalize_github_token(f.read())
+            if token:
+                return token
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _token_search_roots() -> list[str]:
+    """Folders where we look for (or save) the GitHub token file."""
+    roots: list[str] = []
+    if getattr(sys, "frozen", False):
+        roots.append(os.path.dirname(sys.executable))
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    if os.getcwd():
+        roots.append(os.getcwd())
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for base in roots:
+        if not base:
+            continue
+        norm = os.path.normpath(base)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(norm)
+    return ordered
+
+
+def _primary_token_path() -> str:
+    return os.path.join(_token_search_roots()[0], ".hammer_github_token")
+
+
+def token_lookup_hint() -> str:
+    """Human-readable hint for Help / error dialogs."""
+    roots = _token_search_roots()
+    if not roots:
+        return "Put a plain-text token file next to HammerCandleBacktestDashboard.exe"
+    lines = [
+        "Plain text file — one line only, starting with ghp_",
+        "",
+        "Accepted names (same folder as the .exe):",
+        "  .hammer_github_token",
+        "  hammer_github_token.txt",
+        "",
+        "This app looks in:",
+    ]
+    for base in roots:
+        lines.append(f"  {base}")
+    lines.append("")
+    lines.append(f"Or use Help → GitHub Update Token… to save it for you.")
+    return "\n".join(lines)
+
+
+def save_github_token(token: str) -> str:
+    """Write token next to the app. Returns the file path."""
+    cleaned = _normalize_github_token(token)
+    if not cleaned:
+        raise ValueError("Token is empty.")
+    if not cleaned.startswith(("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")):
+        raise ValueError(
+            "That does not look like a GitHub token. It should start with ghp_ "
+            "(classic) or github_pat_ (fine-grained)."
+        )
+    path = _primary_token_path()
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(cleaned)
+    global GITHUB_TOKEN
+    GITHUB_TOKEN = cleaned
+    return path
+
+
 def _load_github_token() -> Optional[str]:
-    """Token for private repos. Env wins; else optional local file (gitignored)."""
+    """Token for private repos. Env wins; else file next to app / module (gitignored)."""
     for key in ("GITHUB_TOKEN", "GH_TOKEN"):
-        val = (os.environ.get(key) or "").strip()
+        val = _normalize_github_token(os.environ.get(key) or "")
         if val:
             return val
-    # Optional: put a PAT in this file next to the app (never commit it)
-    for name in (".hammer_github_token", ".github_token"):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
-        try:
+    # Frozen exe: token lives beside the executable, not inside _MEIPASS bundle.
+    for base in _token_search_roots():
+        for name in _TOKEN_FILE_NAMES:
+            path = os.path.join(base, name)
             if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    token = f.read().strip()
+                token = _read_token_file(path)
                 if token:
                     return token
-        except OSError:
-            pass
     return None
 
 
@@ -81,6 +175,11 @@ _SKIP_DIR_NAMES = {
 _SKIP_FILE_NAMES = {
     "run_history.db",
     ".env",
+    ".hammer_github_token",
+    ".github_token",
+    "hammer_github_token.txt",
+    ".hammer_github_token.txt",
+    "hammer_github_token",
     "credentials.json",
     "secrets.json",
     ".DS_Store",
@@ -196,8 +295,9 @@ def check_for_update() -> Optional[ReleaseInfo]:
                     "Your token may lack access, or the owner/repo name is wrong."
                     if GITHUB_TOKEN
                     else (
-                        "Repo is likely private. Put a GitHub token in "
-                        ".hammer_github_token (Help → About), then restart Hammer."
+                        "Repo is likely private. Add a GitHub token:\n"
+                        "Help → GitHub Update Token…\n\n"
+                        + token_lookup_hint()
                     )
                 )
             ),
