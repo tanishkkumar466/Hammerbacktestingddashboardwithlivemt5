@@ -1,6 +1,8 @@
 # PyInstaller spec — Windows one-file HammerCandleBacktestDashboard.exe
 # Local:  pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
-# CI:     .github/workflows/release-windows-exe.yml
+#
+# Bundles every runtime library Hammer needs on Windows 10/11 (~400–450 MB one-file).
+# Do NOT exclude ray — live optional compute requires the full ray tree.
 
 import os
 import sys
@@ -16,63 +18,53 @@ datas = []
 binaries = []
 hiddenimports = [
     # --- app modules ---
-    "dashboard",
-    "backtest",
-    "plotting",
-    "logic",
-    "doji_logic",
-    "broker",
-    "live",
-    "live_journal",
-    "fetch",
-    "sessions",
-    "hammer_context_logic",
-    "telegram_notify",
-    "telegram_workers",
-    "version",
-    "updater",
-    "update_workers",
-    "update_window",
-    "indicators",
-    "indicators.config",
-    "indicators.filter",
-    "indicators.registry",
-    "indicators.supertrend",
-    "indicators.vwap",
-    # --- stdlib / runtime (sqlite3 often missing if not explicit) ---
-    "sqlite3",
-    "_sqlite3",
-    "encodings",
-    "encodings.utf_8",
-    "encodings.cp1252",
-    # --- third party ---
+    "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker", "live",
+    "live_journal", "fetch", "sessions", "hammer_context_logic",
+    "telegram_notify", "telegram_workers", "version", "updater",
+    "update_workers", "update_window",
+    "indicators", "indicators.config", "indicators.filter", "indicators.registry",
+    "indicators.supertrend", "indicators.vwap",
+    # --- stdlib (sqlite, ssl/https, multiprocessing for ray) ---
+    "sqlite3", "_sqlite3",
+    "ssl", "_ssl", "hashlib", "_hashlib",
+    "encodings", "encodings.utf_8", "encodings.cp1252",
+    "multiprocessing", "multiprocessing.spawn", "multiprocessing.popen_spawn_win32",
+    "zoneinfo",
+    # --- UI: PySide6 / Qt ---
+    "shiboken6", "shiboken6.Shiboken",
+    "PySide6", "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",
+    "PySide6.QtNetwork", "PySide6.support", "PySide6.support.deprecated",
+    # --- charts: matplotlib (Agg PNG export + Qt inspect dialog) ---
+    "matplotlib", "matplotlib.backends", "matplotlib.backends.backend_agg",
+    "matplotlib.backends.backend_qtagg", "matplotlib.backends.backend_qt",
+    "matplotlib.backends.backend_qt5agg", "matplotlib.figure",
+    "matplotlib.pyplot", "matplotlib.dates", "matplotlib.patches",
+    # --- data / backtest ---
+    "numpy", "numpy.core", "numpy.core._multiarray_umath",
+    "polars", "pyarrow",
+    # --- images ---
+    "PIL", "PIL.Image", "PIL._imaging",
+    # --- excel export chain ---
+    "openpyxl", "openpyxl.styles", "openpyxl.cell", "openpyxl.workbook", "openpyxl.utils",
+    "et_xmlfile", "defusedxml", "defusedxml.ElementTree",
+    # --- live / system ---
+    "psutil", "_psutil_windows",
+    # --- HTTPS (updater + telegram via urllib/ssl) ---
+    "certifi", "charset_normalizer", "idna", "urllib3",
+    # --- matplotlib deps ---
+    "kiwisolver", "fonttools", "contourpy", "cycler", "pyparsing",
+    "packaging", "dateutil", "six",
+    # --- timezones (Windows) ---
+    "tzdata",
+    # --- Windows live: MT5 + ray ---
     "MetaTrader5",
-    "openpyxl",
-    "openpyxl.styles",
-    "openpyxl.cell",
-    "openpyxl.workbook",
-    "openpyxl.utils",
-    "matplotlib",
-    "matplotlib.backends",
-    "matplotlib.backends.backend_agg",
-    "numpy",
-    "numpy.core",
-    "numpy.core._multiarray_umath",
-    "PIL",
-    "PIL.Image",
-    "polars",
-    "psutil",
-    "shiboken6",
-    "shiboken6.Shiboken",
-    "PySide6",
-    "PySide6.QtCore",
-    "PySide6.QtGui",
-    "PySide6.QtWidgets",
-    "PySide6.QtNetwork",
-    "PySide6.support",
+    "ray", "ray._private", "ray._private.object_ref_generator",
+    "ray._private.worker", "ray._private.services", "ray._private.runtime_env",
+    # --- ray transitive (collect_all also pulls these; explicit = safer in CI) ---
+    "cloudpickle", "filelock", "jsonschema", "msgpack", "yaml",
+    "google.protobuf", "grpc", "grpcio",
 ]
 
-# Bundle icons for get_asset_path()
 for asset_name in ("logo.ico", "app_icon.ico", "app_icon.png", "logo.png"):
     asset_path = ROOT / asset_name
     if asset_path.is_file():
@@ -80,57 +72,102 @@ for asset_name in ("logo.ico", "app_icon.ico", "app_icon.png", "logo.png"):
 
 
 def _collect_package(name: str) -> None:
-    """Merge collect_all() output; skip optional packages cleanly."""
     try:
         d, b, h = collect_all(name)
         datas.extend(d)
         binaries.extend(b)
         hiddenimports.extend(h)
+        print(f"[spec] collect_all({name}): {len(d)} datas, {len(b)} binaries, {len(h)} hidden")
     except Exception as exc:
         print(f"[spec] collect_all({name}) skipped: {exc}")
 
 
-# Heavy deps — must be fully bundled (missing = smaller exe + ModuleNotFoundError)
-for _pkg in (
+# requirements.txt + every audited dependency (target ~420 MB one-file exe)
+_RUNTIME_PACKAGES = (
+    # UI
     "PySide6",
     "shiboken6",
+    # data / charts
     "polars",
+    "pyarrow",
     "numpy",
     "matplotlib",
     "PIL",
+    # excel
     "openpyxl",
+    "et_xmlfile",
+    "defusedxml",
+    # live helpers
     "psutil",
-):
+    # HTTPS / CA bundle
+    "certifi",
+    "charset_normalizer",
+    # matplotlib stack
+    "kiwisolver",
+    "fonttools",
+    "contourpy",
+    "cycler",
+    "pyparsing",
+    "packaging",
+    "dateutil",
+    "six",
+    # timezones
+    "tzdata",
+    # ray deps (ray collect_all pulls more; these cover partial CI installs)
+    "cloudpickle",
+    "filelock",
+    "jsonschema",
+    "msgpack",
+    "protobuf",
+    "grpcio",
+    "PyYAML",
+)
+
+for _pkg in _RUNTIME_PACKAGES:
     _collect_package(_pkg)
 
-# Windows-only: match local ~420 MB builds (ray + MT5 are large but required for Live)
 if sys.platform == "win32":
     for _pkg in ("MetaTrader5", "ray"):
         _collect_package(_pkg)
-    hiddenimports += ["ray", "ray._private"]
 
-try:
-    hiddenimports += collect_submodules("indicators")
-except Exception:
-    pass
+# Full submodule trees — ray._private.* fixes "No module named ray._private.object_ref_generator"
+for _mod in ("indicators", "ray", "ray._private", "matplotlib.backends"):
+    try:
+        hiddenimports += collect_submodules(_mod)
+    except Exception as exc:
+        print(f"[spec] collect_submodules({_mod}) skipped: {exc}")
 
-datas += collect_data_files("matplotlib")
+# Data files not always picked up by collect_all alone
+for _data_pkg in ("matplotlib", "certifi", "tzdata", "pyarrow", "PySide6"):
+    try:
+        datas += collect_data_files(_data_pkg)
+    except Exception as exc:
+        print(f"[spec] collect_data_files({_data_pkg}) skipped: {exc}")
 
-# Windows: explicitly bundle sqlite3 native extension (fixes "No module named _sqlite3")
+# Windows native extensions (sqlite3, OpenSSL for HTTPS)
 if sys.platform == "win32":
-    _search_roots = [
+    _win_native = (
+        "_sqlite3.pyd",
+        "sqlite3.dll",
+        "_ssl.pyd",
+        "_hashlib.pyd",
+        "libcrypto-3.dll",
+        "libssl-3.dll",
+        "pyexpat.pyd",
+        "_elementtree.pyd",
+    )
+    for base in (
         sysconfig.get_path("stdlib"),
         os.path.join(sys.base_prefix, "DLLs"),
         sys.base_prefix,
-    ]
-    for base in _search_roots:
+    ):
         if not base or not os.path.isdir(base):
             continue
-        for fname in ("_sqlite3.pyd", "sqlite3.dll"):
+        for fname in _win_native:
             fpath = os.path.join(base, fname)
             if os.path.isfile(fpath):
                 binaries.append((fpath, "."))
-                print(f"[spec] bundled {fname} from {base}")
+                print(f"[spec] bundled {fname}")
 
 _exe_icon = None
 for icon_name in ("logo.ico", "app_icon.ico"):
@@ -138,9 +175,6 @@ for icon_name in ("logo.ico", "app_icon.ico"):
     if p.is_file():
         _exe_icon = str(p)
         break
-
-block_cipher = None
-_runtime_hooks = [str(ROOT / "pyinstaller" / "hammer_runtime_hook.py")]
 
 a = Analysis(
     [entry_script],
@@ -150,17 +184,18 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=_runtime_hooks,
+    runtime_hooks=[str(ROOT / "pyinstaller" / "hammer_runtime_hook.py")],
     excludes=["tkinter", "pytest", "IPython", "jupyter", "notebook"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
-    cipher=block_cipher,
+    cipher=None,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
-# One-file exe — upx off, extract cache beside exe (avoids temp-dir / interpreter errors)
+# One-file exe — default _MEI temp (required for PyInstaller 6.22+ security validation).
+# Do NOT set runtime_tmpdir to a custom name — breaks "parent process" security checks.
 exe = EXE(
     pyz,
     a.scripts,
@@ -174,7 +209,7 @@ exe = EXE(
     strip=False,
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir="_hammer_pyi",
+    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

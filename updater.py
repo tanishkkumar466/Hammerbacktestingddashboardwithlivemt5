@@ -173,7 +173,6 @@ _SKIP_DIR_NAMES = {
     ".cursor",
     "_hammer_update_staging",
     "_hammer_update_extract",
-    "_hammer_pyi",
 }
 _SKIP_FILE_NAMES = {
     "run_history.db",
@@ -273,15 +272,19 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
         pts = 0
         if name.endswith(".exe"):
             pts += 200
-            # Full Windows bundle ~380–450 MB; tiny = broken, ~325 MB = missing ray/MT5
+            # Full Windows bundle ~400–450 MB; tiny = broken, ~325 MB = missing ray/MT5
             if size and size < 50_000_000:
                 pts -= 200
             elif size and size < 300_000_000:
                 pts -= 80
+            elif size >= 400_000_000:
+                pts += 60
             elif size >= 380_000_000:
-                pts += 50
+                pts += 40
             elif size >= 350_000_000:
-                pts += 30
+                pts += 20
+            elif size and size < 350_000_000:
+                pts -= 80
         if name == "hammercandlebacktestdashboard.exe":
             pts += 60
         if "windows" in name:
@@ -505,6 +508,31 @@ def _is_onedir_payload(payload_root: str) -> bool:
 # Windows: apply update after this process exits (exe swap or onedir folder copy)
 _WINDOWS_UPDATE_BAT: list = [None]
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+_DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+_PYI_RELAUNCH_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
+
+
+def _windows_relaunch_lines(root: str, exe_path: str) -> list[str]:
+    """
+    Relaunch lines for update .bat files.
+
+    PYINSTALLER_RESET_ENVIRONMENT=1 is required when restarting a one-file exe
+    after self-update (PyInstaller 6.9+). Without it: 'Security validation failure'.
+    """
+    return [
+        f'set {_PYI_RELAUNCH_ENV}=1',
+        f'start "" /D "{root}" "{exe_path}"',
+    ]
+
+
+def _spawn_frozen_relaunch(exe_path: str, root: str) -> None:
+    """Launch a fresh one-file exe instance (post-update or relaunch)."""
+    env = os.environ.copy()
+    env[_PYI_RELAUNCH_ENV] = "1"
+    kwargs: dict = {"cwd": root, "env": env, "close_fds": True}
+    if os.name == "nt":
+        kwargs["creationflags"] = _CREATE_NO_WINDOW | _DETACHED_PROCESS
+    subprocess.Popen([exe_path], **kwargs)
 
 
 def _write_windows_update_bat(*, pid: int, lines: list[str]) -> str:
@@ -548,7 +576,7 @@ def _schedule_windows_onedir_update(payload_root: str, status_cb: Callable[[str]
         pid=os.getpid(),
         lines=[
             f'xcopy /E /Y /I /Q "{staging}\\*" "{root}\\" >nul',
-            f'start "" /D "{root}" "{target_exe}"',
+            *_windows_relaunch_lines(root, target_exe),
             f'rmdir /S /Q "{staging}" 2>nul',
         ],
     )
@@ -576,13 +604,12 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
         bat = _write_windows_update_bat(
             pid=os.getpid(),
             lines=[
-                f'rmdir /S /Q "{root}\\_hammer_pyi" 2>nul',
                 f'del /F /Q "{current_exe}.old" 2>nul',
                 f'move /Y "{current_exe}" "{current_exe}.old" >nul',
                 f'copy /Y "{staged}" "{current_exe}" >nul',
                 f'del /F /Q "{staged}" 2>nul',
                 f'del /F /Q "{current_exe}.old" 2>nul',
-                f'start "" /D "{root}" "{current_exe}"',
+                *_windows_relaunch_lines(root, current_exe),
             ],
         )
         _WINDOWS_UPDATE_BAT[0] = bat
@@ -613,16 +640,16 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
         os._exit(0)
 
     if os.name == "nt":
-        relauncher = os.path.join(root, "_hammer_relaunch.bat")
-        with open(relauncher, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write("@echo off\r\n")
-            f.write("timeout /t 1 /nobreak >nul\r\n")
-            if getattr(sys, "frozen", False):
-                f.write(f'start "" /D "{root}" "{python_exe}"\r\n')
-            else:
+        if getattr(sys, "frozen", False):
+            _spawn_frozen_relaunch(python_exe, root)
+        else:
+            relauncher = os.path.join(root, "_hammer_relaunch.bat")
+            with open(relauncher, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write("@echo off\r\n")
+                f.write("timeout /t 1 /nobreak >nul\r\n")
                 f.write(f'start "" /D "{root}" "{python_exe}" "{main_script}"\r\n')
-            f.write('del /F /Q "%~f0" 2>nul\r\n')
-        _spawn_detached(["cmd", "/c", relauncher])
+                f.write('del /F /Q "%~f0" 2>nul\r\n')
+            _spawn_detached(["cmd", "/c", relauncher])
     else:
         if getattr(sys, "frozen", False):
             subprocess.Popen([python_exe], cwd=root)

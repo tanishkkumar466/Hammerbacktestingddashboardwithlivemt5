@@ -49,7 +49,7 @@ jobs:
       - name: Verify runtime imports
         shell: pwsh
         run: |
-          python -c "import sqlite3, _sqlite3, PySide6, polars, numpy, matplotlib, ray; print('imports OK')"
+          python -c "import sqlite3, _sqlite3, ssl, PySide6, shiboken6, polars, pyarrow, numpy, matplotlib; import matplotlib.backends.backend_qtagg, matplotlib.backends.backend_qt; import openpyxl, et_xmlfile, defusedxml, tzdata, psutil, ray, MetaTrader5; print('imports OK')"
 
       - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
@@ -62,7 +62,7 @@ jobs:
           $size = (Get-Item $exe).Length
           $mb = [math]::Round($size / 1MB, 1)
           Write-Host "Built $exe ($mb MB)"
-          if ($size -lt 350MB) { throw "EXE too small ($mb MB) — expected ~380-450 MB" }
+          if ($size -lt 380MB) { throw "EXE too small ($mb MB) — expected ~400-450 MB" }
 
       - name: Package delivery zip
         shell: pwsh
