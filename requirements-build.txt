@@ -11,7 +11,12 @@
 
 setuptools>=69
 wheel>=0.43
-pyinstaller>=6.22.2,<7
+pyinstaller==6.21.0
+# IMPORTANT: do NOT use 6.22.1+ for Hammer one-file Windows builds.
+# 6.22.1 added "Security validation failure: Failed to obtain executable path
+# for parent process" which breaks self-update relaunch (parent becomes cmd.exe)
+# and can also fail on junctions/OneDrive/AV. 6.21.0 is the last release without
+# that bootloader check — matches older working ~430 MB client builds.
 
 # =============================================================================
 # HTTPS / networking (updater, Telegram, ray)

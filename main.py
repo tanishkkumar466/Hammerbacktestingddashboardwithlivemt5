@@ -106,6 +106,10 @@ def _run_plots() -> int:
 
 
 def main() -> int:
+    # If this process was launched as a fresh instance after update, drop the
+    # public reset flag so child workers (ray/multiprocessing) behave normally.
+    os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+
     _cleanup_stale_update_artifacts()
     parser = argparse.ArgumentParser(description="Hammer candle backtest dashboard")
     parser.add_argument(

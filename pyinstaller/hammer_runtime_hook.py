@@ -20,17 +20,33 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
             os.add_dll_directory(meipass)
         except OSError:
             pass
+        for sub in (
+            os.path.join(meipass, "PySide6"),
+            os.path.join(meipass, "PySide6", "plugins"),
+            os.path.join(meipass, "PySide6", "plugins", "platforms"),
+            os.path.join(meipass, "shiboken6"),
+        ):
+            if os.path.isdir(sub):
+                try:
+                    os.add_dll_directory(sub)
+                except OSError:
+                    pass
 
     # PySide6 platform plugin (qwindows.dll) — required for QApplication to start
     for plugins in (
         os.path.join(meipass, "PySide6", "plugins"),
+        os.path.join(meipass, "PySide6", "Qt6", "plugins"),
         os.path.join(meipass, "PySide6", "Qt", "plugins"),
     ):
         if os.path.isdir(plugins):
             os.environ["QT_PLUGIN_PATH"] = plugins
-            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugins
             platforms = os.path.join(plugins, "platforms")
-            if os.path.isdir(platforms) and sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+            os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = platforms
+            if (
+                os.path.isdir(platforms)
+                and sys.platform == "win32"
+                and hasattr(os, "add_dll_directory")
+            ):
                 try:
                     os.add_dll_directory(platforms)
                 except OSError:

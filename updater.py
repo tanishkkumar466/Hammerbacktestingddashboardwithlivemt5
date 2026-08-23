@@ -511,24 +511,68 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 _PYI_RELAUNCH_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
 
+# Private bootloader vars — if left set, a new onefile exe thinks it is a child
+# of the previous instance / cmd.exe and dies with security validation failure.
+_PYI_PRIVATE_ENV_VARS = (
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_LINUX_PROCESS_NAME",
+    "_PYI_SPLASH_IPC",
+)
+
+
+def _strip_pyi_env(env: dict) -> dict:
+    """Return a copy of env safe for launching a fresh one-file Hammer instance."""
+    cleaned = {k: v for k, v in env.items() if not str(k).startswith("_PYI_")}
+    cleaned[_PYI_RELAUNCH_ENV] = "1"
+    return cleaned
+
 
 def _windows_relaunch_lines(root: str, exe_path: str) -> list[str]:
     """
     Relaunch lines for update .bat files.
 
-    PYINSTALLER_RESET_ENVIRONMENT=1 is required when restarting a one-file exe
-    after self-update (PyInstaller 6.9+). Without it: 'Security validation failure'.
+    Why Check-for-Updates breaks but double-click works
+    ----------------------------------------------------
+    The update bat is started from the frozen Hammer process, so cmd.exe
+    inherits PyInstaller private env vars (_PYI_*). The new one-file exe then
+    thinks it is a *child* of that old instance. Its real parent is cmd.exe,
+    so the bootloader fails with:
+      Security validation failure: Failed to obtain executable path for parent process
+
+    Double-click works because Explorer starts the exe with a clean environment.
+
+    Fix: wipe every _PYI_* var in the bat, set PYINSTALLER_RESET_ENVIRONMENT=1,
+    then start the new exe so it boots as a fresh top-level one-file instance.
     """
-    return [
-        f'set {_PYI_RELAUNCH_ENV}=1',
-        f'start "" /D "{root}" "{exe_path}"',
+    # Clear any _PYI_* that exist (names vary by PyInstaller version)
+    lines = [
+        'for /f "tokens=1 delims==" %%V in (\'set _PYI_ 2^>nul\') do set "%%V="',
     ]
+    for _var in _PYI_PRIVATE_ENV_VARS:
+        lines.append(f'set "{_var}="')
+    lines.append(f'set "{_PYI_RELAUNCH_ENV}=1"')
+    # Prefer PowerShell Start-Process after env wipe — more reliable than start
+    # when cmd itself was spawned from a frozen one-file process.
+    ps = (
+        f"Get-ChildItem Env: | Where-Object {{ $_.Name -like '_PYI_*' }} | "
+        f"ForEach-Object {{ Remove-Item -LiteralPath ('Env:' + $_.Name) -ErrorAction SilentlyContinue }}; "
+        f"$env:{_PYI_RELAUNCH_ENV}='1'; "
+        f"Start-Process -FilePath '{exe_path}' -WorkingDirectory '{root}'"
+    )
+    # Escape for cmd: keep as one powershell -Command string
+    ps_escaped = ps.replace('"', '\\"')
+    lines.append(
+        f'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+        f'-Command "{ps_escaped}"'
+    )
+    return lines
 
 
 def _spawn_frozen_relaunch(exe_path: str, root: str) -> None:
     """Launch a fresh one-file exe instance (post-update or relaunch)."""
-    env = os.environ.copy()
-    env[_PYI_RELAUNCH_ENV] = "1"
+    env = _strip_pyi_env(os.environ.copy())
     kwargs: dict = {"cwd": root, "env": env, "close_fds": True}
     if os.name == "nt":
         kwargs["creationflags"] = _CREATE_NO_WINDOW | _DETACHED_PROCESS
@@ -546,7 +590,8 @@ def _write_windows_update_bat(*, pid: int, lines: list[str]) -> str:
     script.append("  timeout /t 1 /nobreak >nul")
     script.append(f"  goto {label}")
     script.append(")")
-    script.append("timeout /t 2 /nobreak >nul")
+    # Extra wait: one-file parent process may still be releasing the .exe lock
+    script.append("timeout /t 3 /nobreak >nul")
     script.extend(lines)
     script.append('del /F /Q "%~f0" 2>nul')
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
@@ -555,7 +600,14 @@ def _write_windows_update_bat(*, pid: int, lines: list[str]) -> str:
 
 
 def _spawn_detached(cmd: list[str]) -> None:
-    kwargs: dict = {}
+    """
+    Spawn update/relaunch helper without leaking PyInstaller _PYI_* env into cmd.
+
+    If cmd inherits _PYI_*, even a careful bat can relaunch Hammer as a 'child'
+    and trigger security validation failure after Check for Updates.
+    """
+    env = _strip_pyi_env(os.environ.copy())
+    kwargs: dict = {"env": env, "close_fds": True}
     if os.name == "nt":
         kwargs["creationflags"] = _CREATE_NO_WINDOW
     subprocess.Popen(cmd, **kwargs)
@@ -652,7 +704,12 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
             _spawn_detached(["cmd", "/c", relauncher])
     else:
         if getattr(sys, "frozen", False):
-            subprocess.Popen([python_exe], cwd=root)
+            env = os.environ.copy()
+            for key in list(env):
+                if str(key).startswith("_PYI_"):
+                    env.pop(key, None)
+            env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            subprocess.Popen([python_exe], cwd=root, env=env)
         else:
             subprocess.Popen([python_exe, main_script], cwd=root)
 

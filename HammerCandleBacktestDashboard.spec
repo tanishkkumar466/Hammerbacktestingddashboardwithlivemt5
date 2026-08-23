@@ -201,6 +201,9 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
+# One-file exe — default _MEI temp directory (do not set a custom runtime_tmpdir).
+# Built with PyInstaller 6.21.0 (see requirements-build.txt) to avoid 6.22.1+
+# "Security validation failure: Failed to obtain executable path for parent process".
 exe = EXE(
     pyz,
     a.scripts,
