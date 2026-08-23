@@ -92,10 +92,11 @@ class ReleaseInfo:
     tag: str
     version: str
     notes: str
-    download_url: str
+    download_url: str  # API asset URL for private repos; browser URL as fallback
     asset_name: str
     asset_size: int
     asset_kind: str  # "zip" | "exe"
+    asset_id: Optional[int] = None
 
 
 class UpdateError(Exception):
@@ -234,14 +235,23 @@ def check_for_update() -> Optional[ReleaseInfo]:
 
     name = asset.get("name", "") or "update.bin"
     kind = "exe" if name.lower().endswith(".exe") else "zip"
+    # Private repos: browser_download_url returns 404 even with a token.
+    # Always prefer the API asset URL + Accept: application/octet-stream.
+    api_url = asset.get("url") or ""
+    browser_url = asset.get("browser_download_url") or ""
+    download_url = api_url or browser_url
+    if not download_url:
+        raise UpdateError("Release asset has no download URL.")
+
     info = ReleaseInfo(
         tag=tag,
         version=version,
         notes=notes,
-        download_url=asset["browser_download_url"],
+        download_url=download_url,
         asset_name=name,
         asset_size=int(asset.get("size", 0) or 0),
         asset_kind=kind,
+        asset_id=asset.get("id"),
     )
 
     if is_newer(info.version):
@@ -254,21 +264,33 @@ def _download_file(
     dest_path: str,
     progress_cb: Callable[[int, int], None],
 ) -> None:
+    global GITHUB_TOKEN
+    GITHUB_TOKEN = _load_github_token()
+
     req = urllib.request.Request(
         url,
         headers=_request_headers("application/octet-stream"),
     )
-    with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out_file:
-        total = int(resp.headers.get("Content-Length", 0) or 0)
-        downloaded = 0
-        chunk_size = 65536
-        while True:
-            chunk = resp.read(chunk_size)
-            if not chunk:
-                break
-            out_file.write(chunk)
-            downloaded += len(chunk)
-            progress_cb(downloaded, total)
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, "wb") as out_file:
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            chunk_size = 65536
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+                downloaded += len(chunk)
+                progress_cb(downloaded, total)
+    except urllib.error.HTTPError as e:
+        raise UpdateError(
+            f"Download failed (HTTP {e.code}). "
+            "For private repos the app must use the API asset URL with your token "
+            f"— retry after restart. Detail: {e.reason}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise UpdateError(f"Download network error: {e.reason}") from e
 
 
 def app_root() -> str:
