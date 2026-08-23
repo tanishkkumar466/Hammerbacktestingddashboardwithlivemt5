@@ -22,6 +22,7 @@ import doji_logic
 import hammer_context_logic
 import logic
 import sessions
+import telegram_notify
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
@@ -105,6 +106,10 @@ class LiveRunConfig:
     ist_time_filter_enabled: bool = False
     ist_time_start: str = "00:00"
     ist_time_end: str = "23:59"
+    # Telegram alerts (single chat — bot token + chat id from @BotFather / @userinfobot)
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
 
 def reanchor_sl_tp_to_fill(
@@ -387,6 +392,7 @@ class LiveTradingEngine:
             self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="live-signal")
         if live_config.use_ray_if_available:
             self._try_init_ray()
+        self._telegram = telegram_notify.TelegramNotifier.from_live_config(live_config, log)
 
     def _try_init_ray(self):
         try:
@@ -438,6 +444,9 @@ class LiveTradingEngine:
         ist_time_filter_enabled: Optional[bool] = None,
         ist_time_start: Optional[str] = None,
         ist_time_end: Optional[str] = None,
+        telegram_enabled: Optional[bool] = None,
+        telegram_bot_token: Optional[str] = None,
+        telegram_chat_id: Optional[str] = None,
     ) -> None:
         """Call from the UI thread after parameter changes — no need to Stop/Start live."""
         self.strategy_config = strategy_config
@@ -456,6 +465,17 @@ class LiveTradingEngine:
             self.live_config.ist_time_start = str(ist_time_start)
         if ist_time_end is not None:
             self.live_config.ist_time_end = str(ist_time_end)
+        if telegram_enabled is not None:
+            self.live_config.telegram_enabled = bool(telegram_enabled)
+        if telegram_bot_token is not None:
+            self.live_config.telegram_bot_token = str(telegram_bot_token)
+        if telegram_chat_id is not None:
+            self.live_config.telegram_chat_id = str(telegram_chat_id)
+        self._telegram.update(
+            enabled=self.live_config.telegram_enabled,
+            bot_token=self.live_config.telegram_bot_token,
+            chat_id=self.live_config.telegram_chat_id,
+        )
         extra = ""
         if hasattr(strategy_config, "lookback_candles"):
             extra = (
@@ -507,6 +527,21 @@ class LiveTradingEngine:
                 "signal_bar_time": str(sig.hammer_candle.timestamp),
                 "entry_bar_time": str(sig.entry_candle.timestamp),
             },
+        )
+        self._telegram.notify_order_event(
+            event,
+            symbol=self._active_symbol or self.live_config.symbol,
+            timeframe=self.live_config.timeframe_label,
+            pattern=self.pattern_label,
+            direction=sig.direction.value,
+            volume=volume,
+            entry_price=sig.entry_price,
+            stop_loss=sig.stop_loss,
+            target=sig.target,
+            dry_run=dry_run,
+            order_mode=order_mode or self.live_config.order_mode,
+            mt5_order_id=mt5_order_id,
+            mt5_message=mt5_message,
         )
 
     def touch_heartbeat(self):

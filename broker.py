@@ -54,6 +54,11 @@ class MT5Broker:
     def is_connected(self) -> bool:
         return self._connected and self._mt5 is not None
 
+    @property
+    def raw_mt5(self):
+        """Underlying MetaTrader5 module when connected (process-global)."""
+        return self._mt5 if self.is_connected else None
+
     def connect(self, creds: BrokerCredentials) -> Tuple[bool, str]:
         try:
             import MetaTrader5 as mt5

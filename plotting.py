@@ -89,6 +89,12 @@ class PlottingConfig:
     # ---- output ----
     output_dir: str = "plots"
 
+    # ---- optional: used for the price line chart (close series + trade markers) ----
+    data_root: Optional[str] = None
+    symbol: Optional[str] = None
+    # Folder names like "1hour", "15min" — first existing TF with data is used
+    timeframes: List[str] = field(default_factory=list)
+
     # ---- optional benchmark for Treynor ratio (see module docstring) ----
     # Path to a CSV with columns [date, return_pct]. Leave as None to skip
     # Treynor entirely (reported as N/A everywhere).
@@ -437,10 +443,124 @@ def plot_equity_curves_all_models(ledger: pl.DataFrame, config: PlottingConfig, 
     ax.set_xlabel("Date")
     ax.set_ylabel("Equity ($)")
     ax.legend(frameon=True, facecolor="white", edgecolor="#CCCCCC")
+    if not any(build_equity_curve(ledger, m)[0] for m in EXIT_MODEL_COLORS):
+        plt.close(fig)
+        return
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     fig.autofmt_xdate()
     fig.tight_layout()
-    fig.savefig(out_path)
+    fig.savefig(out_path, dpi=config.figure_dpi, facecolor="white")
+    plt.close(fig)
+
+
+def _pick_price_chart_timeframe(ledger: pl.DataFrame, config: PlottingConfig) -> Optional[str]:
+    """Choose which TF folder to load for the price line (most trades, else config list)."""
+    candidates: List[str] = []
+    if ledger.height and "timeframe" in ledger.columns:
+        counts = (
+            ledger.filter(pl.col("outcome").is_in(["WIN", "LOSS"]))
+            .group_by("timeframe")
+            .len()
+            .sort("len", descending=True)
+        )
+        candidates.extend(counts["timeframe"].to_list())
+    for tf in config.timeframes or []:
+        if tf not in candidates:
+            candidates.append(tf)
+    return candidates[0] if candidates else None
+
+
+def plot_price_line_with_trades(
+    ledger: pl.DataFrame,
+    config: PlottingConfig,
+    out_path: str,
+) -> None:
+    """
+    Close-price line for the dominant timeframe, with BUY/SELL entry markers
+    and exit markers from the trade ledger (primary exit model).
+    """
+    import backtest as bt
+
+    _apply_light_theme()
+    exit_model = config.primary_exit_model
+    trades = ledger.filter(
+        (pl.col("exit_model") == exit_model) &
+        (pl.col("outcome").is_in(["WIN", "LOSS"]))
+    ).sort("entry_time")
+
+    tf_folder = _pick_price_chart_timeframe(ledger, config)
+    data_root = (config.data_root or "").strip()
+    symbol = (config.symbol or "").strip()
+
+    closes_t = []
+    closes_p = []
+    title_tf = tf_folder or "?"
+
+    if data_root and symbol and tf_folder:
+        try:
+            cdf = bt.load_candles_df(data_root, symbol, tf_folder)
+            if cdf.height > 0 and trades.height > 0:
+                t0 = trades["entry_time"].min()
+                t1 = trades["exit_time"].max() if "exit_time" in trades.columns else trades["entry_time"].max()
+                # pad a little so markers aren't on the edge
+                window = cdf.filter(
+                    (pl.col("datetime") >= t0) & (pl.col("datetime") <= t1)
+                )
+                if window.height < 50:
+                    window = cdf.tail(min(5000, cdf.height))
+                # downsample very long series for readable PNG
+                step = max(1, window.height // 4000)
+                if step > 1:
+                    window = window.with_row_index("_i").filter(
+                        (pl.col("_i") % step) == 0
+                    ).drop("_i")
+                closes_t = window["datetime"].to_list()
+                closes_p = window["close"].to_list()
+        except Exception as e:
+            print(f"  [WARN] price line: could not load candles ({e})")
+
+    fig, ax = plt.subplots(figsize=(config.figure_width, config.figure_height), dpi=config.figure_dpi)
+
+    if closes_t and closes_p:
+        ax.plot(closes_t, closes_p, color="#5F6368", linewidth=1.2, alpha=0.85, label=f"{symbol} close ({title_tf})")
+    elif trades.height > 0:
+        # Fallback: connect entry prices in time order (no CSV loaded)
+        ax.plot(
+            trades["entry_time"].to_list(),
+            trades["entry_price"].to_list(),
+            color="#5F6368", linewidth=1.4, alpha=0.7, label="Entry price path",
+        )
+    else:
+        plt.close(fig)
+        return
+
+    if trades.height > 0:
+        buys = trades.filter(pl.col("direction") == "BUY")
+        sells = trades.filter(pl.col("direction") == "SELL")
+        if buys.height:
+            ax.scatter(
+                buys["entry_time"].to_list(), buys["entry_price"].to_list(),
+                marker="^", s=36, color=COLORS["win"], zorder=5, label="BUY entry",
+            )
+        if sells.height:
+            ax.scatter(
+                sells["entry_time"].to_list(), sells["entry_price"].to_list(),
+                marker="v", s=36, color=COLORS["loss"], zorder=5, label="SELL entry",
+            )
+        if "exit_time" in trades.columns and "exit_price" in trades.columns:
+            ax.scatter(
+                trades["exit_time"].to_list(), trades["exit_price"].to_list(),
+                marker="x", s=28, color=COLORS["accent2"], zorder=4, label="Exit",
+            )
+
+    ax.set_title(f"Price Line with Trades ({exit_model}) — {symbol or 'symbol'} / {title_tf}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.legend(frameon=True, facecolor="white", edgecolor="#CCCCCC", loc="best")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=config.figure_dpi, facecolor="white")
     plt.close(fig)
 
 
@@ -1421,6 +1541,7 @@ def generate_all_plots(config: PlottingConfig) -> None:
     charts = [
         ("equity_curves_all_models.png", lambda p: plot_equity_curves_all_models(ledger, config, p)),
         ("equity_with_regression.png", lambda p: plot_equity_with_regression(ledger, config, p)),
+        ("price_line_with_trades.png", lambda p: plot_price_line_with_trades(ledger, config, p)),
         ("drawdown.png", lambda p: plot_drawdown(ledger, config, p)),
         ("win_rate_by_year.png", lambda p: plot_win_rate_by_year(summary_by_year, config, p)),
         ("net_pnl_by_year.png", lambda p: plot_net_pnl_by_year(summary_by_year, config, p)),

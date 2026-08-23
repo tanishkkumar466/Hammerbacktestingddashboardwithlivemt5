@@ -72,11 +72,12 @@ OUTPUT FILES (all CSV, ready for Excel/Numbers import)
 """
 
 import os
+import sys
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 
 import numpy as np
 import polars as pl
@@ -105,6 +106,13 @@ class ExitModel(Enum):
     CANDLE_BIAS = "candle_bias"   # tiebreak using the exit candle's own color
 
 
+class MarketDataSource(Enum):
+    """Which on-disk tree to backtest."""
+    SPOT = "spot"         # data/spot/<symbol> (falls back to legacy data/<symbol>)
+    FUTURES = "futures"   # data/futures/<symbol>
+    BOTH = "both"         # run spot and futures (whichever exist)
+
+
 ALL_EXIT_MODELS = [ExitModel.WORST_CASE, ExitModel.BEST_CASE, ExitModel.CANDLE_BIAS]
 
 
@@ -117,6 +125,8 @@ class BacktestConfig:
     # ---- data location ----
     data_root: str = "data"          # matches fetcher.py's OUTPUT_ROOT
     symbol: str = "XAUUSD"
+    # When spot and futures both exist, pick which to backtest (default: spot).
+    market_data: MarketDataSource = MarketDataSource.SPOT
 
     # ---- fetcher.py label -> logic.py label mapping ----
     # fetcher.py folders are named "3min","5min","10min","15min","30min","1hour"
@@ -218,6 +228,18 @@ class BacktestConfig:
 # SECTION 2: DATA LOADING (Polars -- reads fetcher.py's CSV output structure)
 # ============================================================================
 
+# Spot / futures live under data/spot/<symbol> and data/futures/<symbol>.
+# Legacy client layout is data/<symbol>. All loaders accept either.
+_MARKET_SUBFOLDERS = ("spot", "futures")
+
+
+def _default_data_anchor() -> str:
+    """App/exe folder — same idea as dashboard.get_app_dir() for frozen builds."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def resolve_data_root(data_root: str, anchor_dir: Optional[str] = None) -> str:
     """
     Make data_root absolute and stable across launch cwd.
@@ -232,7 +254,7 @@ def resolve_data_root(data_root: str, anchor_dir: Optional[str] = None) -> str:
     if os.path.isabs(raw):
         return os.path.normpath(raw)
 
-    anchor = anchor_dir or os.path.dirname(os.path.abspath(__file__))
+    anchor = anchor_dir or _default_data_anchor()
     candidate_app = os.path.normpath(os.path.join(anchor, raw))
     candidate_cwd = os.path.normpath(os.path.abspath(raw))
     if os.path.isdir(candidate_app):
@@ -247,11 +269,12 @@ def resolve_symbol_folder(data_root: str, symbol: str) -> str:
     sym = (symbol or "").strip()
     if not sym:
         return sym
-    direct = os.path.join(data_root, sym)
-    if os.path.isdir(direct):
-        return sym
     if not os.path.isdir(data_root):
         return sym
+    # Always prefer the real directory name from listdir. On case-insensitive
+    # filesystems (common on macOS), os.path.isdir("…/xauusd") can be True even
+    # when the folder is stored as "XAUUSD" — returning the typed case would
+    # break later path joins on case-sensitive machines / zip tools.
     lower = sym.lower()
     try:
         for name in os.listdir(data_root):
@@ -263,17 +286,183 @@ def resolve_symbol_folder(data_root: str, symbol: str) -> str:
     return sym
 
 
-def find_csv_files(data_root: str, symbol: str, timeframe_folder: str) -> List[str]:
+def _data_parent_root(data_root: str) -> str:
+    """
+    If data_root is …/spot or …/futures, return the parent so we can switch
+    markets without the user re-picking the folder.
+    """
+    root = os.path.normpath(data_root)
+    if os.path.basename(root).lower() in _MARKET_SUBFOLDERS:
+        parent = os.path.dirname(root)
+        return parent or root
+    return root
+
+
+def resolve_symbol_data_root(
+    data_root: str,
+    symbol: str,
+    *,
+    anchor_dir: Optional[str] = None,
+    preferred: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    Locate the folder that actually contains <symbol>/<timeframe>/ CSVs.
+
+    Supports:
+      data_root/<symbol>/…                 (legacy — treated as spot)
+      data_root/spot/<symbol>/…            (Fetch spot)
+      data_root/futures/<symbol>/…         (Fetch futures)
+
+    preferred: "spot" | "futures" | "both" (or MarketDataSource).
+    "both" resolves like spot for a single path (use expand_market_targets
+    to run both). If data_root already points at spot/ or futures/, the
+    parent is used as the search base so switching still works.
+
+    Returns (effective_data_root, on_disk_symbol).
+    """
+    root = resolve_data_root(data_root, anchor_dir=anchor_dir)
+    sym = (symbol or "").strip()
+    if not sym:
+        return root, sym
+
+    if isinstance(preferred, MarketDataSource):
+        pref = preferred.value
+    else:
+        pref = (preferred or MarketDataSource.SPOT.value).strip().lower()
+    # Compat with older presets / labels
+    if pref in ("", "none", "default", "auto", "legacy"):
+        pref = MarketDataSource.SPOT.value
+    if pref == MarketDataSource.BOTH.value:
+        pref = MarketDataSource.SPOT.value
+
+    parent = _data_parent_root(root)
+
+    def _from_market(market: str) -> Optional[Tuple[str, str]]:
+        market_root = os.path.join(parent, market)
+        if not os.path.isdir(market_root):
+            return None
+        nested_sym = resolve_symbol_folder(market_root, sym)
+        if os.path.isdir(os.path.join(market_root, nested_sym)):
+            return market_root, nested_sym
+        return None
+
+    def _from_legacy() -> Optional[Tuple[str, str]]:
+        direct_sym = resolve_symbol_folder(parent, sym)
+        if os.path.isdir(os.path.join(parent, direct_sym)):
+            return parent, direct_sym
+        return None
+
+    if pref == MarketDataSource.FUTURES.value:
+        hit = _from_market("futures")
+        if hit:
+            return hit
+        fut_root = os.path.join(parent, "futures")
+        return fut_root, resolve_symbol_folder(
+            fut_root if os.path.isdir(fut_root) else parent, sym,
+        )
+
+    # SPOT (default): prefer data/spot/<symbol>, else legacy data/<symbol>
+    hit = _from_market("spot")
+    if hit:
+        return hit
+    hit = _from_legacy()
+    if hit:
+        return hit
+    spot_root = os.path.join(parent, "spot")
+    return spot_root, resolve_symbol_folder(
+        spot_root if os.path.isdir(spot_root) else parent, sym,
+    )
+
+
+def expand_market_targets(
+    data_root: str,
+    symbol: str,
+    market_data: Optional[Any] = None,
+    *,
+    anchor_dir: Optional[str] = None,
+) -> List[Tuple[str, str, str]]:
+    """
+    Markets to backtest: [(label, effective_root, symbol), …].
+
+    Spot includes legacy data/<symbol>. Futures is data/futures/<symbol>.
+    Both returns every market that actually has a symbol folder on disk.
+    """
+    if isinstance(market_data, MarketDataSource):
+        pref = market_data.value
+    else:
+        pref = (str(market_data or MarketDataSource.SPOT.value)).strip().lower()
+    if pref in ("", "auto", "legacy", "default"):
+        pref = MarketDataSource.SPOT.value
+
+    if pref == MarketDataSource.BOTH.value:
+        labels = ["spot", "futures"]
+    elif pref == MarketDataSource.FUTURES.value:
+        labels = ["futures"]
+    else:
+        labels = ["spot"]
+
+    out: List[Tuple[str, str, str]] = []
+    for label in labels:
+        eff_root, eff_sym = resolve_symbol_data_root(
+            data_root, symbol, anchor_dir=anchor_dir, preferred=label,
+        )
+        if eff_sym and os.path.isdir(os.path.join(eff_root, eff_sym)):
+            out.append((label, eff_root, eff_sym))
+    return out
+
+
+def find_available_symbols(
+    data_root: str,
+    *,
+    anchor_dir: Optional[str] = None,
+) -> List[str]:
+    """Labels for error dialogs: XAUUSD, spot/XAUUSD, futures/GCZ5, …"""
+    root = resolve_data_root(data_root, anchor_dir=anchor_dir)
+    # Always inventory from the parent so spot+futures both show up
+    root = _data_parent_root(root)
+    found: List[str] = []
+    if not os.path.isdir(root):
+        return found
+
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return found
+
+    for name in names:
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        if name.lower() in _MARKET_SUBFOLDERS:
+            try:
+                nested = sorted(os.listdir(path))
+            except OSError:
+                continue
+            for child in nested:
+                if os.path.isdir(os.path.join(path, child)):
+                    found.append(f"{name}/{child}")
+        else:
+            found.append(name)
+    return found
+
+
+def find_csv_files(
+    data_root: str,
+    symbol: str,
+    timeframe_folder: str,
+    *,
+    preferred: Optional[str] = None,
+) -> List[str]:
     """
     Finds every monthly CSV file for one symbol+timeframe under
     fetcher.py's folder structure:
         data_root/<symbol>/<timeframe_folder>/<year>/<symbol>_<tf>_<year>-<month>.csv
-    Also picks up CSVs directly in the timeframe folder (including *_FULL.csv)
-    when no year subfolders with CSVs are found. Returns paths sorted
-    chronologically.
+    Also accepts data_root/spot|futures/<symbol>/… and loose *_FULL.csv
+    files in the timeframe folder. Returns paths sorted chronologically.
     """
-    data_root = resolve_data_root(data_root)
-    symbol = resolve_symbol_folder(data_root, symbol)
+    data_root, symbol = resolve_symbol_data_root(
+        data_root, symbol, preferred=preferred,
+    )
     base = os.path.join(data_root, symbol, timeframe_folder)
     if not os.path.isdir(base):
         return []
@@ -306,6 +495,8 @@ def load_candles_df(
     timeframe_folder: str,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
+    *,
+    preferred: Optional[str] = None,
 ) -> pl.DataFrame:
     """
     Loads all CSV files for one symbol+timeframe into a single Polars
@@ -317,8 +508,9 @@ def load_candles_df(
     optional date range filter -- all as vectorized Polars expressions,
     not Python loops.
     """
-    data_root = resolve_data_root(data_root)
-    symbol = resolve_symbol_folder(data_root, symbol)
+    data_root, symbol = resolve_symbol_data_root(
+        data_root, symbol, preferred=preferred,
+    )
     files = find_csv_files(data_root, symbol, timeframe_folder)
     if not files:
         return pl.DataFrame(schema={
@@ -1378,10 +1570,19 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     compute_metrics_grouped() for every breakdown -> export everything
     to CSV under output/<run_name>/.
     Returns the metrics tables as Polars DataFrames.
+
+    When market_data is BOTH, runs spot and futures separately (whichever
+    exist), tags each trade with a market column, and merges results.
     """
     print("=" * 70)
     print(f"BACKTEST: {config.symbol} | Pattern: {config.pattern_type} | "
           f"Timeframes: {config.timeframes_to_test}")
+    market_setting = getattr(config, "market_data", MarketDataSource.SPOT)
+    market_label = (
+        market_setting.value if isinstance(market_setting, MarketDataSource)
+        else str(market_setting)
+    )
+    print(f"Market data: {market_label}")
     if config.pattern_type in ("hammer_with_candles", "hammer_context"):
         try:
             print(hammer_context_logic.describe_hammer_context_rules(config.strategy_config))
@@ -1401,23 +1602,62 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
         )
     print("=" * 70)
 
-    ledger, ignored = run_full_backtest(config)
+    targets = expand_market_targets(
+        config.data_root, config.symbol, market_setting,
+    )
+    if not targets:
+        # Fall back to whatever resolve returns so empty-run messaging still works
+        eff_root, eff_sym = resolve_symbol_data_root(
+            config.data_root, config.symbol, preferred=market_setting,
+        )
+        targets = [(market_label if market_label != "both" else "spot", eff_root, eff_sym)]
 
-    if not ledger:
+    frames: List[pl.DataFrame] = []
+    all_ignored: List = []
+    for label, eff_root, eff_sym in targets:
+        print(f"\n--- Market: {label} → {eff_root}/{eff_sym} ---")
+        sub = replace(
+            config,
+            data_root=eff_root,
+            symbol=eff_sym,
+            market_data=(
+                MarketDataSource.FUTURES if label == "futures"
+                else MarketDataSource.SPOT
+            ),
+        )
+        ledger, ignored = run_full_backtest(sub)
+        all_ignored.extend(ignored)
+        part = ledger_to_polars(
+            ledger,
+            session_clock=getattr(config, "session_clock", "broker"),
+            broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
+        )
+        if part.height == 0:
+            print(f"[WARN] No trades for market={label}.")
+            continue
+        part = part.with_columns(pl.lit(label).alias("market"))
+        frames.append(part)
+
+    if frames:
+        df = pl.concat(frames, how="diagonal_relaxed")
+    else:
+        df = ledger_to_polars(
+            [],
+            session_clock=getattr(config, "session_clock", "broker"),
+            broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
+        )
+        if "market" not in df.columns:
+            df = df.with_columns(pl.lit(None).cast(pl.Utf8).alias("market"))
+
+    if df.height == 0:
         print("\n[WARN] No trades were generated. Check your data folder, "
               "symbol name, and date range.")
-
-    df = ledger_to_polars(
-        ledger,
-        session_clock=getattr(config, "session_clock", "broker"),
-        broker_utc_offset_hours=getattr(config, "broker_utc_offset_hours", None),
-    )
 
     out_dir = os.path.join(config.output_root, config.run_name)
     os.makedirs(out_dir, exist_ok=True)
 
     export_trade_ledger(df, os.path.join(out_dir, "trade_ledger.csv"))
-    export_ignored_signals(ignored, os.path.join(out_dir, "ignored_signals.csv"))
+    export_ignored_signals(all_ignored, os.path.join(out_dir, "ignored_signals.csv"))
     export_skipped_and_open(df, out_dir)
 
     tables: Dict[str, pl.DataFrame] = {
@@ -1428,6 +1668,10 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
         "by_direction": compute_metrics_grouped(df, ["direction"], config.starting_capital),
         "by_session": compute_metrics_grouped(df, ["session"], config.starting_capital),
     }
+    if "market" in df.columns and df.height and df["market"].n_unique() > 1:
+        tables["by_market"] = compute_metrics_grouped(
+            df, ["market"], config.starting_capital,
+        )
 
     for name, table in tables.items():
         table.write_csv(os.path.join(out_dir, f"summary_{name}.csv"))
@@ -1436,6 +1680,8 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     print("    trade_ledger.csv, ignored_signals.csv, skipped_overlap.csv, still_open.csv,")
     print("    summary_overall.csv, summary_by_year.csv, summary_by_month.csv,")
     print("    summary_by_timeframe.csv, summary_by_direction.csv, summary_by_session.csv")
+    if "by_market" in tables:
+        print("    summary_by_market.csv")
 
     if tables["overall"].height:
         print("\n--- QUICK OVERALL SUMMARY (all 3 exit models) ---")
@@ -1454,6 +1700,17 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
                 pf = f"{row['profit_factor']:.2f}" if row.get("profit_factor") is not None else "N/A"
                 print(
                     f"  [{row['group']:6}] Trades={row['total_trades']:>5} | "
+                    f"WinRate={row['win_rate_pct']:5.1f}% | NetPnL=${row['net_pnl']:>10.2f} | PF={pf}"
+                )
+
+        by_m = tables.get("by_market")
+        if by_m is not None and by_m.height:
+            print("\n--- BY MARKET ---")
+            wc = by_m.filter(pl.col("exit_model") == "worst_case").sort("group")
+            for row in wc.iter_rows(named=True):
+                pf = f"{row['profit_factor']:.2f}" if row.get("profit_factor") is not None else "N/A"
+                print(
+                    f"  [{row['group']:8}] Trades={row['total_trades']:>5} | "
                     f"WinRate={row['win_rate_pct']:5.1f}% | NetPnL=${row['net_pnl']:>10.2f} | PF={pf}"
                 )
 

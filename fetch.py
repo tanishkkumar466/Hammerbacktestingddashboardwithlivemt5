@@ -7,6 +7,7 @@ import sys
 import time
 import argparse
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 
@@ -38,6 +39,14 @@ OUTPUT_ROOT = "data"
 
 CHUNK_BY = "month"
 
+# Spot vs futures live in separate subfolders under the data root:
+#   data/spot/<symbol>/…
+#   data/futures/<symbol>/…
+# Legacy layout data/<symbol>/… is treated as spot when updating.
+MARKET_SPOT = "spot"
+MARKET_FUTURES = "futures"
+MARKET_TYPES = (MARKET_SPOT, MARKET_FUTURES)
+
 # ---- retry settings for MT5 requests (server hiccups happen over a
 #      20-year pull, so failed chunks get retried instead of silently
 #      skipped) ----
@@ -52,7 +61,7 @@ RETRY_DELAY_SECONDS = 5
 EXPECTED_GAP_MULTIPLIER = 2.0
 
 TIMEFRAME_MINUTES: Dict[str, int] = {
-    "3min": 3, "5min": 5, "10min": 10, "15min": 15, "30min": 30, "1hour": 60,
+    "1min": 1, "3min": 3, "5min": 5, "10min": 10, "15min": 15, "30min": 30, "1hour": 60,
 }
 
 
@@ -64,20 +73,139 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def month_folder(symbol: str, timeframe_label: str, year: int) -> str:
-    path = os.path.join(OUTPUT_ROOT, symbol, timeframe_label, str(year))
+def _root(output_root: Optional[str] = None) -> str:
+    return (output_root or OUTPUT_ROOT).strip() or OUTPUT_ROOT
+
+
+def normalize_market_type(market_type: Optional[str]) -> str:
+    mt = (market_type or MARKET_SPOT).strip().lower()
+    if mt in ("future", "fut", "fwd", "forward"):
+        mt = MARKET_FUTURES
+    if mt not in MARKET_TYPES:
+        return MARKET_SPOT
+    return mt
+
+
+def market_data_root(
+    output_root: Optional[str] = None,
+    market_type: Optional[str] = None,
+) -> str:
+    """
+    Absolute/relative path where symbol folders live for this market type.
+    If output_root already ends with spot/ or futures/, it is adjusted to
+    the requested market type instead of nesting again.
+    """
+    root = os.path.normpath(_root(output_root))
+    mt = normalize_market_type(market_type)
+    base = os.path.basename(root).lower()
+    if base in MARKET_TYPES:
+        parent = os.path.dirname(root) or "."
+        return os.path.normpath(os.path.join(parent, mt))
+    return os.path.normpath(os.path.join(root, mt))
+
+
+def classify_market_type(
+    symbol: str,
+    mt5_info: Optional[object] = None,
+) -> str:
+    """
+    Guess spot vs futures from MT5 symbol_info (when available) or the name.
+
+    Returns MARKET_SPOT or MARKET_FUTURES. Prefer explicit MT5 fields; fall
+    back to path/description keywords and symbol-name heuristics.
+    """
+    sym = (symbol or "").strip()
+    # --- MT5 symbol_info hints ---
+    if mt5_info is not None:
+        try:
+            exp = int(getattr(mt5_info, "expiration_time", 0) or 0)
+            if exp > 0:
+                return MARKET_FUTURES
+        except (TypeError, ValueError):
+            pass
+        path = str(getattr(mt5_info, "path", "") or "").lower()
+        desc = str(getattr(mt5_info, "description", "") or "").lower()
+        blob = f"{path} {desc} {sym.lower()}"
+        fut_keys = (
+            "future", "futures", "fwd", "forward", "comex", "cme", "nymex",
+            "expiry", "expiration", "contango",
+        )
+        spot_keys = ("spot", "forex", "fx ", "cfd", "metal", "metals", "otc")
+        if any(k in blob for k in fut_keys):
+            return MARKET_FUTURES
+        if any(k in blob for k in spot_keys):
+            return MARKET_SPOT
+
+    # --- name heuristics (offline / no MT5) ---
+    s = sym.upper().replace(" ", "")
+    if not s:
+        return MARKET_SPOT
+    # Contract-month style: XAUz25, GCZ5, CLH6, XAUUSD-JUN25
+    if re.search(r"(20\d{2}|[FGHJKMNQUVXZ]\d{1,2})$", s):
+        # Avoid treating plain XAUUSD / EURUSD as futures
+        if re.search(r"[FGHJKMNQUVXZ]\d{1,2}$", s) or re.search(r"20\d{2}$", s):
+            if not re.fullmatch(r"[A-Z]{6}", s):  # 6-letter FX pairs stay spot
+                return MARKET_FUTURES
+    if any(tok in s for tok in ("FUT", "FUTURE", "_F", "-F", ".F")):
+        return MARKET_FUTURES
+    if s.endswith("SPOT") or ".S" in s or s.endswith("_S"):
+        return MARKET_SPOT
+    return MARKET_SPOT
+
+
+def detect_market_type_from_mt5(mt5, symbol: str) -> str:
+    """Classify using live MT5 symbol_info when connected; else name only."""
+    info = None
+    try:
+        if mt5 is not None and symbol:
+            info = mt5.symbol_info(symbol)
+    except Exception:
+        info = None
+    return classify_market_type(symbol, info)
+
+
+def resolve_write_root(
+    output_root: Optional[str],
+    symbol: str,
+    market_type: Optional[str],
+    *,
+    prefer_legacy_spot: bool = True,
+) -> str:
+    """
+    Folder that should contain <symbol>/<timeframe>/ for this fetch.
+
+    Spot + prefer_legacy_spot: if legacy data/<symbol> exists and
+    data/spot/<symbol> does not, keep writing into the legacy folder so
+    existing client data updates in place. New installs use data/spot/.
+    """
+    mt = normalize_market_type(market_type)
+    preferred = market_data_root(output_root, mt)
+    preferred_sym = os.path.join(preferred, symbol)
+    if mt == MARKET_SPOT and prefer_legacy_spot:
+        legacy = os.path.join(_root(output_root), symbol)
+        if os.path.isdir(legacy) and not os.path.isdir(preferred_sym):
+            return _root(output_root)
+    ensure_dir(preferred)
+    return preferred
+
+
+def month_folder(symbol: str, timeframe_label: str, year: int,
+                 output_root: Optional[str] = None) -> str:
+    path = os.path.join(_root(output_root), symbol, timeframe_label, str(year))
     ensure_dir(path)
     return path
 
 
-def monthly_csv_path(symbol: str, timeframe_label: str, year: int, month: int) -> str:
-    folder = month_folder(symbol, timeframe_label, year)
+def monthly_csv_path(symbol: str, timeframe_label: str, year: int, month: int,
+                     output_root: Optional[str] = None) -> str:
+    folder = month_folder(symbol, timeframe_label, year, output_root=output_root)
     filename = f"{symbol}_{timeframe_label}_{year:04d}-{month:02d}.csv"
     return os.path.join(folder, filename)
 
 
-def full_history_csv_path(symbol: str, timeframe_label: str) -> str:
-    folder = os.path.join(OUTPUT_ROOT, symbol, timeframe_label)
+def full_history_csv_path(symbol: str, timeframe_label: str,
+                          output_root: Optional[str] = None) -> str:
+    folder = os.path.join(_root(output_root), symbol, timeframe_label)
     ensure_dir(folder)
     filename = f"{symbol}_{timeframe_label}_FULL.csv"
     return os.path.join(folder, filename)
@@ -122,12 +250,26 @@ def iter_year_chunks(start: datetime, end: datetime):
 # re-initializing per month/timeframe -- initializing hundreds of times
 # over a full historical pull is slow and can make the terminal unstable.
 
-def connect_to_mt5():
+def connect_to_mt5(
+    terminal_path: str = "",
+    login: int = 0,
+    password: str = "",
+    server: str = "",
+    log=None,
+):
     """
-    Initializes the connection to the local MT5 terminal ONCE for the
-    whole script run. Returns the mt5 module itself (so callers don't
-    need to re-import it), or raises RuntimeError if it can't connect.
+    Initializes ONE connection to the local MT5 terminal for this process.
+
+    MetaTrader5's Python API is process-global: a second initialize() can
+    switch terminals, and shutdown() kills every user of that connection
+    (including Live). Prefer reusing an already-open Live broker module
+    via run_fetch_job(mt5_module=..., own_connection=False).
+
+    If terminal_path is set, initialize that terminal; otherwise attach
+    to the nearest already-running MT5 instance. Optional login/password/
+    server match Live Settings so Fetch and Live hit the same account.
     """
+    _log = log or (lambda msg: print(msg))
     try:
         import MetaTrader5 as mt5
     except ImportError:
@@ -138,26 +280,65 @@ def connect_to_mt5():
             "terminal installed and logged in."
         )
 
-    if not mt5.initialize():
+    path = (terminal_path or "").strip()
+    ok = mt5.initialize(path=path) if path else mt5.initialize()
+    if not ok:
         raise RuntimeError(
             f"MT5 initialize() failed, error code: {mt5.last_error()}. "
             f"Make sure the MT5 terminal is open and logged into an account."
         )
 
+    if login:
+        authorized = mt5.login(
+            login=int(login),
+            password=password or "",
+            server=(server or "").strip() or None,
+        )
+        if not authorized:
+            err = mt5.last_error()
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            raise RuntimeError(f"MT5 login failed: {err}")
+
     account_info = mt5.account_info()
+    term = None
+    try:
+        term = mt5.terminal_info()
+    except Exception:
+        term = None
     if account_info is not None:
-        print(f"[OK] Connected to MT5 -- Account: {account_info.login} | "
-              f"Server: {account_info.server}")
+        path_note = ""
+        if term is not None and getattr(term, "path", None):
+            path_note = f" | Terminal: {term.path}"
+        _log(
+            f"[OK] Connected to MT5 -- Account: {account_info.login} | "
+            f"Server: {account_info.server}{path_note}"
+        )
     else:
-        print("[OK] Connected to MT5 (no account info available).")
+        _log("[OK] Connected to MT5 (no account info available).")
 
     return mt5
 
 
-def disconnect_from_mt5(mt5):
-    """Cleanly shuts down the single MT5 connection at the very end."""
-    mt5.shutdown()
-    print("[OK] MT5 connection closed.")
+def disconnect_from_mt5(mt5, *, owned: bool = True, log=None):
+    """
+    Shut down the MT5 connection only if this caller owns it.
+
+    owned=False: shared with Live (or another owner) — do not shutdown.
+    """
+    _log = log or (lambda msg: print(msg))
+    if not owned:
+        _log("[OK] Leaving shared MT5 connection open (Live/other owner).")
+        return
+    if mt5 is None:
+        return
+    try:
+        mt5.shutdown()
+    except Exception:
+        pass
+    _log("[OK] MT5 connection closed.")
 
 
 def verify_symbol(mt5, symbol: str) -> bool:
@@ -235,7 +416,7 @@ def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, e
 def fetch_from_mock(symbol: str, timeframe_label: str, start: datetime, end: datetime,
                      seed_price: float = 100.0):
     minutes_per_candle = {
-        "3min": 3, "5min": 5, "10min": 10, "15min": 15, "30min": 30, "1hour": 60,
+        "1min": 1, "3min": 3, "5min": 5, "10min": 10, "15min": 15, "30min": 30, "1hour": 60,
     }[timeframe_label]
 
     step = timedelta(minutes=minutes_per_candle)
@@ -307,6 +488,152 @@ def append_to_full_history(filepath: str, candles: List[dict]) -> None:
             row = dict(c)
             row["datetime"] = c["datetime"].strftime("%Y-%m-%d %H:%M:%S")
             writer.writerow(row)
+
+
+def read_csv_candles(filepath: str) -> List[dict]:
+    """Load a monthly/FULL CSV into candle dicts (timezone-naive datetimes)."""
+    if not os.path.isfile(filepath):
+        return []
+    out: List[dict] = []
+    with open(filepath, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                dt = datetime.strptime(row["datetime"].strip(), "%Y-%m-%d %H:%M:%S")
+            except (KeyError, ValueError, AttributeError):
+                continue
+            try:
+                out.append({
+                    "datetime": dt,
+                    "open": float(row["open"]),
+                    "high": float(row["high"]),
+                    "low": float(row["low"]),
+                    "close": float(row["close"]),
+                    "volume": int(float(row.get("volume") or 0)),
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def merge_candles(existing: List[dict], new: List[dict]) -> List[dict]:
+    """Merge by datetime; newer rows overwrite older ones. Sorted ascending."""
+    by_dt: Dict[datetime, dict] = {}
+    for c in existing:
+        by_dt[c["datetime"]] = c
+    for c in new:
+        by_dt[c["datetime"]] = c
+    return [by_dt[k] for k in sorted(by_dt.keys())]
+
+
+def list_monthly_csv_files(symbol: str, timeframe_label: str,
+                           output_root: Optional[str] = None) -> List[str]:
+    """All monthly CSVs under data/<symbol>/<tf>/<year>/… (excludes *_FULL.csv)."""
+    base = os.path.join(_root(output_root), symbol, timeframe_label)
+    if not os.path.isdir(base):
+        return []
+    files: List[str] = []
+    for entry in sorted(os.listdir(base)):
+        year_dir = os.path.join(base, entry)
+        if not (os.path.isdir(year_dir) and entry.isdigit()):
+            continue
+        for fname in sorted(os.listdir(year_dir)):
+            if fname.endswith(".csv") and "_FULL" not in fname:
+                files.append(os.path.join(year_dir, fname))
+    return files
+
+
+def detect_latest_bar(
+    symbol: str,
+    timeframe_label: str,
+    output_root: Optional[str] = None,
+) -> Optional[datetime]:
+    """
+    Latest bar timestamp already on disk for this symbol+timeframe.
+    Prefers monthly year folders; falls back to *_FULL.csv.
+    """
+    latest: Optional[datetime] = None
+    for path in list_monthly_csv_files(symbol, timeframe_label, output_root):
+        # Fast path: read last non-empty data line instead of whole file when possible
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                if size <= 0:
+                    continue
+                chunk = min(size, 8192)
+                f.seek(-chunk, os.SEEK_END)
+                tail = f.read().decode("utf-8", errors="replace")
+            lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+            # drop header if it snuck into the tail
+            for line in reversed(lines):
+                if line.lower().startswith("datetime"):
+                    continue
+                part = line.split(",", 1)[0].strip()
+                try:
+                    dt = datetime.strptime(part, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                if latest is None or dt > latest:
+                    latest = dt
+                break
+        except OSError:
+            continue
+
+    if latest is not None:
+        return latest
+
+    full_path = full_history_csv_path(symbol, timeframe_label, output_root=output_root)
+    candles = read_csv_candles(full_path)
+    if not candles:
+        return None
+    return max(c["datetime"] for c in candles)
+
+
+def detect_data_folder_symbols(output_root: Optional[str] = None) -> List[str]:
+    """Symbol subfolders under a market root (or legacy flat data root)."""
+    root = _root(output_root)
+    if not os.path.isdir(root):
+        return []
+    out = []
+    for name in sorted(os.listdir(root)):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path) or name.startswith("."):
+            continue
+        if name.lower() in MARKET_TYPES:
+            continue  # skip spot/futures containers when scanning flat root
+        out.append(name)
+    return out
+
+
+def detect_market_inventory(output_root: Optional[str] = None) -> Dict[str, List[str]]:
+    """
+    Symbols found under spot/, futures/, and legacy flat folders.
+    Returns {"spot": [...], "futures": [...], "legacy_spot": [...]}.
+    """
+    root = _root(output_root)
+    inv = {MARKET_SPOT: [], MARKET_FUTURES: [], "legacy_spot": []}
+    if not os.path.isdir(root):
+        return inv
+    for mt in MARKET_TYPES:
+        mt_root = market_data_root(root, mt)
+        inv[mt] = detect_data_folder_symbols(mt_root)
+    # Legacy: symbols directly under data/ (not spot/futures)
+    inv["legacy_spot"] = detect_data_folder_symbols(root)
+    return inv
+
+
+def write_or_merge_monthly(
+    filepath: str,
+    candles: List[dict],
+    *,
+    merge: bool,
+) -> int:
+    """Write monthly CSV; if merge and file exists, combine + dedupe. Returns row count written."""
+    if merge and os.path.isfile(filepath):
+        candles = merge_candles(read_csv_candles(filepath), candles)
+    write_csv(filepath, candles)
+    return len(candles)
 
 
 # ============================================================================
@@ -398,22 +725,24 @@ def print_quality_report(symbol: str, report: dict) -> None:
 # ============================================================================
 
 def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: str,
-                    start: datetime, end: datetime, use_mock: bool) -> dict:
+                    start: datetime, end: datetime, use_mock: bool,
+                    output_root: Optional[str] = None,
+                    update_existing: bool = False,
+                    log=None) -> dict:
     """
-    Fetches + saves one symbol+timeframe across the full date range.
+    Fetches + saves one symbol+timeframe across the date range.
 
-    Returns a summary dict instead of just a total count, so the caller
-    can tell the difference between "no data existed for this period"
-    (normal, e.g. before broker history starts) and "the request failed
-    after retries" (a real problem worth re-running).
+    update_existing=True: merge into existing monthly CSVs (do not wipe FULL),
+    and only fetch from `start` (typically last bar + 1 step) through `end`.
     """
+    _log = log or (lambda msg: print(msg))
     total_saved = 0
-    failed_chunks = []   # list of (period_label,) that failed even after retries
-    all_candles: List[dict] = []   # kept in memory briefly for the quality check
+    failed_chunks = []
+    all_candles: List[dict] = []
 
-    full_path = full_history_csv_path(symbol, timeframe_label)
+    full_path = full_history_csv_path(symbol, timeframe_label, output_root=output_root)
 
-    if os.path.exists(full_path):
+    if not update_existing and os.path.exists(full_path):
         os.remove(full_path)
 
     if CHUNK_BY == "month":
@@ -436,31 +765,51 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
             candles = fetch_from_mt5(mt5, symbol, mt5_timeframe_name, chunk_start, chunk_end)
 
         if candles is None:
-            # Explicit failure after retries -- distinct from a genuinely
-            # empty period. Flagged so you know to re-run just this chunk.
             failed_chunks.append(period_label)
             continue
 
         if not candles:
-            continue  # genuinely empty period (e.g. before broker's history starts)
+            continue
 
         if CHUNK_BY == "month":
-            out_path = monthly_csv_path(symbol, timeframe_label, year, month)
+            out_path = monthly_csv_path(
+                symbol, timeframe_label, year, month, output_root=output_root,
+            )
         else:
-            folder = month_folder(symbol, timeframe_label, year)
+            folder = month_folder(symbol, timeframe_label, year, output_root=output_root)
             out_path = os.path.join(folder, f"{symbol}_{timeframe_label}_{year}.csv")
 
-        write_csv(out_path, candles)
-        append_to_full_history(full_path, candles)
-        all_candles.extend(candles)
+        before = len(read_csv_candles(out_path)) if update_existing else 0
+        written = write_or_merge_monthly(out_path, candles, merge=update_existing)
+        new_rows = max(0, written - before) if update_existing else written
 
-        total_saved += len(candles)
-        print(f"  [{symbol} | {timeframe_label}] {period_label}: "
-              f"{len(candles)} candles -> {out_path}")
+        if update_existing:
+            # Append only bars newer than previous FULL tip (avoid full rewrite)
+            existing_full = read_csv_candles(full_path) if os.path.isfile(full_path) else []
+            if existing_full:
+                tip = max(c["datetime"] for c in existing_full)
+                to_append = [c for c in candles if c["datetime"] > tip]
+            else:
+                to_append = candles
+            if to_append:
+                append_to_full_history(full_path, to_append)
+        else:
+            append_to_full_history(full_path, candles)
+
+        all_candles.extend(candles)
+        total_saved += new_rows if update_existing else len(candles)
+        _log(
+            f"  [{symbol} | {timeframe_label}] {period_label}: "
+            f"{len(candles)} fetched"
+            + (f", +{new_rows} new" if update_existing else "")
+            + f" -> {out_path}"
+        )
 
     if failed_chunks:
-        print(f"  [WARN] {symbol} | {timeframe_label}: "
-              f"{len(failed_chunks)} period(s) FAILED after retries: {failed_chunks}")
+        _log(
+            f"  [WARN] {symbol} | {timeframe_label}: "
+            f"{len(failed_chunks)} period(s) FAILED after retries: {failed_chunks}"
+        )
 
     quality = check_data_quality(timeframe_label, all_candles)
 
@@ -481,12 +830,11 @@ def run_fetcher(use_mock: bool) -> None:
     print(f"Output folder: ./{OUTPUT_ROOT}/")
     print("-" * 70)
 
-    # ---- Connect to MT5 ONCE for the whole run (not per month/timeframe) ----
     mt5 = None
     if not use_mock:
         mt5 = connect_to_mt5()
 
-    all_results = []   # (symbol, timeframe_label, result_dict)
+    all_results = []
 
     try:
         for symbol in SYMBOLS:
@@ -505,6 +853,8 @@ def run_fetcher(use_mock: bool) -> None:
                     start=START_DATE,
                     end=END_DATE,
                     use_mock=use_mock,
+                    output_root=OUTPUT_ROOT,
+                    update_existing=False,
                 )
                 all_results.append((symbol, timeframe_label, result))
                 print(f"  -> Total candles saved for {symbol} [{timeframe_label}]: "
@@ -512,9 +862,8 @@ def run_fetcher(use_mock: bool) -> None:
                 print_quality_report(symbol, result["quality"])
     finally:
         if mt5 is not None:
-            disconnect_from_mt5(mt5)
+            disconnect_from_mt5(mt5, owned=True)
 
-    # ---- Final summary ----
     print("\n" + "-" * 70)
     grand_total = sum(r["total_saved"] for _, _, r in all_results)
     print(f"DONE. Grand total candles saved across all symbols/timeframes: {grand_total}")
@@ -535,6 +884,235 @@ def run_fetcher(use_mock: bool) -> None:
         print("\n[ATTENTION] Some datasets need review (duplicates/bad prices/high<low):")
         for symbol, tf in any_dirty:
             print(f"    {symbol} [{tf}]")
+
+
+def run_fetch_job(
+    *,
+    output_root: str,
+    symbols: Optional[List[str]] = None,
+    timeframes: Optional[List[str]] = None,
+    update_existing: bool = True,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    use_mock: bool = False,
+    terminal_path: str = "",
+    login: int = 0,
+    password: str = "",
+    server: str = "",
+    market_type: Optional[str] = None,
+    auto_detect_market: bool = True,
+    mt5_module=None,
+    own_connection: Optional[bool] = None,
+    log=None,
+    should_stop=None,
+) -> dict:
+    """
+    Programmatic fetch used by the dashboard Fetch menu.
+
+    Spot and futures are stored separately:
+        <output_root>/spot/<symbol>/…
+        <output_root>/futures/<symbol>/…
+    Legacy <output_root>/<symbol>/… is treated as spot for updates.
+
+    market_type: "spot" | "futures" | None (auto from MT5 / name).
+
+    Connection safety (critical):
+      - Pass mt5_module= from an already-connected Live MT5Broker and set
+        own_connection=False so Fetch never initialize()/shutdown() a second
+        terminal and never kills Live.
+      - Otherwise Fetch opens ONE connection with the same path/login/server
+        as Live Settings and shuts it down when done.
+    """
+    _log = log or (lambda msg: print(msg))
+    stop = should_stop or (lambda: False)
+
+    root = os.path.abspath(os.path.expanduser(output_root or OUTPUT_ROOT))
+    # If caller already pointed at …/spot or …/futures, peel up to parent data root
+    if os.path.basename(root).lower() in MARKET_TYPES:
+        if market_type is None:
+            market_type = os.path.basename(root).lower()
+        root = os.path.dirname(root) or root
+    ensure_dir(root)
+
+    syms = list(symbols or SYMBOLS)
+    tfs = list(timeframes or list(TIMEFRAMES.keys()))
+    for tf in tfs:
+        if tf not in TIMEFRAMES:
+            raise ValueError(f"Unknown timeframe folder label: {tf}")
+
+    end = end_date or datetime.now(timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    default_start = start_date or START_DATE
+    if default_start.tzinfo is None:
+        default_start = default_start.replace(tzinfo=timezone.utc)
+
+    forced_market = normalize_market_type(market_type) if market_type else None
+    mode = "UPDATE existing" if update_existing else "FULL refresh"
+    _log(f"Data folder: {root}")
+    inv = detect_market_inventory(root)
+    _log(
+        f"On disk — spot: {', '.join(inv[MARKET_SPOT]) or '(none)'} | "
+        f"futures: {', '.join(inv[MARKET_FUTURES]) or '(none)'} | "
+        f"legacy: {', '.join(inv['legacy_spot']) or '(none)'}"
+    )
+    _log(
+        f"Mode: {mode} | Market: {forced_market or 'auto-detect'} | "
+        f"Symbols: {syms} | Timeframes: {tfs}"
+    )
+    _log("-" * 60)
+
+    mt5 = None
+    owns_mt5 = False
+    if not use_mock:
+        if mt5_module is not None:
+            mt5 = mt5_module
+            owns_mt5 = False if own_connection is None else bool(own_connection)
+            try:
+                info = mt5.account_info()
+                if info is not None:
+                    _log(
+                        f"[OK] Reusing open MT5 connection — Account: {info.login} | "
+                        f"Server: {info.server} (shared, will not shut down)"
+                    )
+                else:
+                    _log("[OK] Reusing open MT5 connection (shared, will not shut down)")
+            except Exception:
+                _log("[OK] Reusing open MT5 connection (shared, will not shut down)")
+        else:
+            mt5 = connect_to_mt5(
+                terminal_path=terminal_path,
+                login=int(login or 0),
+                password=password or "",
+                server=server or "",
+                log=_log,
+            )
+            owns_mt5 = True if own_connection is None else bool(own_connection)
+
+    all_results = []
+    write_roots_used = set()
+    try:
+        for symbol in syms:
+            if stop():
+                _log("[STOP] Fetch cancelled.")
+                break
+            if not use_mock and not verify_symbol(mt5, symbol):
+                _log(f"[SKIP] Symbol '{symbol}' not found on this broker.")
+                continue
+
+            if forced_market:
+                sym_market = forced_market
+                detected = (
+                    detect_market_type_from_mt5(mt5, symbol)
+                    if (auto_detect_market and mt5) else classify_market_type(symbol)
+                )
+                if detected != sym_market:
+                    _log(
+                        f"[INFO] '{symbol}' looks like {detected} from "
+                        f"{'MT5' if mt5 else 'name'}, but saving under {sym_market} as selected."
+                    )
+            else:
+                sym_market = (
+                    detect_market_type_from_mt5(mt5, symbol)
+                    if mt5 else classify_market_type(symbol)
+                )
+
+            write_root = resolve_write_root(root, symbol, sym_market)
+            write_roots_used.add(write_root)
+            _log(f"\n=== {symbol} → {sym_market.upper()} @ {write_root} ===")
+
+            for timeframe_label in tfs:
+                if stop():
+                    _log("[STOP] Fetch cancelled.")
+                    break
+                mt5_tf = TIMEFRAMES[timeframe_label]
+                tf_start = default_start
+                updating = False
+                if update_existing:
+                    latest = detect_latest_bar(symbol, timeframe_label, output_root=write_root)
+                    if latest is not None:
+                        minutes = TIMEFRAME_MINUTES.get(timeframe_label, 60)
+                        naive_start = latest + timedelta(minutes=minutes)
+                        tf_start = naive_start.replace(tzinfo=timezone.utc)
+                        updating = True
+                        _log(
+                            f"\n{symbol} [{timeframe_label}]: existing {sym_market} data through "
+                            f"{latest} — updating from {naive_start} …"
+                        )
+                    else:
+                        _log(
+                            f"\n{symbol} [{timeframe_label}]: no local {sym_market} data — "
+                            f"full pull from {tf_start.date()} …"
+                        )
+                else:
+                    _log(
+                        f"\n{symbol} [{timeframe_label}]: full {sym_market} refresh "
+                        f"from {tf_start.date()} …"
+                    )
+
+                if tf_start >= end:
+                    _log(f"  Already up to date (nothing newer than {tf_start}).")
+                    all_results.append((symbol, timeframe_label, {
+                        "total_saved": 0,
+                        "failed_chunks": [],
+                        "market_type": sym_market,
+                        "write_root": write_root,
+                        "quality": {
+                            "timeframe": timeframe_label,
+                            "total_candles": 0,
+                            "duplicate_timestamps": 0,
+                            "invalid_price_rows": 0,
+                            "high_low_violations": 0,
+                            "suspicious_gaps": 0,
+                            "is_clean": None,
+                        },
+                    }))
+                    continue
+
+                result = fetch_and_save(
+                    mt5=mt5,
+                    symbol=symbol,
+                    timeframe_label=timeframe_label,
+                    mt5_timeframe_name=mt5_tf,
+                    start=tf_start,
+                    end=end,
+                    use_mock=use_mock,
+                    output_root=write_root,
+                    update_existing=updating or update_existing,
+                    log=_log,
+                )
+                result["market_type"] = sym_market
+                result["write_root"] = write_root
+                all_results.append((symbol, timeframe_label, result))
+                _log(
+                    f"  -> {symbol} [{timeframe_label}] ({sym_market}): "
+                    f"{result['total_saved']} candle(s) written"
+                )
+                print_quality_report(symbol, result["quality"])
+    finally:
+        if mt5 is not None:
+            disconnect_from_mt5(mt5, owned=owns_mt5, log=_log)
+
+    grand = sum(r["total_saved"] for _, _, r in all_results)
+    _log("-" * 60)
+    _log(f"DONE. Candles written this run: {grand}")
+    _log(f"Data folder: {root}")
+    for wr in sorted(write_roots_used):
+        _log(f"  Wrote under: {wr}")
+    primary_write = (
+        sorted(write_roots_used)[0]
+        if write_roots_used
+        else market_data_root(root, forced_market or MARKET_SPOT)
+    )
+    return {
+        "output_root": root,
+        "write_root": primary_write,
+        "market_type": forced_market or (
+            all_results[0][2].get("market_type") if all_results else MARKET_SPOT
+        ),
+        "total_saved": grand,
+        "results": all_results,
+    }
 
 
 # ============================================================================

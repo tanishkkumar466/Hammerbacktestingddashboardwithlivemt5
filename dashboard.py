@@ -61,7 +61,7 @@ import sys
 import tempfile
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +77,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QMessageBox, QFrame, QDialog, QSizePolicy,
     QDockWidget, QInputDialog, QPlainTextEdit, QFormLayout,
     QAbstractItemView, QDialogButtonBox, QButtonGroup, QColorDialog, QRadioButton,
+    QFileDialog,
 )
 
 import logic
@@ -89,6 +90,8 @@ import polars as pl
 from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperTrendConfig, VWAPConfig
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
+import telegram_notify
+import fetch as data_fetcher
 from broker import BrokerCredentials, MT5Broker
 from live_journal import append_session_log, live_journal_dir, session_log_path
 
@@ -904,17 +907,28 @@ ENTRY_RULE_LABELS_WICK_OFF = {
 }
 
 
-def _populate_enum_combo(combo: QComboBox, choices: List[str], default_val: Any) -> None:
+def _populate_enum_combo(combo: QComboBox, choices: List[Any], default_val: Any) -> None:
     """Dropdown stores enum value in itemData; label can be changed without breaking reads."""
     combo.clear()
     default_str = default_val.value if isinstance(default_val, Enum) else str(default_val)
     for choice in choices:
-        combo.addItem(str(choice), choice)
+        if isinstance(choice, (tuple, list)) and len(choice) >= 2:
+            value, label = str(choice[0]), str(choice[1])
+        else:
+            value = label = str(choice)
+        combo.addItem(label, value)
     idx = combo.findData(default_str)
     if idx >= 0:
         combo.setCurrentIndex(idx)
     elif combo.findText(default_str) >= 0:
         combo.setCurrentText(default_str)
+
+
+MARKET_DATA_CHOICES = [
+    ("spot", "Spot"),
+    ("futures", "Futures"),
+    ("both", "Both (spot + futures)"),
+]
 
 
 def _prefixed_shape_fields(prefix: str, field_defs) -> List[tuple]:
@@ -1185,6 +1199,7 @@ TIMEFRAME_CHOPPINESS = {
 BACKTEST_FIELDS = [
     ("symbol", "Instrument / Symbol", FIELD_TYPE_TEXT, None),
     ("data_root", "Data Folder", FIELD_TYPE_TEXT, None),
+    ("market_data", "Market data (spot / futures)", FIELD_TYPE_DROPDOWN, MARKET_DATA_CHOICES),
     ("start_date", "Backtest Start Date (YYYY-MM-DD, blank = all)", FIELD_TYPE_TEXT, None),
     ("end_date", "Backtest End Date (YYYY-MM-DD, blank = all)", FIELD_TYPE_TEXT, None),
     ("max_forward_candles", "Max Forward Scan (candles)", FIELD_TYPE_TEXT, None),
@@ -1308,7 +1323,17 @@ FIELD_HELP: Dict[str, str] = {
     "enable_risk_limit": "On: trades that would risk more than the configured limit are skipped.",
     "reject_zero_or_negative_risk": "On: skip any trade where entry and stop-loss end up on the same side (zero or negative risk).",
     "symbol": "Instrument folder name under the Data Folder to backtest (e.g. EURUSD).",
-    "data_root": "Folder containing your historical price CSVs, organized by symbol and timeframe.",
+    "data_root": (
+        "Folder containing your historical price CSVs. Can be the parent data/ folder "
+        "or a market folder (data/spot, data/futures). Use Market data to choose spot vs futures."
+    ),
+    "market_data": (
+        "Which CSV tree to backtest (default Spot):\n"
+        "• Spot — data/spot/SYMBOL, or your existing data/SYMBOL folder\n"
+        "• Futures — data/futures/SYMBOL\n"
+        "• Both — run spot and futures in one backtest (tagged in results)\n"
+        "No need to move folders; Spot still finds legacy data/SYMBOL."
+    ),
     "start_date": "Only include candles on/after this date. Leave blank to use all available history.",
     "end_date": "Only include candles on/before this date. Leave blank to use all available history.",
     "max_forward_candles": "How many candles forward the backtest scans looking for the trade's exit before giving up.",
@@ -1569,6 +1594,18 @@ QLabel#liveStepChip {
 QFrame#liveControlBar {
     background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
     padding: 10px 12px;
+}
+QFrame#liveNotifyBar {
+    background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
+    padding: 10px 12px;
+}
+QLabel#liveNotifyTitle { font-size: 12.5px; font-weight: 700; color: #188038; }
+QLabel#liveNotifyStatus {
+    background-color: #F1F3F4; border: 1px solid #E8EAED; border-radius: 6px;
+    padding: 3px 10px; font-size: 11px; font-weight: 600; color: #5F6368;
+}
+QLabel#liveNotifyStatus[ready="true"] {
+    background-color: #E6F4EA; border-color: #CEEAD6; color: #188038;
 }
 QLabel#liveStatusBadge {
     background-color: #F1F3F4; border: 1px solid #DDE1E6; border-radius: 8px;
@@ -2390,6 +2427,9 @@ class BacktestWorker(QObject):
                 backtest_output_dir=os.path.join(
                     self.backtest_config.output_root, self.backtest_config.run_name),
                 output_dir=plots_dir,
+                data_root=getattr(self.backtest_config, "data_root", None),
+                symbol=getattr(self.backtest_config, "symbol", None),
+                timeframes=list(getattr(self.backtest_config, "timeframes_to_test", None) or []),
             )
             plotting.generate_all_plots(plot_config)
             plotting.generate_yearly_summary(plot_config)
@@ -2399,6 +2439,490 @@ class BacktestWorker(QObject):
         except Exception as e:
             tb = traceback.format_exc()
             self.failed.emit(str(e), tb)
+
+
+class FetchDataWorker(QThread):
+    """Background MT5/history fetch so the UI stays responsive."""
+
+    log_line = Signal(str)
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, job: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self._job = job
+        self._stop = False
+
+    def request_stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            result = data_fetcher.run_fetch_job(
+                output_root=self._job["output_root"],
+                symbols=self._job["symbols"],
+                timeframes=self._job["timeframes"],
+                update_existing=self._job["update_existing"],
+                start_date=self._job.get("start_date"),
+                use_mock=bool(self._job.get("use_mock", False)),
+                terminal_path=self._job.get("terminal_path") or "",
+                login=int(self._job.get("login") or 0),
+                password=self._job.get("password") or "",
+                server=self._job.get("server") or "",
+                market_type=self._job.get("market_type"),
+                auto_detect_market=bool(self._job.get("auto_detect_market", True)),
+                mt5_module=self._job.get("mt5_module"),
+                own_connection=self._job.get("own_connection"),
+                log=lambda msg: self.log_line.emit(str(msg)),
+                should_stop=lambda: self._stop,
+            )
+            self.finished_ok.emit(result)
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
+class FetchDataDialog(QDialog):
+    """Fetch / update historical CSVs via fetch.py (menu bar → Fetch)."""
+
+    def __init__(self, dashboard: "BacktestDashboard"):
+        super().__init__(dashboard)
+        self._dash = dashboard
+        self._worker: Optional[FetchDataWorker] = None
+        self.setWindowTitle("Fetch market data")
+        self.setMinimumSize(640, 520)
+        self.resize(720, 580)
+
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "Pulls candles from the <b>same MT5 terminal as Live</b> "
+            "(Live Settings path / login / server — never a second connection). "
+            "<b>Spot</b> and <b>futures</b> are stored separately "
+            "(<code>data/spot/…</code> and <code>data/futures/…</code>). "
+            "Update mode only downloads newer bars and merges them."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        intro.setObjectName("sectionHint")
+        root.addWidget(intro)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        path_row = QHBoxLayout()
+        self.data_root_edit = QLineEdit(self._detected_data_root())
+        browse = QPushButton("Browse…")
+        browse.setObjectName("secondaryButton")
+        browse.clicked.connect(self._browse_data_root)
+        path_row.addWidget(self.data_root_edit, 1)
+        path_row.addWidget(browse)
+        form.addRow("Data folder", path_row)
+
+        self.symbol_edit = QLineEdit(self._detected_symbol())
+        self.symbol_edit.editingFinished.connect(self._on_symbol_or_market_changed)
+        form.addRow("Symbol", self.symbol_edit)
+
+        self.market_spot = QRadioButton("Spot")
+        self.market_futures = QRadioButton("Futures")
+        self.market_auto = QRadioButton("Auto-detect (MT5 / name)")
+        self.market_auto.setChecked(True)
+        self.market_group = QButtonGroup(self)
+        self.market_group.addButton(self.market_spot)
+        self.market_group.addButton(self.market_futures)
+        self.market_group.addButton(self.market_auto)
+        market_row = QHBoxLayout()
+        market_row.addWidget(self.market_auto)
+        market_row.addWidget(self.market_spot)
+        market_row.addWidget(self.market_futures)
+        market_row.addStretch()
+        form.addRow("Market type", market_row)
+        self.market_guess_label = QLabel("")
+        self.market_guess_label.setObjectName("sectionHint")
+        form.addRow("", self.market_guess_label)
+        self.market_spot.toggled.connect(self._on_symbol_or_market_changed)
+        self.market_futures.toggled.connect(self._on_symbol_or_market_changed)
+        self.market_auto.toggled.connect(self._on_symbol_or_market_changed)
+
+        self.mt5_conn_label = QLabel("")
+        self.mt5_conn_label.setWordWrap(True)
+        self.mt5_conn_label.setObjectName("sectionHint")
+        self.mt5_conn_label.setTextFormat(Qt.RichText)
+        form.addRow("MT5 connection", self.mt5_conn_label)
+
+        self.mode_update = QRadioButton("Update existing (recommended)")
+        self.mode_update.setChecked(True)
+        self.mode_update.setToolTip(
+            "Detect the latest bar on disk per timeframe and only fetch newer data."
+        )
+        self.mode_full = QRadioButton("Full re-fetch from start year")
+        self.mode_full.setToolTip("Overwrite monthly files from the start year through today.")
+        mode_box = QVBoxLayout()
+        mode_box.addWidget(self.mode_update)
+        mode_box.addWidget(self.mode_full)
+        form.addRow("Mode", mode_box)
+
+        self.start_year_edit = QLineEdit("2020")
+        self.start_year_edit.setMaximumWidth(80)
+        self.start_year_edit.setToolTip("Used when no local data exists, or for full re-fetch.")
+        form.addRow("Start year", self.start_year_edit)
+
+        root.addLayout(form)
+
+        tf_box = QGroupBox("Timeframes")
+        tf_layout = QHBoxLayout(tf_box)
+        self.tf_checks: Dict[str, QCheckBox] = {}
+        for folder in data_fetcher.TIMEFRAMES.keys():
+            cb = QCheckBox(folder)
+            cb.setChecked(True)
+            self.tf_checks[folder] = cb
+            tf_layout.addWidget(cb)
+        tf_layout.addStretch()
+        root.addWidget(tf_box)
+
+        detect_row = QHBoxLayout()
+        self.detect_label = QLabel("")
+        self.detect_label.setObjectName("sectionHint")
+        self.detect_label.setWordWrap(True)
+        detect_btn = QPushButton("Scan data folder")
+        detect_btn.setObjectName("secondaryButton")
+        detect_btn.clicked.connect(self._refresh_detect_summary)
+        detect_row.addWidget(detect_btn)
+        detect_row.addWidget(self.detect_label, 1)
+        root.addLayout(detect_row)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setObjectName("liveLogConsole")
+        self.log_view.setMinimumHeight(180)
+        root.addWidget(self.log_view, 1)
+
+        btn_row = QHBoxLayout()
+        self.start_btn = QPushButton("Start fetch")
+        self.start_btn.setObjectName("primaryButton")
+        self.start_btn.clicked.connect(self._start_fetch)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("secondaryButton")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_fetch)
+        open_folder = QPushButton("Open data folder")
+        open_folder.setObjectName("secondaryButton")
+        open_folder.clicked.connect(self._open_data_folder)
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("secondaryButton")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.start_btn)
+        btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(open_folder)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+        self._on_symbol_or_market_changed()
+        self._refresh_mt5_connection_label()
+
+    def _detected_data_root(self) -> str:
+        d = self._dash
+        w = d.field_widgets.get("data_root") if hasattr(d, "field_widgets") else None
+        if isinstance(w, QLineEdit) and w.text().strip():
+            path = backtest.resolve_data_root(w.text().strip(), anchor_dir=APP_DIR)
+            # Peel …/spot or …/futures so the dialog always shows the parent data root
+            if os.path.basename(path).lower() in data_fetcher.MARKET_TYPES:
+                path = os.path.dirname(path) or path
+            return path
+        return DEFAULT_DATA_DIR
+
+    def _detected_symbol(self) -> str:
+        d = self._dash
+        w = d.field_widgets.get("symbol") if hasattr(d, "field_widgets") else None
+        if isinstance(w, QLineEdit) and w.text().strip():
+            return w.text().strip()
+        return "XAUUSD"
+
+    def _selected_market_type(self) -> Optional[str]:
+        if self.market_spot.isChecked():
+            return data_fetcher.MARKET_SPOT
+        if self.market_futures.isChecked():
+            return data_fetcher.MARKET_FUTURES
+        return None  # auto
+
+    def _on_symbol_or_market_changed(self, *_args):
+        sym = self.symbol_edit.text().strip() or "XAUUSD"
+        guessed = data_fetcher.classify_market_type(sym)
+        selected = self._selected_market_type()
+        if selected is None:
+            self.market_guess_label.setText(
+                f"Name guess for <b>{sym}</b>: <b>{guessed.upper()}</b> "
+                f"(MT5 will refine this when connected)."
+            )
+        else:
+            note = ""
+            if guessed != selected:
+                note = f" — name looks like <b>{guessed}</b>, but will save as <b>{selected}</b>"
+            self.market_guess_label.setText(
+                f"Saving <b>{sym}</b> under <b>{selected.upper()}</b>{note}."
+            )
+        self.market_guess_label.setTextFormat(Qt.RichText)
+        self._refresh_detect_summary()
+
+    def _browse_data_root(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select data folder", self.data_root_edit.text().strip() or DEFAULT_DATA_DIR,
+        )
+        if path:
+            self.data_root_edit.setText(path)
+            self._refresh_detect_summary()
+
+    def _open_data_folder(self):
+        path = self.data_root_edit.text().strip() or DEFAULT_DATA_DIR
+        mt = self._selected_market_type() or data_fetcher.classify_market_type(
+            self.symbol_edit.text().strip() or "XAUUSD"
+        )
+        target = data_fetcher.market_data_root(path, mt)
+        os.makedirs(target, exist_ok=True)
+        self._dash._open_folder(target)
+
+    def _refresh_detect_summary(self):
+        root = self.data_root_edit.text().strip() or DEFAULT_DATA_DIR
+        root = backtest.resolve_data_root(root, anchor_dir=APP_DIR)
+        if os.path.basename(root).lower() in data_fetcher.MARKET_TYPES:
+            root = os.path.dirname(root) or root
+        self.data_root_edit.setText(root)
+        sym = self.symbol_edit.text().strip() or "XAUUSD"
+        if not os.path.isdir(root):
+            self.detect_label.setText(f"Folder does not exist yet — will be created: {root}")
+            return
+        inv = data_fetcher.detect_market_inventory(root)
+        bits = [
+            f"spot: {', '.join(inv['spot']) or '—'} | "
+            f"futures: {', '.join(inv['futures']) or '—'} | "
+            f"legacy: {', '.join(inv['legacy_spot']) or '—'}"
+        ]
+        mt = self._selected_market_type() or data_fetcher.classify_market_type(sym)
+        write_root = data_fetcher.resolve_write_root(root, sym, mt)
+        for tf in ("1hour", "15min", "1min"):
+            latest = data_fetcher.detect_latest_bar(sym, tf, output_root=write_root)
+            if latest is not None:
+                bits.append(f"{mt}/{sym}/{tf} → {latest}")
+        self.detect_label.setText(" · ".join(bits[:6]) + (" …" if len(bits) > 6 else ""))
+
+    def _append_log(self, line: str):
+        self.log_view.appendPlainText(line)
+        bar = self.log_view.verticalScrollBar()
+        if bar is not None:
+            bar.setValue(bar.maximum())
+
+    def _refresh_mt5_connection_label(self) -> None:
+        d = self._dash
+        creds = d._live_broker_credentials() if hasattr(d, "_live_broker_credentials") else None
+        path = (creds.terminal_path if creds else "") or "(nearest running MT5)"
+        login = creds.login if creds else 0
+        server = (creds.server if creds else "") or "—"
+        broker = getattr(d, "mt5_broker", None)
+        if broker is not None and broker.is_connected:
+            info = broker.account_info_dict()
+            self.mt5_conn_label.setText(
+                f"<b>Reusing Live connection</b> — account {info.get('login', '?')} "
+                f"@ {info.get('server', '?')}<br>"
+                f"Terminal setting: {path} · will <b>not</b> shut down after fetch"
+            )
+        else:
+            login_txt = str(login) if login else "(already logged in)"
+            self.mt5_conn_label.setText(
+                f"Will connect with <b>Live Settings</b> "
+                f"(same as Connect MT5)<br>"
+                f"Terminal: {path} · Login: {login_txt} · Server: {server}"
+            )
+
+    def _start_fetch(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+        d = self._dash
+        # Never fight Live for the process-global MetaTrader5 connection
+        if hasattr(d, "_live_worker_running") and d._live_worker_running():
+            QMessageBox.warning(
+                self,
+                "Live is running",
+                "Stop live trading before fetching history.\n\n"
+                "MT5 allows only one Python connection — Fetch and Live must "
+                "not compete for the same terminal.",
+            )
+            return
+
+        root = self.data_root_edit.text().strip() or DEFAULT_DATA_DIR
+        root = backtest.resolve_data_root(root, anchor_dir=APP_DIR)
+        if os.path.basename(root).lower() in data_fetcher.MARKET_TYPES:
+            root = os.path.dirname(root) or root
+        symbol = self.symbol_edit.text().strip() or "XAUUSD"
+        tfs = [tf for tf, cb in self.tf_checks.items() if cb.isChecked()]
+        if not tfs:
+            QMessageBox.warning(self, "Fetch", "Select at least one timeframe.")
+            return
+        try:
+            year = int(self.start_year_edit.text().strip() or "2020")
+            year = max(1990, min(datetime.now().year, year))
+        except ValueError:
+            year = 2020
+        start_date = datetime(year, 1, 1, tzinfo=timezone.utc)
+        update = self.mode_update.isChecked()
+        market = self._selected_market_type()
+        creds = d._live_broker_credentials()
+
+        shared_mt5 = None
+        own_connection = True
+        broker = getattr(d, "mt5_broker", None)
+        if broker is not None and broker.is_connected and broker.raw_mt5 is not None:
+            shared_mt5 = broker.raw_mt5
+            own_connection = False
+
+        job = {
+            "output_root": root,
+            "symbols": [symbol],
+            "timeframes": tfs,
+            "update_existing": update,
+            "start_date": start_date,
+            "terminal_path": creds.terminal_path,
+            "login": creds.login,
+            "password": creds.password,
+            "server": creds.server,
+            "use_mock": False,
+            "market_type": market,
+            "auto_detect_market": True,
+            "mt5_module": shared_mt5,
+            "own_connection": own_connection,
+        }
+        self.log_view.clear()
+        mt_label = market or "auto-detect"
+        if shared_mt5 is not None:
+            self._append_log(f"Starting fetch ({mt_label}) via shared Live MT5 connection…")
+        else:
+            self._append_log(
+                f"Starting fetch ({mt_label}) using Live Settings credentials "
+                f"(single connection; will close when done)…"
+            )
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._worker = FetchDataWorker(job, self)
+        self._worker.log_line.connect(self._append_log)
+        self._worker.finished_ok.connect(self._on_fetch_ok)
+        self._worker.failed.connect(self._on_fetch_failed)
+        self._worker.finished.connect(self._on_fetch_thread_finished)
+        self._worker.start()
+
+    def _stop_fetch(self):
+        if self._worker is not None:
+            self._worker.request_stop()
+            self._append_log("[STOP] Stop requested — finishing current chunk…")
+
+    def _on_fetch_ok(self, result: dict):
+        total = result.get("total_saved", 0)
+        market = result.get("market_type") or "spot"
+        write_root = result.get("write_root") or result.get("output_root") or ""
+        self._append_log(
+            f"Fetch finished ({market}). Candles written: {total} → {write_root}"
+        )
+        self._refresh_detect_summary()
+        # Point Parameters → data_root at the market folder used (spot or futures)
+        w = self._dash.field_widgets.get("data_root") if hasattr(self._dash, "field_widgets") else None
+        if isinstance(w, QLineEdit) and write_root:
+            w.setText(write_root)
+        QMessageBox.information(
+            self, "Fetch complete",
+            f"Done.\n\nMarket: {market}\nCandles written: {total}\n\n"
+            f"Backtest data folder set to:\n{write_root}",
+        )
+
+    def _on_fetch_failed(self, detail: str):
+        self._append_log(detail)
+        QMessageBox.critical(
+            self, "Fetch failed",
+            "Could not fetch data. On Windows, open MT5 and log in first.\n\n"
+            f"{detail[:800]}",
+        )
+
+    def _on_fetch_thread_finished(self):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._worker = None
+
+    def closeEvent(self, event):
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.request_stop()
+            self._worker.wait(3000)
+        super().closeEvent(event)
+
+
+class LiveNotificationsDialog(QDialog):
+    """Telegram alerts — opened from menu bar Notifications."""
+
+    def __init__(self, dashboard: "BacktestDashboard"):
+        super().__init__(dashboard)
+        self._dash = dashboard
+        self.setWindowTitle("Telegram notifications")
+        self.setMinimumSize(500, 340)
+        self.resize(540, 380)
+
+        d = dashboard
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "Get a Telegram message when the bot places an order, runs dry run, "
+            "fails an order, or hits a safety block. Retries automatically if Telegram is slow."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("sectionHint")
+        root.addWidget(intro)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        d.live_telegram_enabled.setText("Send Telegram alerts for all order events")
+        form.addRow(d.live_telegram_enabled)
+        form.addRow("Bot token", d.live_telegram_token)
+        form.addRow("Chat ID", d.live_telegram_chat_id)
+        root.addLayout(form)
+
+        if not hasattr(d, "live_telegram_status"):
+            d.live_telegram_status = QLabel("Off")
+        d.live_telegram_status.setObjectName("liveNotifyStatus")
+        d._refresh_live_telegram_status()
+        root.addWidget(d.live_telegram_status)
+
+        test_btn = QPushButton("Send test notification")
+        test_btn.setObjectName("secondaryButton")
+        test_btn.setToolTip("Verify bot token and chat id (with retries).")
+        test_btn.clicked.connect(d._test_telegram_notification)
+        root.addWidget(test_btn)
+
+        hint = QLabel(
+            "Create a bot with <b>@BotFather</b>, paste the token, then message your bot once. "
+            "Get your numeric chat id from <b>@userinfobot</b>."
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.RichText)
+        hint.setObjectName("sectionHint")
+        root.addWidget(hint)
+        root.addStretch()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self._on_cancel)
+        root.addWidget(buttons)
+
+    def _release_widgets(self):
+        self._dash._stash_live_notifications_widgets()
+
+    def _on_cancel(self):
+        self._release_widgets()
+        self.reject()
+
+    def _on_save(self):
+        self._dash._save_live_settings()
+        self._dash._refresh_live_telegram_status()
+        self._dash._on_live_telegram_changed()
+        self._dash._live_log("Telegram notification settings saved.")
+        self._release_widgets()
+        self.accept()
+
+    def closeEvent(self, event):
+        self._release_widgets()
+        super().closeEvent(event)
 
 
 class LiveSettingsDialog(QDialog):
@@ -2680,6 +3204,8 @@ class BacktestDashboard(QMainWindow):
 
         self._live_settings_host = QWidget(self)
         self._live_settings_host.setVisible(False)
+        self._live_notifications_host = QWidget(self)
+        self._live_notifications_host.setVisible(False)
 
         try:
             self.run_db: Optional[RunDatabase] = RunDatabase(RUN_DATABASE_PATH)
@@ -3112,6 +3638,51 @@ class BacktestDashboard(QMainWindow):
         self._live_action_ray.triggered.connect(self._on_live_performance_menu_changed)
         perf_menu.addAction(self._live_action_ray)
 
+    def _build_notifications_menu(self):
+        """Top-level Notifications menu — separate from Live settings."""
+        menu_bar = self.menuBar()
+        notify_menu = menu_bar.addMenu("Notifications")
+        open_tg = QAction("Telegram alerts…", self)
+        open_tg.setToolTip(
+            "Configure Telegram alerts for placed orders, dry run, failures, and safety blocks"
+        )
+        open_tg.triggered.connect(self._open_live_notifications)
+        notify_menu.addAction(open_tg)
+
+    def _build_fetch_menu(self):
+        """Top-level Fetch menu — pulls history from nearest MT5 into data/."""
+        menu_bar = self.menuBar()
+        fetch_menu = menu_bar.addMenu("Fetch")
+        open_fetch = QAction("Fetch / update data from MT5…", self)
+        open_fetch.setToolTip(
+            "Detect the data folder, connect to the nearest MT5 terminal, "
+            "and update CSVs with newer bars (or full re-fetch)."
+        )
+        open_fetch.triggered.connect(self._open_fetch_data_dialog)
+        fetch_menu.addAction(open_fetch)
+        open_data = QAction("Open data folder", self)
+        open_data.triggered.connect(self._open_data_folder_menu)
+        fetch_menu.addAction(open_data)
+
+    def _open_fetch_data_dialog(self):
+        if self._live_worker_running():
+            QMessageBox.warning(
+                self,
+                "Live is running",
+                "Stop live trading before opening Fetch.\n\n"
+                "History download and live trading share one MT5 Python connection.",
+            )
+            return
+        dlg = FetchDataDialog(self)
+        dlg.exec()
+
+    def _open_data_folder_menu(self):
+        w = self.field_widgets.get("data_root") if hasattr(self, "field_widgets") else None
+        path = w.text().strip() if isinstance(w, QLineEdit) and w.text().strip() else DEFAULT_DATA_DIR
+        path = backtest.resolve_data_root(path, anchor_dir=APP_DIR)
+        os.makedirs(path, exist_ok=True)
+        self._open_folder(path)
+
     def _live_dry_run_checked(self) -> bool:
         if hasattr(self, "live_dry_run_cb"):
             return self.live_dry_run_cb.isChecked()
@@ -3181,6 +3752,8 @@ class BacktestDashboard(QMainWindow):
     def _build_shortcuts(self):
         menu_bar = self.menuBar()
         self._build_live_menu()
+        self._build_notifications_menu()
+        self._build_fetch_menu()
         run_menu = menu_bar.addMenu("Run")
 
         run_action = QAction("Run Backtest", self)
@@ -3280,6 +3853,8 @@ class BacktestDashboard(QMainWindow):
             "F4   Toggle Pattern & Preview panel\n"
             "F8   Toggle Results panel\n"
             "F9   Toggle Live Trading panel\n"
+            "Notifications → Telegram alerts   Order notifications\n"
+            "Fetch → Fetch / update data from MT5   History CSVs\n"
             "Live → Performance   Dry run, thread pool, Ray (advanced)\n"
             "F1   This help\n\n"
             "Help → Parameter Guide — which tabs affect signals vs backtest sizing vs live.\n\n"
@@ -5575,8 +6150,8 @@ class BacktestDashboard(QMainWindow):
         steps.addStretch()
         hero_layout.addLayout(steps)
         sub = QLabel(
-            "Use <b>Settings…</b> for MT5, market/limit orders, and risk limits. "
-            "Demo and live accounts supported."
+            "Use menu <b>Notifications</b> for Telegram alerts. "
+            "Use <b>Settings…</b> for MT5, orders, and risk limits."
         )
         sub.setTextFormat(Qt.RichText)
         sub.setWordWrap(True)
@@ -5607,6 +6182,7 @@ class BacktestDashboard(QMainWindow):
         ctrl_layout.addWidget(self.live_start_btn)
         ctrl_layout.addWidget(self.live_stop_btn)
         root.addWidget(control)
+
         root.addWidget(self.live_status_label)
 
         self.live_config_summary = QLabel("Open Settings to configure MT5, orders, and risk limits.")
@@ -5727,6 +6303,24 @@ class BacktestDashboard(QMainWindow):
             "On Start live, remind you if the live chart TF is unchecked in Parameters → Timeframes."
         )
 
+        self.live_telegram_enabled = QCheckBox("Send Telegram alerts for all order events")
+        self.live_telegram_enabled.setToolTip(
+            "Send Telegram messages for real orders, dry run, failed orders, and safety blocks."
+        )
+        self.live_telegram_token = QLineEdit()
+        self.live_telegram_token.setEchoMode(QLineEdit.Password)
+        self.live_telegram_token.setPlaceholderText("From @BotFather")
+        self.live_telegram_chat_id = QLineEdit()
+        self.live_telegram_chat_id.setPlaceholderText("Your numeric chat id")
+        self.live_telegram_chat_id.setToolTip(
+            "Message @userinfobot on Telegram to get your numeric chat id."
+        )
+        self.live_telegram_status = QLabel("Off")
+        self.live_telegram_status.setObjectName("liveNotifyStatus")
+        self.live_telegram_enabled.toggled.connect(self._on_live_telegram_changed)
+        self.live_telegram_token.editingFinished.connect(self._on_live_telegram_changed)
+        self.live_telegram_chat_id.editingFinished.connect(self._on_live_telegram_changed)
+
         self.live_settings_strategy_info = QLabel("Strategy summary will appear when you open Settings.")
         self.live_settings_strategy_info.setWordWrap(True)
         self.live_settings_strategy_info.setTextFormat(Qt.RichText)
@@ -5745,6 +6339,10 @@ class BacktestDashboard(QMainWindow):
         if host is not None:
             for w in self._live_settings_field_widgets():
                 w.setParent(host)
+        notify_host = getattr(self, "_live_notifications_host", None)
+        if notify_host is not None:
+            for w in self._live_notifications_field_widgets():
+                w.setParent(notify_host)
 
         self.live_connect_btn = QPushButton("Connect MT5")
         self.live_connect_btn.setObjectName("secondaryButton")
@@ -5825,6 +6423,9 @@ class BacktestDashboard(QMainWindow):
             ist_time_filter_enabled=tf["ist_time_filter_enabled"],
             ist_time_start=tf["ist_time_start"],
             ist_time_end=tf["ist_time_end"],
+            telegram_enabled=self.live_telegram_enabled.isChecked(),
+            telegram_bot_token=self.live_telegram_token.text().strip(),
+            telegram_chat_id=self.live_telegram_chat_id.text().strip(),
         )
         self._refresh_live_strategy_summary()
         self._live_log("Dashboard parameters pushed to live loop.")
@@ -5839,6 +6440,26 @@ class BacktestDashboard(QMainWindow):
             return
         dlg = LiveSettingsDialog(self)
         dlg.exec()
+
+    def _open_live_notifications(self):
+        dlg = LiveNotificationsDialog(self)
+        dlg.exec()
+
+    def _live_notifications_field_widgets(self):
+        widgets = [
+            self.live_telegram_enabled,
+            self.live_telegram_token,
+            self.live_telegram_chat_id,
+            self.live_telegram_status,
+        ]
+        return widgets
+
+    def _stash_live_notifications_widgets(self):
+        host = getattr(self, "_live_notifications_host", None)
+        if host is None:
+            return
+        for w in self._live_notifications_field_widgets():
+            w.setParent(host)
 
     def _live_settings_field_widgets(self):
         widgets = [
@@ -6031,6 +6652,42 @@ class BacktestDashboard(QMainWindow):
         html += "<span style='color:#5f6368;'>Click Settings… for connection, limit orders, and all limits.</span>"
         self.live_config_summary.setText(html)
 
+    def _refresh_live_telegram_status(self) -> None:
+        if not hasattr(self, "live_telegram_status"):
+            return
+        enabled = (
+            hasattr(self, "live_telegram_enabled")
+            and self.live_telegram_enabled.isChecked()
+        )
+        token = self.live_telegram_token.text().strip() if hasattr(self, "live_telegram_token") else ""
+        chat_id = self.live_telegram_chat_id.text().strip() if hasattr(self, "live_telegram_chat_id") else ""
+        badge = self.live_telegram_status
+        if not enabled:
+            badge.setText("Off")
+            badge.setProperty("ready", False)
+        elif token and chat_id:
+            badge.setText("Ready")
+            badge.setProperty("ready", True)
+        else:
+            badge.setText("Needs token + chat id")
+            badge.setProperty("ready", False)
+        badge.style().unpolish(badge)
+        badge.style().polish(badge)
+
+    def _on_live_telegram_changed(self) -> None:
+        self._save_live_settings()
+        self._refresh_live_telegram_status()
+        if self._live_engine is not None and self._live_worker_running():
+            self._live_engine.update_runtime_strategy(
+                self._live_engine.strategy_config,
+                self._live_engine.indicator_stack,
+                self._live_engine.pattern_type,
+                self._live_engine.pattern_label,
+                telegram_enabled=self.live_telegram_enabled.isChecked(),
+                telegram_bot_token=self.live_telegram_token.text().strip(),
+                telegram_chat_id=self.live_telegram_chat_id.text().strip(),
+            )
+
     def _on_live_pattern_combo_changed(self, pattern_name: str):
         if not pattern_name or not hasattr(self, "pattern_combo"):
             return
@@ -6154,6 +6811,9 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/history_bars", self.live_history_bars.text())
         s.setValue("live/fallback_market", self.live_fallback_market.isChecked())
         s.setValue("live/warn_tf_mismatch", self.live_warn_tf_mismatch.isChecked())
+        s.setValue("live/telegram_enabled", self.live_telegram_enabled.isChecked())
+        s.setValue("live/telegram_token", self.live_telegram_token.text())
+        s.setValue("live/telegram_chat_id", self.live_telegram_chat_id.text())
 
     def _restore_live_settings(self):
         if not hasattr(self, "live_mt5_path"):
@@ -6197,10 +6857,15 @@ class BacktestDashboard(QMainWindow):
                     break
             self.live_fallback_market.setChecked(s.value("live/fallback_market", False, type=bool))
             self.live_warn_tf_mismatch.setChecked(s.value("live/warn_tf_mismatch", True, type=bool))
+        if hasattr(self, "live_telegram_enabled"):
+            self.live_telegram_enabled.setChecked(s.value("live/telegram_enabled", False, type=bool))
+            self.live_telegram_token.setText(s.value("live/telegram_token", "", type=str))
+            self.live_telegram_chat_id.setText(s.value("live/telegram_chat_id", "", type=str))
         if hasattr(self, "live_dry_run_cb") and hasattr(self, "_live_action_dry_run"):
             self.live_dry_run_cb.blockSignals(True)
             self.live_dry_run_cb.setChecked(s.value("live/dry_run", True, type=bool))
             self.live_dry_run_cb.blockSignals(False)
+        self._refresh_live_telegram_status()
         self._refresh_live_perf_hint()
 
     def _append_live_log_line(self, line: str):
@@ -6299,8 +6964,44 @@ class BacktestDashboard(QMainWindow):
             fallback_to_market_on_limit_fail=self.live_fallback_market.isChecked(),
             max_entry_deviation_points=_f("live_max_entry_deviation", 200.0),
             limit_offset_from_market=self.live_limit_offset_from_market.isChecked(),
+            telegram_enabled=self.live_telegram_enabled.isChecked(),
+            telegram_bot_token=self.live_telegram_token.text().strip(),
+            telegram_chat_id=self.live_telegram_chat_id.text().strip(),
             **{k: v for k, v in self._collect_time_filter_kwargs().items() if k != "time_filter_mode"},
         )
+
+    def _test_telegram_notification(self):
+        token = self.live_telegram_token.text().strip()
+        chat_id = self.live_telegram_chat_id.text().strip()
+        if not token or not chat_id:
+            QMessageBox.warning(
+                self,
+                "Telegram",
+                "Enter bot token and chat ID first.\n\n"
+                "Token from @BotFather · chat id from @userinfobot",
+            )
+            return
+        ok, detail = telegram_notify.send_message(
+            token,
+            chat_id,
+            "Hammer Live — test notification.\nIf you see this, Telegram alerts are configured.",
+            max_retries=telegram_notify.DEFAULT_MAX_RETRIES,
+        )
+        if ok:
+            QMessageBox.information(self, "Telegram", "Test message sent successfully.")
+            self._live_log("[TELEGRAM] Test notification sent.")
+            if hasattr(self, "live_telegram_status"):
+                self.live_telegram_status.setText("Test OK")
+                self.live_telegram_status.setProperty("ready", True)
+                self.live_telegram_status.style().unpolish(self.live_telegram_status)
+                self.live_telegram_status.style().polish(self.live_telegram_status)
+        else:
+            QMessageBox.warning(
+                self,
+                "Telegram",
+                f"Could not send test message after retries:\n\n{detail}",
+            )
+            self._live_log(f"[TELEGRAM] Test failed: {detail}")
 
     def _live_worker_running(self) -> bool:
         return self._live_thread is not None and self._live_thread.isRunning()
@@ -6474,6 +7175,10 @@ class BacktestDashboard(QMainWindow):
         self.live_stop_btn.setEnabled(True)
         dry = "ON (no orders)" if live_cfg.dry_run else "OFF (orders enabled)"
         self._set_app_status(f"Live: running, dry run {dry}")
+        if live_cfg.telegram_enabled and live_cfg.telegram_bot_token and live_cfg.telegram_chat_id:
+            self._live_log("[TELEGRAM] Alerts enabled for all order events.")
+        elif live_cfg.telegram_enabled:
+            self._live_log("[TELEGRAM] Enabled but token or chat id missing — no alerts will send.")
         self.live_dock.show()
         self.live_dock.raise_()
 
@@ -6559,6 +7264,15 @@ class BacktestDashboard(QMainWindow):
         self.results_color_legend.setTextFormat(Qt.RichText)
         self.results_color_legend.setObjectName("sectionHint")
         metrics_layout.addWidget(self.results_color_legend)
+
+        self.buy_sell_summary = QLabel(
+            "BUY vs SELL summary will appear here after a backtest."
+        )
+        self.buy_sell_summary.setWordWrap(True)
+        self.buy_sell_summary.setTextFormat(Qt.RichText)
+        self.buy_sell_summary.setObjectName("liveSummaryCard")
+        metrics_layout.addWidget(self.buy_sell_summary)
+
         self.metrics_sub_tabs = QTabWidget()
         metrics_layout.addWidget(self.metrics_sub_tabs)
 
@@ -6569,10 +7283,23 @@ class BacktestDashboard(QMainWindow):
         self.metrics_sub_tabs.addTab(self._wrap_table(self.by_timeframe_table), "By Timeframe")
 
         self.by_direction_table = self._make_metrics_table()
-        self.metrics_sub_tabs.addTab(self._wrap_table(self.by_direction_table), "By Direction")
+        dir_wrap = QWidget()
+        dir_layout = QVBoxLayout(dir_wrap)
+        dir_layout.setContentsMargins(0, 0, 0, 0)
+        self.buy_sell_direction_note = QLabel(
+            "Full BUY / SELL breakdown by exit model. See the green summary card above for the quick verdict."
+        )
+        self.buy_sell_direction_note.setObjectName("sectionHint")
+        self.buy_sell_direction_note.setWordWrap(True)
+        dir_layout.addWidget(self.buy_sell_direction_note)
+        dir_layout.addWidget(self._wrap_table(self.by_direction_table), 1)
+        self.metrics_sub_tabs.addTab(dir_wrap, "By Direction")
 
         self.by_session_table = self._make_metrics_table()
         self.metrics_sub_tabs.addTab(self._wrap_table(self.by_session_table), "By Session")
+
+        self.by_market_table = self._make_metrics_table()
+        self.metrics_sub_tabs.addTab(self._wrap_table(self.by_market_table), "By Market")
 
         self.by_year_table = self._make_metrics_table()
         self.metrics_sub_tabs.addTab(self._wrap_table(self.by_year_table), "By Year")
@@ -6587,8 +7314,9 @@ class BacktestDashboard(QMainWindow):
         trades_hint = QLabel(
             "Individual trades from the last run. Row color: "
             "<b>green</b> = BUY, <b>red</b> = SELL, <b>blue</b> = candle-bias exit model.<br>"
-            "<b>Double-click a row</b> (or select + Inspect) to open a candlestick chart with "
-            "prior bars, signal/entry, and SL / TP / exit markers."
+            "Use <b>Show</b> / <b>Sort</b> to inspect wins, losses, newest (near end date), or oldest "
+            "(near start date). <b>Double-click a row</b> (or select + Inspect) for the chart — "
+            "then use <b>↑↓</b> to browse trades one by one."
         )
         trades_hint.setTextFormat(Qt.RichText)
         trades_hint.setObjectName("sectionHint")
@@ -6607,6 +7335,31 @@ class BacktestDashboard(QMainWindow):
         )
         self.trade_exit_model_filter.currentIndexChanged.connect(self._refresh_trade_ledger_view)
         trade_filter_row.addWidget(self.trade_exit_model_filter)
+
+        trade_filter_row.addWidget(QLabel("Show:"))
+        self.trade_outcome_filter = QComboBox()
+        self.trade_outcome_filter.addItem("All outcomes", "all")
+        self.trade_outcome_filter.addItem("Wins only", "WIN")
+        self.trade_outcome_filter.addItem("Losses only", "LOSS")
+        self.trade_outcome_filter.setToolTip("Keep only winning or losing trades for inspection.")
+        self.trade_outcome_filter.currentIndexChanged.connect(self._refresh_trade_ledger_view)
+        trade_filter_row.addWidget(self.trade_outcome_filter)
+
+        trade_filter_row.addWidget(QLabel("Sort:"))
+        self.trade_sort_filter = QComboBox()
+        self.trade_sort_filter.addItem("Newest first (near end date)", "newest")
+        self.trade_sort_filter.addItem("Oldest first (near start date)", "oldest")
+        self.trade_sort_filter.addItem("Losses first", "losses_first")
+        self.trade_sort_filter.addItem("Wins first", "wins_first")
+        self.trade_sort_filter.addItem("Biggest loss first", "biggest_loss")
+        self.trade_sort_filter.addItem("Biggest win first", "biggest_win")
+        self.trade_sort_filter.setToolTip(
+            "Order the list before the row cap. Newest = closer to the backtest end date; "
+            "Oldest = closer to the start date."
+        )
+        self.trade_sort_filter.currentIndexChanged.connect(self._refresh_trade_ledger_view)
+        trade_filter_row.addWidget(self.trade_sort_filter)
+
         inspect_btn = QPushButton("Inspect selected trade")
         inspect_btn.setObjectName("secondaryButton")
         inspect_btn.setToolTip("Open candlestick chart for the highlighted trade.")
@@ -6629,6 +7382,49 @@ class BacktestDashboard(QMainWindow):
         self._trade_ledger_display_df = None
         self._trade_ledger_full_df = None
         self.last_backtest_config = None
+
+        # Dedicated Equity / Price chart tabs (always first places clients look)
+        equity_tab = QWidget()
+        equity_layout = QVBoxLayout(equity_tab)
+        equity_hint = QLabel(
+            "Account equity over time for each exit model (worst / candle-bias / best). "
+            "Generated after every backtest run."
+        )
+        equity_hint.setObjectName("sectionHint")
+        equity_hint.setWordWrap(True)
+        equity_layout.addWidget(equity_hint)
+        self.equity_chart_scroll = QScrollArea()
+        self.equity_chart_scroll.setWidgetResizable(True)
+        self.equity_chart_inner = QWidget()
+        self.equity_chart_layout = QVBoxLayout(self.equity_chart_inner)
+        self.equity_chart_layout.addWidget(
+            self._empty_state_label("Run a backtest to see the equity curve here.")
+        )
+        self.equity_chart_layout.addStretch()
+        self.equity_chart_scroll.setWidget(self.equity_chart_inner)
+        equity_layout.addWidget(self.equity_chart_scroll, 1)
+        self.results_tabs.addTab(equity_tab, "Equity")
+
+        price_tab = QWidget()
+        price_layout = QVBoxLayout(price_tab)
+        price_hint = QLabel(
+            "Price line (close) for the main timeframe, with BUY ▲ / SELL ▼ entries and exit markers. "
+            "Uses the same CSVs as the backtest."
+        )
+        price_hint.setObjectName("sectionHint")
+        price_hint.setWordWrap(True)
+        price_layout.addWidget(price_hint)
+        self.price_chart_scroll = QScrollArea()
+        self.price_chart_scroll.setWidgetResizable(True)
+        self.price_chart_inner = QWidget()
+        self.price_chart_layout = QVBoxLayout(self.price_chart_inner)
+        self.price_chart_layout.addWidget(
+            self._empty_state_label("Run a backtest to see the price line chart here.")
+        )
+        self.price_chart_layout.addStretch()
+        self.price_chart_scroll.setWidget(self.price_chart_inner)
+        price_layout.addWidget(self.price_chart_scroll, 1)
+        self.results_tabs.addTab(price_tab, "Price")
 
         charts_tab = QWidget()
         charts_outer_layout = QVBoxLayout(charts_tab)
@@ -7065,7 +7861,18 @@ class BacktestDashboard(QMainWindow):
             if ftype == FIELD_TYPE_CHECK:
                 kwargs[name] = bool(raw)
             elif ftype == FIELD_TYPE_DROPDOWN:
-                kwargs[name] = backtest.PositionSizingMode(raw)
+                if name == "position_sizing_mode":
+                    kwargs[name] = backtest.PositionSizingMode(raw)
+                elif name == "market_data":
+                    raw_m = str(raw or "spot").strip().lower()
+                    if raw_m in ("auto", "legacy", "default", ""):
+                        raw_m = "spot"
+                    try:
+                        kwargs[name] = backtest.MarketDataSource(raw_m)
+                    except ValueError:
+                        kwargs[name] = backtest.MarketDataSource.SPOT
+                else:
+                    kwargs[name] = raw
             else:
                 kwargs[name] = self._parse_value(raw, default_val)
 
@@ -7084,13 +7891,30 @@ class BacktestDashboard(QMainWindow):
         kwargs["run_name"] = f"dashboard_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         kwargs["indicator_stack"] = self._build_indicator_stack()
 
-        # Always store an absolute data_root so CSV discovery does not depend
-        # on the process working directory (restart-only "CSV not found" bug).
+        # Absolute data_root; market_data picks spot / futures / both.
         raw_root = str(kwargs.get("data_root") or DEFAULT_DATA_DIR)
         resolved_root = backtest.resolve_data_root(raw_root, anchor_dir=APP_DIR)
-        kwargs["data_root"] = resolved_root
         raw_sym = str(kwargs.get("symbol") or "XAUUSD").strip()
-        kwargs["symbol"] = backtest.resolve_symbol_folder(resolved_root, raw_sym)
+        market_pref = kwargs.get("market_data", backtest.MarketDataSource.SPOT)
+
+        if market_pref == backtest.MarketDataSource.BOTH:
+            # Keep parent data/ so expand_market_targets can see spot + futures
+            parent = backtest._data_parent_root(resolved_root)
+            kwargs["data_root"] = parent
+            kwargs["symbol"] = backtest.resolve_symbol_folder(parent, raw_sym) or raw_sym
+            # Prefer on-disk case from first available target
+            targets = backtest.expand_market_targets(
+                parent, raw_sym, market_pref, anchor_dir=APP_DIR,
+            )
+            if targets:
+                kwargs["symbol"] = targets[0][2]
+            eff_root, eff_sym = parent, kwargs["symbol"]
+        else:
+            eff_root, eff_sym = backtest.resolve_symbol_data_root(
+                resolved_root, raw_sym, anchor_dir=APP_DIR, preferred=market_pref,
+            )
+            kwargs["data_root"] = eff_root
+            kwargs["symbol"] = eff_sym
 
         cfg = backtest.BacktestConfig(**kwargs)
         sizing_err = backtest.validate_position_sizing_config(cfg)
@@ -7099,11 +7923,11 @@ class BacktestDashboard(QMainWindow):
 
         # Keep the Run Settings fields in sync with what we will actually use.
         root_w = self.field_widgets.get("data_root")
-        if isinstance(root_w, QLineEdit) and root_w.text().strip() != resolved_root:
-            root_w.setText(resolved_root)
+        if isinstance(root_w, QLineEdit) and root_w.text().strip() != eff_root:
+            root_w.setText(eff_root)
         sym_w = self.field_widgets.get("symbol")
-        if isinstance(sym_w, QLineEdit) and kwargs["symbol"] != raw_sym:
-            sym_w.setText(kwargs["symbol"])
+        if isinstance(sym_w, QLineEdit) and eff_sym != raw_sym:
+            sym_w.setText(eff_sym)
 
         return cfg
 
@@ -7147,40 +7971,57 @@ class BacktestDashboard(QMainWindow):
             )
             return
 
-        symbol_dir = os.path.join(backtest_config.data_root, backtest_config.symbol)
-        if not os.path.isdir(symbol_dir):
-            available = [d for d in os.listdir(backtest_config.data_root)
-                         if os.path.isdir(os.path.join(backtest_config.data_root, d))]
+        market_pref = getattr(backtest_config, "market_data", backtest.MarketDataSource.SPOT)
+        targets = backtest.expand_market_targets(
+            backtest_config.data_root,
+            backtest_config.symbol,
+            market_pref,
+            anchor_dir=APP_DIR,
+        )
+        if not targets:
+            available = backtest.find_available_symbols(
+                backtest_config.data_root, anchor_dir=APP_DIR,
+            )
             available_text = ", ".join(available) if available else "(none found)"
+            market_label = (
+                market_pref.value if hasattr(market_pref, "value") else str(market_pref)
+            )
             QMessageBox.critical(
                 self, "Symbol Not Found",
-                f"No data found for symbol '{backtest_config.symbol}' in:\n{symbol_dir}\n\n"
-                f"Symbols available in your data folder: {available_text}"
+                f"No data found for symbol '{backtest_config.symbol}' "
+                f"(Market data = {market_label}).\n\n"
+                f"Looked under:\n{backtest_config.data_root}\n\n"
+                f"Symbols available: {available_text}\n\n"
+                "Spot uses data/spot/SYMBOL or legacy data/SYMBOL.\n"
+                "Futures uses data/futures/SYMBOL."
             )
             return
 
-        # Fail early if selected timeframes have no CSVs (clearer than empty results)
+        # Fail early if selected timeframes have no CSVs on any chosen market
         missing_csv = []
         for tf_folder in backtest_config.timeframes_to_test:
-            files = backtest.find_csv_files(
-                backtest_config.data_root, backtest_config.symbol, tf_folder,
-            )
-            if not files:
+            found_any = False
+            for _label, eff_root, eff_sym in targets:
+                files = backtest.find_csv_files(
+                    eff_root, eff_sym, tf_folder, preferred=_label,
+                )
+                if files:
+                    found_any = True
+                    break
+            if not found_any:
                 missing_csv.append(tf_folder)
         if missing_csv:
-            example = os.path.join(
-                backtest_config.data_root, backtest_config.symbol,
-                missing_csv[0], "<year>", f"{backtest_config.symbol}_{missing_csv[0]}_YYYY-MM.csv",
+            roots = ", ".join(f"{lbl}:{root}" for lbl, root, _s in targets)
+            market_label = (
+                market_pref.value if hasattr(market_pref, "value") else str(market_pref)
             )
             QMessageBox.critical(
                 self, "CSV data not found",
                 "No price CSV files found for:\n  • "
                 + "\n  • ".join(missing_csv)
-                + f"\n\nLooking under:\n{backtest_config.data_root}"
-                f"/{backtest_config.symbol}/…\n\n"
-                f"Expected layout like:\n{example}\n\n"
-                "If you just copied CSVs in, click Run again — paths are now "
-                "resolved to the app folder automatically."
+                + f"\n\nMarket data setting: {market_label}\n"
+                f"Looking under:\n{roots}\n\n"
+                "Use Run Settings → Market data: Spot / Futures / Both."
             )
             return
 
@@ -7213,7 +8054,16 @@ class BacktestDashboard(QMainWindow):
             tooltip=f"Output: {output_dir}\n{db_detail}",
         )
         if hasattr(self, "results_tabs"):
-            self.results_tabs.setCurrentIndex(0)
+            # Jump to Equity so the client sees the main curve immediately
+            for i in range(self.results_tabs.count()):
+                if self.results_tabs.tabText(i) == "Equity":
+                    self.results_tabs.setCurrentIndex(i)
+                    break
+            else:
+                self.results_tabs.setCurrentIndex(0)
+        if hasattr(self, "results_dock"):
+            self.results_dock.show()
+            self.results_dock.raise_()
 
     def _save_run_to_database(self, tables, output_dir: str, plots_dir: str):
         """Returns (short_summary_for_status_bar, full_detail_for_tooltip)."""
@@ -7369,6 +8219,55 @@ class BacktestDashboard(QMainWindow):
         self._trade_ledger_full_df = df
         self._refresh_trade_ledger_view()
 
+    @staticmethod
+    def _trade_ledger_time_col(df) -> Optional[str]:
+        for col in ("exit_time", "entry_time", "exit_time_ist", "entry_time_ist"):
+            if col in df.columns:
+                return col
+        return None
+
+    def _apply_trade_ledger_sort(self, view, sort_key: str):
+        """Sort trades for inspection; applied before the display row cap."""
+        if view is None or getattr(view, "height", 0) == 0:
+            return view
+        time_col = self._trade_ledger_time_col(view)
+        has_outcome = "outcome" in view.columns
+        has_pnl = "pnl_usd" in view.columns
+
+        if sort_key == "oldest" and time_col:
+            return view.sort(time_col, descending=False, nulls_last=True)
+        if sort_key == "newest" and time_col:
+            return view.sort(time_col, descending=True, nulls_last=True)
+        if sort_key == "losses_first" and has_outcome:
+            ranked = view.with_columns(
+                pl.when(pl.col("outcome") == "LOSS").then(0)
+                .when(pl.col("outcome") == "WIN").then(1)
+                .otherwise(2)
+                .alias("_sort_rank")
+            )
+            sort_cols = ["_sort_rank"] + ([time_col] if time_col else [])
+            descending = [False] + ([True] if time_col else [])
+            ranked = ranked.sort(sort_cols, descending=descending, nulls_last=True)
+            return ranked.drop("_sort_rank")
+        if sort_key == "wins_first" and has_outcome:
+            ranked = view.with_columns(
+                pl.when(pl.col("outcome") == "WIN").then(0)
+                .when(pl.col("outcome") == "LOSS").then(1)
+                .otherwise(2)
+                .alias("_sort_rank")
+            )
+            sort_cols = ["_sort_rank"] + ([time_col] if time_col else [])
+            descending = [False] + ([True] if time_col else [])
+            ranked = ranked.sort(sort_cols, descending=descending, nulls_last=True)
+            return ranked.drop("_sort_rank")
+        if sort_key == "biggest_loss" and has_pnl:
+            return view.sort("pnl_usd", descending=False, nulls_last=True)
+        if sort_key == "biggest_win" and has_pnl:
+            return view.sort("pnl_usd", descending=True, nulls_last=True)
+        if time_col:
+            return view.sort(time_col, descending=True, nulls_last=True)
+        return view
+
     def _refresh_trade_ledger_view(self) -> None:
         table = self.trade_ledger_table
         df = self._trade_ledger_full_df
@@ -7385,22 +8284,52 @@ class BacktestDashboard(QMainWindow):
         model_filter = ""
         if hasattr(self, "trade_exit_model_filter"):
             model_filter = self.trade_exit_model_filter.currentData() or ""
+        outcome_filter = "all"
+        if hasattr(self, "trade_outcome_filter"):
+            outcome_filter = self.trade_outcome_filter.currentData() or "all"
+        sort_key = "newest"
+        if hasattr(self, "trade_sort_filter"):
+            sort_key = self.trade_sort_filter.currentData() or "newest"
+
         view = df
         if model_filter and "exit_model" in df.columns:
-            view = df.filter(pl.col("exit_model") == model_filter)
+            view = view.filter(pl.col("exit_model") == model_filter)
+        if outcome_filter in ("WIN", "LOSS") and "outcome" in view.columns:
+            view = view.filter(pl.col("outcome") == outcome_filter)
+
+        view = self._apply_trade_ledger_sort(view, sort_key)
 
         total = view.height
+        shown = total
         if total > TRADE_LEDGER_DISPLAY_MAX_ROWS:
             view = view.head(TRADE_LEDGER_DISPLAY_MAX_ROWS)
+            shown = TRADE_LEDGER_DISPLAY_MAX_ROWS
+
+        filter_bits = []
+        if model_filter:
+            filter_bits.append(model_filter)
+        else:
+            filter_bits.append("all exit models")
+        if outcome_filter in ("WIN", "LOSS"):
+            filter_bits.append(f"{outcome_filter.lower()}s only")
+        sort_label = {
+            "newest": "newest first",
+            "oldest": "oldest first",
+            "losses_first": "losses first",
+            "wins_first": "wins first",
+            "biggest_loss": "biggest loss first",
+            "biggest_win": "biggest win first",
+        }.get(sort_key, sort_key)
+        filter_bits.append(sort_label)
+
+        if shown < total:
             note = (
-                f"Showing first {TRADE_LEDGER_DISPLAY_MAX_ROWS:,} of {total:,} rows"
-                f"{' (' + model_filter + ')' if model_filter else ''}. "
+                f"Showing {shown:,} of {total:,} rows ({', '.join(filter_bits)}). "
                 f"Double-click a row to inspect candlesticks."
             )
         else:
             note = (
-                f"{total:,} trade rows"
-                f"{' (' + model_filter + ')' if model_filter else ' (all exit models)'}. "
+                f"{total:,} trade rows ({', '.join(filter_bits)}). "
                 f"Double-click a row to inspect candlesticks."
             )
         if hasattr(self, "trade_ledger_note"):
@@ -7416,7 +8345,7 @@ class BacktestDashboard(QMainWindow):
 
         self._trade_ledger_display_df = view
         prefer = [
-            "entry_time_ist", "entry_time", "timeframe", "direction", "session", "outcome", "exit_model",
+            "market", "entry_time_ist", "entry_time", "timeframe", "direction", "session", "outcome", "exit_model",
             "entry_price", "stop_loss", "target", "exit_price", "exit_time_ist", "exit_time",
             "bars_held", "pnl_usd", "pattern_variant", "risk_usd", "session_clock",
         ]
@@ -7472,8 +8401,37 @@ class BacktestDashboard(QMainWindow):
             stack = getattr(cfg, "indicator_stack", None)
             if stack is None or not stack.enabled_indicator_ids():
                 stack = self._build_indicator_stack()
-            dialog = TradeInspectDialog(self, trade, cfg, indicator_stack=stack)
+            trades_list: List[dict] = []
+            for r in range(table.rowCount()):
+                cell = table.item(r, 0)
+                if cell is None:
+                    continue
+                payload = cell.data(Qt.UserRole)
+                if isinstance(payload, dict):
+                    trades_list.append(payload)
+            start_idx = 0
+            if trades_list:
+                for i, t in enumerate(trades_list):
+                    if t is trade or t == trade:
+                        start_idx = i
+                        break
+                else:
+                    # Fallback: match by current table row among dict rows
+                    start_idx = min(max(row, 0), len(trades_list) - 1)
+            else:
+                trades_list = [trade]
+            dialog = TradeInspectDialog(
+                self, trade, cfg,
+                indicator_stack=stack,
+                trades=trades_list,
+                trade_index=start_idx,
+            )
             dialog.exec()
+            # Keep table selection in sync with last viewed trade
+            last_idx = getattr(dialog, "_trade_index", start_idx)
+            if 0 <= last_idx < table.rowCount():
+                table.selectRow(last_idx)
+                table.setCurrentCell(last_idx, 0)
         except Exception as e:
             QMessageBox.critical(self, "Inspect failed", str(e))
             traceback.print_exc()
@@ -7528,10 +8486,132 @@ class BacktestDashboard(QMainWindow):
         self._fill_table(self.by_timeframe_table, tables.get("by_timeframe"))
         self._fill_table(self.by_direction_table, tables.get("by_direction"))
         self._fill_table(self.by_session_table, tables.get("by_session"))
+        self._fill_table(self.by_market_table, tables.get("by_market"))
         self._fill_table(self.by_year_table, tables.get("by_year"))
         self._fill_table(self.by_month_table, tables.get("by_month"))
         self._fill_trade_ledger_table(tables.get("ledger"))
         self._refresh_session_results_legend()
+        self._refresh_buy_sell_summary(tables.get("by_direction"))
+
+    def _direction_side_key(self, row: Dict[str, Any]) -> str:
+        side = _normalize_result_label(row.get("direction") or row.get("group"))
+        return side if side in ("BUY", "SELL") else ""
+
+    def _refresh_buy_sell_summary(self, by_direction_df) -> None:
+        """Plain-English verdict: is BUY or SELL driving the wins?"""
+        if not hasattr(self, "buy_sell_summary"):
+            return
+        if by_direction_df is None or getattr(by_direction_df, "height", 0) == 0:
+            self.buy_sell_summary.setText(
+                "<b>BUY vs SELL:</b> no direction breakdown for this run."
+            )
+            return
+
+        # Prefer worst_case (live-relevant); fall back to whatever is present
+        models = []
+        if "exit_model" in by_direction_df.columns:
+            models = by_direction_df["exit_model"].unique().to_list()
+        prefer = ["worst_case", "candle_bias", "best_case"]
+        model = next((m for m in prefer if m in models), models[0] if models else None)
+
+        rows = [
+            r for r in by_direction_df.iter_rows(named=True)
+            if (model is None or r.get("exit_model") == model)
+            and self._direction_side_key(r) in ("BUY", "SELL")
+        ]
+        by_side = {self._direction_side_key(r): r for r in rows}
+        buy = by_side.get("BUY")
+        sell = by_side.get("SELL")
+
+        def _f(row, key, default=0.0):
+            if not row:
+                return default
+            v = row.get(key)
+            return float(v) if v is not None else default
+
+        def _i(row, key, default=0):
+            if not row:
+                return default
+            v = row.get(key)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        buy_pnl = _f(buy, "net_pnl")
+        sell_pnl = _f(sell, "net_pnl")
+        buy_wr = _f(buy, "win_rate_pct")
+        sell_wr = _f(sell, "win_rate_pct")
+        buy_n = _i(buy, "total_trades")
+        sell_n = _i(sell, "total_trades")
+        buy_wins = _i(buy, "wins")
+        sell_wins = _i(sell, "wins")
+        buy_pf = _f(buy, "profit_factor")
+        sell_pf = _f(sell, "profit_factor")
+
+        # Who is driving performance?
+        if buy is None and sell is None:
+            self.buy_sell_summary.setText("<b>BUY vs SELL:</b> no BUY/SELL rows found.")
+            return
+        if buy is None:
+            verdict = "Only <b>SELL</b> trades in this run."
+            winner = "SELL"
+        elif sell is None:
+            verdict = "Only <b>BUY</b> trades in this run."
+            winner = "BUY"
+        elif abs(buy_pnl - sell_pnl) < 1e-9:
+            verdict = "BUY and SELL contributed about the <b>same Net PnL</b>."
+            winner = "TIE"
+        elif buy_pnl > sell_pnl:
+            gap = buy_pnl - sell_pnl
+            verdict = (
+                f"<b>BUY is driving the results</b> — higher Net PnL by "
+                f"<b>${gap:,.2f}</b> vs SELL."
+            )
+            winner = "BUY"
+        else:
+            gap = sell_pnl - buy_pnl
+            verdict = (
+                f"<b>SELL is driving the results</b> — higher Net PnL by "
+                f"<b>${gap:,.2f}</b> vs BUY."
+            )
+            winner = "SELL"
+
+        wr_note = ""
+        if buy is not None and sell is not None and abs(buy_wr - sell_wr) >= 0.5:
+            better_wr = "BUY" if buy_wr > sell_wr else "SELL"
+            wr_note = (
+                f" Win rate edge: <b>{better_wr}</b> "
+                f"({max(buy_wr, sell_wr):.1f}% vs {min(buy_wr, sell_wr):.1f}%)."
+            )
+
+        model_label = (model or "all").replace("_", " ")
+        html = (
+            f"<b>BUY vs SELL summary</b> "
+            f"<span style='color:#5f6368;'>({model_label})</span><br>"
+            f"{verdict}{wr_note}<br><br>"
+            f"<span style='background-color:#D7F5DD; padding:4px 10px; border-radius:4px;'>"
+            f"<b>BUY</b> — {buy_n} trades · {buy_wins} wins · WR {buy_wr:.1f}% · "
+            f"Net ${buy_pnl:,.2f} · PF {buy_pf:.2f}</span>"
+            f"&nbsp;&nbsp;"
+            f"<span style='background-color:#FADBD8; padding:4px 10px; border-radius:4px;'>"
+            f"<b>SELL</b> — {sell_n} trades · {sell_wins} wins · WR {sell_wr:.1f}% · "
+            f"Net ${sell_pnl:,.2f} · PF {sell_pf:.2f}</span>"
+        )
+        self.buy_sell_summary.setText(html)
+
+        if hasattr(self, "buy_sell_direction_note"):
+            if winner == "BUY":
+                tip = "Quick read: <b>BUY</b> side is the stronger contributor on Net PnL."
+            elif winner == "SELL":
+                tip = "Quick read: <b>SELL</b> side is the stronger contributor on Net PnL."
+            elif winner == "TIE":
+                tip = "Quick read: BUY and SELL are roughly even on Net PnL."
+            else:
+                tip = "Full BUY / SELL breakdown by exit model below."
+            self.buy_sell_direction_note.setText(
+                tip + " Open this tab for every metric row."
+            )
 
     def _refresh_session_results_legend(self) -> None:
         if not hasattr(self, "results_color_legend"):
@@ -7566,15 +8646,45 @@ class BacktestDashboard(QMainWindow):
             '<b>as if that session alone</b> (not additive across sessions).'
         )
 
-    def _display_charts(self, plots_dir: str):
-        while self.charts_layout.count():
-            item = self.charts_layout.takeAt(0)
+    def _clear_vbox(self, layout: QVBoxLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
             w = item.widget()
             if w:
                 w.deleteLater()
 
+    def _add_chart_card(self, layout: QVBoxLayout, path: str, title: str, width: int = 720) -> None:
+        card = QFrame()
+        card.setObjectName("candleCard")
+        card_layout = QVBoxLayout(card)
+        name_label = QLabel(f"{title}  (click to zoom)")
+        name_label.setStyleSheet("font-weight: 600;")
+        card_layout.addWidget(name_label)
+        pixmap = QPixmap(path)
+        if not pixmap.isNull():
+            scaled = pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+            img_label = ClickableImageLabel(path, title, self)
+            img_label.setPixmap(scaled)
+            img_label.setCursor(Qt.PointingHandCursor)
+            card_layout.addWidget(img_label)
+        layout.addWidget(card)
+
+    def _display_charts(self, plots_dir: str):
+        self._clear_vbox(self.charts_layout)
+        if hasattr(self, "equity_chart_layout"):
+            self._clear_vbox(self.equity_chart_layout)
+        if hasattr(self, "price_chart_layout"):
+            self._clear_vbox(self.price_chart_layout)
+
         if not os.path.isdir(plots_dir):
-            self.charts_layout.addWidget(QLabel("No charts were generated."))
+            msg = QLabel("No charts were generated.")
+            self.charts_layout.addWidget(msg)
+            if hasattr(self, "equity_chart_layout"):
+                self.equity_chart_layout.addWidget(QLabel("No equity chart yet — run a backtest."))
+                self.equity_chart_layout.addStretch()
+            if hasattr(self, "price_chart_layout"):
+                self.price_chart_layout.addWidget(QLabel("No price chart yet — run a backtest."))
+                self.price_chart_layout.addStretch()
             return
 
         png_files = sorted(f for f in os.listdir(plots_dir) if f.endswith(".png"))
@@ -7582,24 +8692,47 @@ class BacktestDashboard(QMainWindow):
             self.charts_layout.addWidget(QLabel("No charts were generated."))
             return
 
-        for fname in png_files:
+        # Pin key charts into dedicated tabs
+        equity_names = (
+            "equity_curves_all_models.png",
+            "equity_with_regression.png",
+            "drawdown.png",
+        )
+        price_names = ("price_line_with_trades.png",)
+
+        for fname in equity_names:
             path = os.path.join(plots_dir, fname)
-            card = QFrame()
-            card.setObjectName("candleCard")
-            card_layout = QVBoxLayout(card)
+            if os.path.isfile(path) and hasattr(self, "equity_chart_layout"):
+                self._add_chart_card(self.equity_chart_layout, path, fname.replace("_", " ").replace(".png", ""))
+        if hasattr(self, "equity_chart_layout"):
+            if self.equity_chart_layout.count() == 0:
+                self.equity_chart_layout.addWidget(
+                    QLabel("Equity charts missing — re-run the backtest.")
+                )
+            self.equity_chart_layout.addStretch()
 
-            name_label = QLabel(f"{fname}  (click to zoom)")
-            name_label.setStyleSheet("font-weight: 600;")
-            card_layout.addWidget(name_label)
+        for fname in price_names:
+            path = os.path.join(plots_dir, fname)
+            if os.path.isfile(path) and hasattr(self, "price_chart_layout"):
+                self._add_chart_card(
+                    self.price_chart_layout, path,
+                    "Price line with trades", width=780,
+                )
+        if hasattr(self, "price_chart_layout"):
+            if self.price_chart_layout.count() == 0:
+                self.price_chart_layout.addWidget(
+                    QLabel("Price chart missing — re-run the backtest.")
+                )
+            self.price_chart_layout.addStretch()
 
-            pixmap = QPixmap(path)
-            scaled = pixmap.scaledToWidth(680, Qt.SmoothTransformation)
-            img_label = ClickableImageLabel(path, fname, self)
-            img_label.setPixmap(scaled)
-            img_label.setCursor(Qt.PointingHandCursor)
-            card_layout.addWidget(img_label)
-
-            self.charts_layout.addWidget(card)
+        # All charts gallery (equity + price first)
+        priority = list(equity_names) + list(price_names)
+        ordered = [f for f in priority if f in png_files] + [
+            f for f in png_files if f not in priority
+        ]
+        for fname in ordered:
+            path = os.path.join(plots_dir, fname)
+            self._add_chart_card(self.charts_layout, path, fname)
 
         self.charts_layout.addStretch()
 
@@ -7821,9 +8954,28 @@ class BacktestDashboard(QMainWindow):
     def _preset_path(self, filename: str) -> str:
         return os.path.join(PRESETS_DIR, filename)
 
+    def _ensure_example_presets(self) -> None:
+        """Copy template example presets into presets/ if missing (client-ready)."""
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        template_dir = os.path.join(APP_DIR, "template")
+        examples = (
+            "preset_example_hammer_green_buy_red_sell.json",
+            "preset_example_hammer_with_candles.json",
+        )
+        for name in examples:
+            src = os.path.join(template_dir, name)
+            dst = os.path.join(PRESETS_DIR, name)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                try:
+                    import shutil
+                    shutil.copy2(src, dst)
+                except OSError:
+                    pass
+
     def _refresh_preset_combo(self, keep_selection: bool = False):
         if not hasattr(self, "preset_combo"):
             return
+        self._ensure_example_presets()
         os.makedirs(PRESETS_DIR, exist_ok=True)
         current = self.preset_combo.currentData() if keep_selection else ""
         self.preset_combo.blockSignals(True)
@@ -7831,6 +8983,15 @@ class BacktestDashboard(QMainWindow):
         self.preset_combo.addItem("Not using a saved preset", "")
         for name in sorted(f for f in os.listdir(PRESETS_DIR) if f.endswith(".json")):
             label = name[:-5].replace("_", " ")
+            # Prefer display_name from JSON when present
+            path = self._preset_path(name)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if isinstance(meta, dict) and meta.get("display_name"):
+                    label = str(meta["display_name"])
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
             self.preset_combo.addItem(label, name)
         if keep_selection and current:
             idx = self.preset_combo.findData(current)
@@ -8066,10 +9227,14 @@ class BacktestDashboard(QMainWindow):
             if name in ("plain_english", "applies_to"):
                 continue
             self._set_field_widget_value(name, value)
+        # Strict defaults for older presets missing newer Run Settings keys
+        if not (data.get("backtest") or {}).get("market_data") and "market_data" not in (data.get("fields") or {}):
+            self._set_field_widget_value("market_data", "spot")
         if pattern == "Doji":
             self._fill_empty_doji_widget_defaults()
         self._wire_symmetric_tolerance_fields()
         self._wire_wick_requirement_fields()
+        self._wire_sl_mode_fields()
         self._redraw_candle_preview()
         self._refresh_sizing_field_highlights()
         self._refresh_live_strategy_summary()
@@ -8188,10 +9353,27 @@ class TradeInspectDialog(QDialog):
         "#FFFFFF",  # white
     )
 
-    def __init__(self, parent, trade: dict, backtest_config, indicator_stack=None):
+    def __init__(
+        self,
+        parent,
+        trade: dict,
+        backtest_config,
+        indicator_stack=None,
+        trades: Optional[List[dict]] = None,
+        trade_index: int = 0,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Inspect trade — candlesticks")
-        self.resize(1080, 720)
+        self.resize(1280, 860)
+        self.setMinimumSize(960, 640)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._cfg = backtest_config
+        self._trades: List[dict] = list(trades) if trades else [trade]
+        if not self._trades:
+            self._trades = [trade]
+        self._trade_index = max(0, min(int(trade_index), len(self._trades) - 1))
+        trade = self._trades[self._trade_index]
+
         self._indicator_stack = indicator_stack
         if self._indicator_stack is None:
             self._indicator_stack = getattr(backtest_config, "indicator_stack", None)
@@ -8208,11 +9390,31 @@ class TradeInspectDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        summary = QLabel(self._summary_html(trade, backtest_config, self._indicator_stack))
-        summary.setTextFormat(Qt.RichText)
-        summary.setWordWrap(True)
-        summary.setObjectName("sectionHint")
-        layout.addWidget(summary)
+        nav = QHBoxLayout()
+        self._prev_btn = QPushButton("▲ Prev")
+        self._prev_btn.setToolTip("Previous trade (↑ or ←)")
+        self._prev_btn.clicked.connect(lambda: self._navigate(-1))
+        self._next_btn = QPushButton("▼ Next")
+        self._next_btn.setToolTip("Next trade (↓ or →)")
+        self._next_btn.clicked.connect(lambda: self._navigate(1))
+        self._nav_label = QLabel("")
+        self._nav_label.setObjectName("sectionHint")
+        nav.addWidget(self._prev_btn)
+        nav.addWidget(self._next_btn)
+        nav.addWidget(self._nav_label, 1)
+        nav_hint = QLabel("↑↓ / ←→ browse trades like a photo preview")
+        nav_hint.setObjectName("sectionHint")
+        nav.addWidget(nav_hint)
+        layout.addLayout(nav)
+        self._refresh_nav_controls()
+
+        self._summary_label = QLabel(
+            self._summary_html(trade, backtest_config, self._indicator_stack)
+        )
+        self._summary_label.setTextFormat(Qt.RichText)
+        self._summary_label.setWordWrap(True)
+        self._summary_label.setObjectName("sectionHint")
+        layout.addWidget(self._summary_label)
 
         stack = self._indicator_stack
         ind_bits = []
@@ -8349,7 +9551,7 @@ class TradeInspectDialog(QDialog):
         self._coord_label.setObjectName("sectionHint")
         layout.addWidget(self._coord_label)
 
-        fig = Figure(figsize=(10.5, 5.4), dpi=110)
+        fig = Figure(figsize=(12.2, 6.4), dpi=110)
         canvas = FigureCanvasQTAgg(fig)
         canvas.setFocusPolicy(Qt.StrongFocus)
         self._fig = fig
@@ -8364,6 +9566,80 @@ class TradeInspectDialog(QDialog):
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         layout.addWidget(close)
+
+    def _refresh_nav_controls(self) -> None:
+        n = len(getattr(self, "_trades", []) or [])
+        i = getattr(self, "_trade_index", 0)
+        if hasattr(self, "_nav_label"):
+            self._nav_label.setText(f"Trade <b>{i + 1}</b> of <b>{n}</b>" if n else "No trades")
+            self._nav_label.setTextFormat(Qt.RichText)
+        if hasattr(self, "_prev_btn"):
+            self._prev_btn.setEnabled(n > 1 and i > 0)
+        if hasattr(self, "_next_btn"):
+            self._next_btn.setEnabled(n > 1 and i < n - 1)
+        trade = self._trades[i] if n and 0 <= i < n else {}
+        side = str(trade.get("direction") or trade.get("outcome") or "trade")
+        self.setWindowTitle(f"Inspect trade — {i + 1}/{n} · {side}")
+
+    def _navigate(self, delta: int) -> None:
+        trades = getattr(self, "_trades", None) or []
+        if len(trades) <= 1:
+            return
+        new_idx = getattr(self, "_trade_index", 0) + int(delta)
+        if new_idx < 0 or new_idx >= len(trades):
+            return
+        self._show_trade_at(new_idx)
+
+    def _show_trade_at(self, index: int) -> None:
+        trades = getattr(self, "_trades", None) or []
+        if not trades:
+            return
+        index = max(0, min(int(index), len(trades) - 1))
+        self._trade_index = index
+        trade = trades[index]
+        self._refresh_nav_controls()
+        if hasattr(self, "_summary_label"):
+            self._summary_label.setText(
+                self._summary_html(trade, self._cfg, self._indicator_stack)
+            )
+        if self._fig is None or self._canvas is None:
+            return
+        self._disconnect_draw_events()
+        self._pending_point = None
+        self._preview_artists = []
+        self._user_drawings = []
+        self._crosshair_h = self._crosshair_v = self._crosshair_txt = None
+        self._fig.clear()
+        self._ax = None
+        try:
+            self._draw_chart(self._fig, trade, self._cfg)
+            self._canvas.draw()
+            self._install_draw_events()
+        except Exception as e:
+            self._fig.clear()
+            ax = self._fig.add_subplot(111)
+            ax.text(0.5, 0.5, f"Could not draw trade:\n{e}", ha="center", va="center")
+            ax.axis("off")
+            self._ax = ax
+            self._canvas.draw()
+        # Sync parent trades table selection
+        parent = self.parent()
+        table = getattr(parent, "trade_ledger_table", None) if parent is not None else None
+        if table is not None and 0 <= index < table.rowCount():
+            table.selectRow(index)
+            table.setCurrentCell(index, 0)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key in (Qt.Key_Up, Qt.Key_Left):
+            self._navigate(-1)
+            event.accept()
+            return
+        if key in (Qt.Key_Down, Qt.Key_Right):
+            self._navigate(1)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     @staticmethod
     def _summary_html(trade: dict, cfg=None, stack=None) -> str:
@@ -8640,10 +9916,23 @@ class TradeInspectDialog(QDialog):
     def _install_draw_events(self) -> None:
         if self._canvas is None or self._ax is None:
             return
+        self._disconnect_draw_events()
         self._cid_click = self._canvas.mpl_connect("button_press_event", self._on_draw_click)
         self._cid_move = self._canvas.mpl_connect("motion_notify_event", self._on_draw_move)
         self._cid_key = self._canvas.mpl_connect("key_press_event", self._on_draw_key)
         self._canvas.setFocus()
+
+    def _disconnect_draw_events(self) -> None:
+        if self._canvas is None:
+            return
+        for attr in ("_cid_click", "_cid_move", "_cid_key"):
+            cid = getattr(self, attr, None)
+            if cid is not None:
+                try:
+                    self._canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def _data_xy(self, event):
         if event is None or event.inaxes is not self._ax:
@@ -8675,6 +9964,10 @@ class TradeInspectDialog(QDialog):
             self._set_draw_mode("cursor")
         elif key in ("backspace", "delete"):
             self._undo_drawing()
+        elif key in ("up", "left"):
+            self._navigate(-1)
+        elif key in ("down", "right"):
+            self._navigate(1)
 
     def _on_draw_move(self, event) -> None:
         xy = self._data_xy(event)
