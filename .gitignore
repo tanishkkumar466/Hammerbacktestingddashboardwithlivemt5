@@ -47,6 +47,8 @@ env/
 *.key
 credentials.json
 secrets.json
+.hammer_github_token
+.github_token
 
 # OS / IDE
 .DS_Store

@@ -1412,6 +1412,9 @@ RESULT_BG_BUY = QColor("#D7F5DD")
 RESULT_BG_SELL = QColor("#FADBD8")
 RESULT_BG_CANDLE_BIAS = QColor("#D2E3FC")
 RESULT_BG_NEUTRAL = QColor("#FFFFFF")
+# Trade ledger text: win / loss (direction stays on row background).
+RESULT_FG_WIN = QColor("#137333")
+RESULT_FG_LOSS = QColor("#C5221F")
 TRADE_LEDGER_DISPLAY_MAX_ROWS = 2500
 
 
@@ -1439,17 +1442,33 @@ def result_tint_for_row(row: Dict[str, Any]) -> Optional[QColor]:
     return None
 
 
+def result_fg_for_outcome(row: Dict[str, Any]) -> Optional[QColor]:
+    """Trade text color from outcome: WIN = green, LOSS = red."""
+    outcome = _normalize_result_label(row.get("outcome"))
+    if outcome == "WIN":
+        return RESULT_FG_WIN
+    if outcome == "LOSS":
+        return RESULT_FG_LOSS
+    return None
+
+
 def result_tint_for_exit_model_column(exit_model_name: str) -> Optional[QColor]:
     if _normalize_result_label(exit_model_name) == "CANDLE_BIAS":
         return RESULT_BG_CANDLE_BIAS
     return None
 
 
-def _table_item(text: str, background: Optional[QColor] = None) -> QTableWidgetItem:
+def _table_item(
+    text: str,
+    background: Optional[QColor] = None,
+    foreground: Optional[QColor] = None,
+) -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
     if background is not None:
         item.setBackground(background)
+    if foreground is not None:
+        item.setForeground(foreground)
     return item
 
 
@@ -2430,6 +2449,13 @@ class BacktestWorker(QObject):
                 data_root=getattr(self.backtest_config, "data_root", None),
                 symbol=getattr(self.backtest_config, "symbol", None),
                 timeframes=list(getattr(self.backtest_config, "timeframes_to_test", None) or []),
+                market_data=(
+                    getattr(self.backtest_config.market_data, "value", None)
+                    if getattr(self.backtest_config, "market_data", None) is not None
+                    else None
+                ),
+                start_date=getattr(self.backtest_config, "start_date", None),
+                end_date=getattr(self.backtest_config, "end_date", None),
             )
             plotting.generate_all_plots(plot_config)
             plotting.generate_yearly_summary(plot_config)
@@ -3155,7 +3181,11 @@ class LiveTradingThread(QThread):
 class BacktestDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hammer · XAUUSD Backtest & Live")
+        try:
+            from version import __version__ as _app_ver
+            self.setWindowTitle(f"Hammer · XAUUSD Backtest & Live  v{_app_ver}")
+        except Exception:
+            self.setWindowTitle("Hammer · XAUUSD Backtest & Live")
 
         # QSettings persists window geometry + dock layout across runs
         # (client request: "make sure it saves the state where it is
@@ -3806,6 +3836,15 @@ class BacktestDashboard(QMainWindow):
             action.setShortcutContext(Qt.ApplicationShortcut)
 
         help_menu = menu_bar.addMenu("Help")
+
+        update_action = QAction("Check for Updates…", self)
+        update_action.setToolTip(
+            "Check GitHub Releases for a newer Hammer version and install it."
+        )
+        update_action.triggered.connect(self._check_for_updates)
+        help_menu.addAction(update_action)
+        help_menu.addSeparator()
+
         shortcuts_action = QAction("Keyboard Shortcuts", self)
         shortcuts_action.setShortcut(QKeySequence(Qt.Key_F1))
         shortcuts_action.setShortcutContext(Qt.ApplicationShortcut)
@@ -3826,7 +3865,8 @@ class BacktestDashboard(QMainWindow):
         # garbage-collected once this method returns.
         self._shortcut_actions = [
             run_action, output_action, charts_action, export_action,
-            shortcuts_action, about_action, guide_action, verify_dir_action,
+            shortcuts_action, update_action, about_action, guide_action,
+            verify_dir_action,
         ]
 
     def _show_parameters_guide(self):
@@ -3861,13 +3901,36 @@ class BacktestDashboard(QMainWindow):
             "All shortcuts work while the app has focus.",
         )
 
+    def _check_for_updates(self):
+        try:
+            from update_window import open_update_window
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Updates unavailable",
+                f"Could not open the update dialog:\n{e}",
+            )
+            return
+        open_update_window(self)
+
     def _show_about_dialog(self):
+        try:
+            from version import __version__ as app_version
+        except Exception:
+            app_version = "?"
         QMessageBox.about(
             self,
             "About",
-            "<b>Hammer Candle Backtest Dashboard</b><br><br>"
+            "<b>Hammer Candle Backtest Dashboard</b><br>"
+            f"Version {app_version}<br><br>"
             "Hammer & Doji backtesting, indicators, run history, compare, and "
             "optional MT5 live trading (Windows).<br><br>"
+            "<b>Updates:</b> Help → Check for Updates…<br>"
+            "If the repo is private, put a GitHub Personal Access Token in a file "
+            "named <code>.hammer_github_token</code> next to the app "
+            "(classic token with <code>repo</code> scope), then try again.<br>"
+            "You must also publish a GitHub <b>Release</b> with a <code>.zip</code> "
+            "asset for updates to appear.<br><br>"
             "Press <b>F1</b> for keyboard shortcuts.",
         )
 
@@ -7312,8 +7375,10 @@ class BacktestDashboard(QMainWindow):
         trades_tab = QWidget()
         trades_layout = QVBoxLayout(trades_tab)
         trades_hint = QLabel(
-            "Individual trades from the last run. Row color: "
-            "<b>green</b> = BUY, <b>red</b> = SELL, <b>blue</b> = candle-bias exit model.<br>"
+            "Individual trades from the last run. "
+            "<b>Row background:</b> green = BUY, red = SELL, blue = candle-bias exit model. "
+            "<b>Text color:</b> <span style='color:#137333'>green = WIN</span>, "
+            "<span style='color:#C5221F'>red = LOSS</span>.<br>"
             "Use <b>Show</b> / <b>Sort</b> to inspect wins, losses, newest (near end date), or oldest "
             "(near start date). <b>Double-click a row</b> (or select + Inspect) for the chart — "
             "then use <b>↑↓</b> to browse trades one by one."
@@ -7383,16 +7448,27 @@ class BacktestDashboard(QMainWindow):
         self._trade_ledger_full_df = None
         self.last_backtest_config = None
 
-        # Dedicated Equity / Price chart tabs (always first places clients look)
-        equity_tab = QWidget()
-        equity_layout = QVBoxLayout(equity_tab)
-        equity_hint = QLabel(
-            "Account equity over time for each exit model (worst / candle-bias / best). "
-            "Generated after every backtest run."
+        # Equity + Price side-by-side for easy visual comparison
+        equity_price_tab = QWidget()
+        equity_price_layout = QVBoxLayout(equity_price_tab)
+        equity_price_hint = QLabel(
+            "Equity (left) vs price line (right). Price is close only — no trade markers. "
+            "<b>Click a chart to zoom.</b>"
         )
-        equity_hint.setObjectName("sectionHint")
-        equity_hint.setWordWrap(True)
-        equity_layout.addWidget(equity_hint)
+        equity_price_hint.setTextFormat(Qt.RichText)
+        equity_price_hint.setObjectName("sectionHint")
+        equity_price_hint.setWordWrap(True)
+        equity_price_layout.addWidget(equity_price_hint)
+
+        side_by_side = QHBoxLayout()
+        side_by_side.setSpacing(12)
+
+        equity_panel = QWidget()
+        equity_col = QVBoxLayout(equity_panel)
+        equity_col.setContentsMargins(0, 0, 0, 0)
+        equity_col_title = QLabel("<b>Equity</b>")
+        equity_col_title.setTextFormat(Qt.RichText)
+        equity_col.addWidget(equity_col_title)
         self.equity_chart_scroll = QScrollArea()
         self.equity_chart_scroll.setWidgetResizable(True)
         self.equity_chart_inner = QWidget()
@@ -7402,29 +7478,29 @@ class BacktestDashboard(QMainWindow):
         )
         self.equity_chart_layout.addStretch()
         self.equity_chart_scroll.setWidget(self.equity_chart_inner)
-        equity_layout.addWidget(self.equity_chart_scroll, 1)
-        self.results_tabs.addTab(equity_tab, "Equity")
+        equity_col.addWidget(self.equity_chart_scroll, 1)
 
-        price_tab = QWidget()
-        price_layout = QVBoxLayout(price_tab)
-        price_hint = QLabel(
-            "Price line (close) for the main timeframe, with BUY ▲ / SELL ▼ entries and exit markers. "
-            "Uses the same CSVs as the backtest."
-        )
-        price_hint.setObjectName("sectionHint")
-        price_hint.setWordWrap(True)
-        price_layout.addWidget(price_hint)
+        price_panel = QWidget()
+        price_col = QVBoxLayout(price_panel)
+        price_col.setContentsMargins(0, 0, 0, 0)
+        price_col_title = QLabel("<b>Price</b>")
+        price_col_title.setTextFormat(Qt.RichText)
+        price_col.addWidget(price_col_title)
         self.price_chart_scroll = QScrollArea()
         self.price_chart_scroll.setWidgetResizable(True)
         self.price_chart_inner = QWidget()
         self.price_chart_layout = QVBoxLayout(self.price_chart_inner)
         self.price_chart_layout.addWidget(
-            self._empty_state_label("Run a backtest to see the price line chart here.")
+            self._empty_state_label("Run a backtest to see the price line here.")
         )
         self.price_chart_layout.addStretch()
         self.price_chart_scroll.setWidget(self.price_chart_inner)
-        price_layout.addWidget(self.price_chart_scroll, 1)
-        self.results_tabs.addTab(price_tab, "Price")
+        price_col.addWidget(self.price_chart_scroll, 1)
+
+        side_by_side.addWidget(equity_panel, 1)
+        side_by_side.addWidget(price_panel, 1)
+        equity_price_layout.addLayout(side_by_side, 1)
+        self.results_tabs.addTab(equity_price_tab, "Equity & Price")
 
         charts_tab = QWidget()
         charts_outer_layout = QVBoxLayout(charts_tab)
@@ -8054,9 +8130,9 @@ class BacktestDashboard(QMainWindow):
             tooltip=f"Output: {output_dir}\n{db_detail}",
         )
         if hasattr(self, "results_tabs"):
-            # Jump to Equity so the client sees the main curve immediately
+            # Jump to Equity & Price so the client sees curves immediately
             for i in range(self.results_tabs.count()):
-                if self.results_tabs.tabText(i) == "Equity":
+                if self.results_tabs.tabText(i) == "Equity & Price":
                     self.results_tabs.setCurrentIndex(i)
                     break
             else:
@@ -8358,6 +8434,7 @@ class BacktestDashboard(QMainWindow):
         table.setRowCount(view.height)
         for i, row in enumerate(view.iter_rows(named=True)):
             row_bg = result_tint_for_row(row)
+            row_fg = result_fg_for_outcome(row)
             for j, col in enumerate(cols):
                 val = row.get(col)
                 if isinstance(val, float):
@@ -8366,7 +8443,7 @@ class BacktestDashboard(QMainWindow):
                     text = ""
                 else:
                     text = str(val)
-                item = _table_item(text, row_bg)
+                item = _table_item(text, row_bg, row_fg)
                 if j == 0:
                     item.setData(Qt.UserRole, dict(row))
                 table.setItem(i, j, item)
@@ -8657,16 +8734,20 @@ class BacktestDashboard(QMainWindow):
         card = QFrame()
         card.setObjectName("candleCard")
         card_layout = QVBoxLayout(card)
-        name_label = QLabel(f"{title}  (click to zoom)")
+        name_label = QLabel(f"{title}  (click image to zoom)")
         name_label.setStyleSheet("font-weight: 600;")
         card_layout.addWidget(name_label)
         pixmap = QPixmap(path)
         if not pixmap.isNull():
-            scaled = pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+            scaled = pixmap.scaledToWidth(max(280, int(width)), Qt.SmoothTransformation)
             img_label = ClickableImageLabel(path, title, self)
             img_label.setPixmap(scaled)
             img_label.setCursor(Qt.PointingHandCursor)
+            img_label.setToolTip("Click to open full-size zoom window")
+            img_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             card_layout.addWidget(img_label)
+        else:
+            card_layout.addWidget(QLabel(f"(could not load {os.path.basename(path)})"))
         layout.addWidget(card)
 
     def _display_charts(self, plots_dir: str):
@@ -8690,20 +8771,35 @@ class BacktestDashboard(QMainWindow):
         png_files = sorted(f for f in os.listdir(plots_dir) if f.endswith(".png"))
         if not png_files:
             self.charts_layout.addWidget(QLabel("No charts were generated."))
+            if hasattr(self, "equity_chart_layout"):
+                self.equity_chart_layout.addWidget(
+                    QLabel("Equity charts missing — re-run the backtest.")
+                )
+                self.equity_chart_layout.addStretch()
+            if hasattr(self, "price_chart_layout"):
+                self.price_chart_layout.addWidget(
+                    QLabel("Price chart missing — re-run the backtest.")
+                )
+                self.price_chart_layout.addStretch()
             return
 
-        # Pin key charts into dedicated tabs
+        # Side-by-side: main equity curve + clean price line
         equity_names = (
             "equity_curves_all_models.png",
             "equity_with_regression.png",
-            "drawdown.png",
         )
         price_names = ("price_line_with_trades.png",)
+        # Fit both columns in the Results pane
+        col_width = 560
 
         for fname in equity_names:
             path = os.path.join(plots_dir, fname)
             if os.path.isfile(path) and hasattr(self, "equity_chart_layout"):
-                self._add_chart_card(self.equity_chart_layout, path, fname.replace("_", " ").replace(".png", ""))
+                self._add_chart_card(
+                    self.equity_chart_layout, path,
+                    fname.replace("_", " ").replace(".png", ""),
+                    width=col_width,
+                )
         if hasattr(self, "equity_chart_layout"):
             if self.equity_chart_layout.count() == 0:
                 self.equity_chart_layout.addWidget(
@@ -8716,7 +8812,7 @@ class BacktestDashboard(QMainWindow):
             if os.path.isfile(path) and hasattr(self, "price_chart_layout"):
                 self._add_chart_card(
                     self.price_chart_layout, path,
-                    "Price line with trades", width=780,
+                    "Price line", width=col_width,
                 )
         if hasattr(self, "price_chart_layout"):
             if self.price_chart_layout.count() == 0:
@@ -8726,7 +8822,7 @@ class BacktestDashboard(QMainWindow):
             self.price_chart_layout.addStretch()
 
         # All charts gallery (equity + price first)
-        priority = list(equity_names) + list(price_names)
+        priority = list(equity_names) + list(price_names) + ["drawdown.png"]
         ordered = [f for f in priority if f in png_files] + [
             f for f in png_files if f not in priority
         ]
@@ -8737,25 +8833,46 @@ class BacktestDashboard(QMainWindow):
         self.charts_layout.addStretch()
 
     def open_zoomed_chart(self, path: str, title: str):
+        if not path or not os.path.isfile(path):
+            QMessageBox.information(self, "Chart missing", f"Could not find:\n{path}")
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            QMessageBox.information(self, "Chart missing", f"Could not load image:\n{path}")
+            return
+
         dialog = QDialog(self)
-        dialog.setWindowTitle(title)
+        dialog.setWindowTitle(title or "Chart zoom")
+        dialog.setModal(True)
         layout = QVBoxLayout(dialog)
 
+        hint = QLabel("Scroll to pan. Close when done.")
+        hint.setObjectName("sectionHint")
+        layout.addWidget(hint)
+
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        # False = keep full image size so scrollbars actually pan/zoom-pan
+        scroll.setWidgetResizable(False)
         label = QLabel()
-        pixmap = QPixmap(path)
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w = int(screen.width() * 1.6)
+        max_h = int(screen.height() * 1.6)
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+            pixmap = pixmap.scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         label.setPixmap(pixmap)
+        label.setAlignment(Qt.AlignCenter)
+        label.setMinimumSize(pixmap.size())
         scroll.setWidget(label)
-        layout.addWidget(scroll)
+        layout.addWidget(scroll, 1)
 
         close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dialog.close)
+        close_btn.clicked.connect(dialog.accept)
         layout.addWidget(close_btn)
 
-        screen = QApplication.primaryScreen().availableGeometry()
-        dialog.resize(min(pixmap.width() + 60, int(screen.width() * 0.9)),
-                      min(pixmap.height() + 100, int(screen.height() * 0.9)))
+        dialog.resize(
+            min(max(pixmap.width() + 80, 720), int(screen.width() * 0.92)),
+            min(max(pixmap.height() + 120, 480), int(screen.height() * 0.92)),
+        )
         dialog.exec()
 
     # ------------------------------------------------------------------
@@ -10142,14 +10259,19 @@ class TradeInspectDialog(QDialog):
 class ClickableImageLabel(QLabel):
     """A QLabel that opens the full-resolution chart when clicked."""
 
-    def __init__(self, path: str, title: str, dashboard: BacktestDashboard):
+    def __init__(self, path: str, title: str, dashboard: "BacktestDashboard"):
         super().__init__()
         self.path = path
         self.title = title
         self.dashboard = dashboard
+        self.setCursor(Qt.PointingHandCursor)
 
     def mousePressEvent(self, event):
-        self.dashboard.open_zoomed_chart(self.path, self.title)
+        if event.button() == Qt.LeftButton and self.dashboard is not None:
+            self.dashboard.open_zoomed_chart(self.path, self.title)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 # ============================================================================

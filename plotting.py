@@ -60,6 +60,7 @@ section below.
 import os
 import math
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -89,11 +90,15 @@ class PlottingConfig:
     # ---- output ----
     output_dir: str = "plots"
 
-    # ---- optional: used for the price line chart (close series + trade markers) ----
+    # ---- optional: used for the price line chart (close series) ----
     data_root: Optional[str] = None
     symbol: Optional[str] = None
     # Folder names like "1hour", "15min" — first existing TF with data is used
     timeframes: List[str] = field(default_factory=list)
+    # spot | futures | both — same as BacktestConfig.market_data
+    market_data: Optional[str] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
 
     # ---- optional benchmark for Treynor ratio (see module docstring) ----
     # Path to a CSV with columns [date, return_pct]. Leave as None to skip
@@ -476,8 +481,8 @@ def plot_price_line_with_trades(
     out_path: str,
 ) -> None:
     """
-    Close-price line for the dominant timeframe, with BUY/SELL entry markers
-    and exit markers from the trade ledger (primary exit model).
+    Close-price line for the dominant timeframe (no trade markers).
+    Kept as a clean companion to the equity curve for visual comparison.
     """
     import backtest as bt
 
@@ -498,16 +503,30 @@ def plot_price_line_with_trades(
 
     if data_root and symbol and tf_folder:
         try:
-            cdf = bt.load_candles_df(data_root, symbol, tf_folder)
-            if cdf.height > 0 and trades.height > 0:
-                t0 = trades["entry_time"].min()
-                t1 = trades["exit_time"].max() if "exit_time" in trades.columns else trades["entry_time"].max()
-                # pad a little so markers aren't on the edge
-                window = cdf.filter(
-                    (pl.col("datetime") >= t0) & (pl.col("datetime") <= t1)
-                )
-                if window.height < 50:
-                    window = cdf.tail(min(5000, cdf.height))
+            # Prefer explicit market setting; for "both" use spot line (legacy fallback)
+            preferred = (config.market_data or "spot")
+            if str(preferred).lower() == "both":
+                preferred = "spot"
+            cdf = bt.load_candles_df(
+                data_root, symbol, tf_folder,
+                config.start_date,
+                config.end_date,
+                preferred=preferred,
+            )
+            if cdf.height > 0:
+                window = cdf
+                if trades.height > 0:
+                    t0 = trades["entry_time"].min()
+                    t1 = (
+                        trades["exit_time"].max()
+                        if "exit_time" in trades.columns
+                        else trades["entry_time"].max()
+                    )
+                    clipped = cdf.filter(
+                        (pl.col("datetime") >= t0) & (pl.col("datetime") <= t1)
+                    )
+                    if clipped.height >= 50:
+                        window = clipped
                 # downsample very long series for readable PNG
                 step = max(1, window.height // 4000)
                 if step > 1:
@@ -522,38 +541,24 @@ def plot_price_line_with_trades(
     fig, ax = plt.subplots(figsize=(config.figure_width, config.figure_height), dpi=config.figure_dpi)
 
     if closes_t and closes_p:
-        ax.plot(closes_t, closes_p, color="#5F6368", linewidth=1.2, alpha=0.85, label=f"{symbol} close ({title_tf})")
+        ax.plot(
+            closes_t, closes_p,
+            color="#1A73E8", linewidth=1.4, alpha=0.9,
+            label=f"{symbol} close ({title_tf})",
+        )
     elif trades.height > 0:
-        # Fallback: connect entry prices in time order (no CSV loaded)
+        # Fallback when CSV unavailable: entry-price path only (still a line)
         ax.plot(
             trades["entry_time"].to_list(),
             trades["entry_price"].to_list(),
-            color="#5F6368", linewidth=1.4, alpha=0.7, label="Entry price path",
+            color="#1A73E8", linewidth=1.4, alpha=0.85,
+            label="Entry price path",
         )
     else:
         plt.close(fig)
         return
 
-    if trades.height > 0:
-        buys = trades.filter(pl.col("direction") == "BUY")
-        sells = trades.filter(pl.col("direction") == "SELL")
-        if buys.height:
-            ax.scatter(
-                buys["entry_time"].to_list(), buys["entry_price"].to_list(),
-                marker="^", s=36, color=COLORS["win"], zorder=5, label="BUY entry",
-            )
-        if sells.height:
-            ax.scatter(
-                sells["entry_time"].to_list(), sells["entry_price"].to_list(),
-                marker="v", s=36, color=COLORS["loss"], zorder=5, label="SELL entry",
-            )
-        if "exit_time" in trades.columns and "exit_price" in trades.columns:
-            ax.scatter(
-                trades["exit_time"].to_list(), trades["exit_price"].to_list(),
-                marker="x", s=28, color=COLORS["accent2"], zorder=4, label="Exit",
-            )
-
-    ax.set_title(f"Price Line with Trades ({exit_model}) — {symbol or 'symbol'} / {title_tf}")
+    ax.set_title(f"Price Line — {symbol or 'symbol'} / {title_tf}")
     ax.set_xlabel("Date")
     ax.set_ylabel("Price")
     ax.legend(frameon=True, facecolor="white", edgecolor="#CCCCCC", loc="best")
