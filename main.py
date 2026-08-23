@@ -49,6 +49,31 @@ def _run_dashboard() -> None:
     dashboard.launch()
 
 
+def _report_frozen_crash(exc: BaseException) -> None:
+    """Write hammer_crash.log and show a Windows message box when the exe fails to start."""
+    if not getattr(sys, "frozen", False):
+        raise exc
+    import traceback
+
+    log_path = os.path.join(_app_dir(), "hammer_crash.log")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Hammer failed to start\n\n")
+            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+    except OSError:
+        log_path = "(could not write log)"
+
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            msg = f"{exc}\n\nDetails saved to:\n{log_path}"
+            ctypes.windll.user32.MessageBoxW(0, msg, "Hammer — startup failed", 0x10)
+        except Exception:
+            pass
+    raise exc
+
+
 def _run_backtest() -> int:
     os.chdir(_app_dir())
     from backtest import BacktestConfig, PositionSizingMode, run_backtest_and_export
@@ -101,4 +126,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as _exc:
+        _report_frozen_crash(_exc)
+        raise SystemExit(1)
