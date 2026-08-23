@@ -29,6 +29,7 @@ def _cleanup_stale_update_artifacts() -> None:
         "_hammer_update_extract",
         "_hammer_apply_update.bat",
         "_hammer_relaunch.bat",
+        "_hammer_pyi",
     ):
         path = os.path.join(root, name)
         try:

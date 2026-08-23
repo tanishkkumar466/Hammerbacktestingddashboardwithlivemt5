@@ -107,18 +107,22 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# Onedir build (folder with _internal/) — reliable self-update on Windows.
-# One-file exe + UPX often causes "Failed to start embedded Python interpreter".
+# One-file Windows exe (single HammerCandleBacktestDashboard.exe next to data/).
+# upx=False + local extract dir avoids "embedded Python interpreter" / temp-dir errors.
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name="HammerCandleBacktestDashboard",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
+    upx_exclude=[],
+    runtime_tmpdir="_hammer_pyi",
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -126,15 +130,4 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=_exe_icon,
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=False,
-    upx_exclude=[],
-    name="HammerCandleBacktestDashboard",
 )

@@ -56,50 +56,43 @@ jobs:
             if (-not (Test-Path $f)) { throw "Missing required file: $f" }
           }
           if (-not (Test-Path "indicators/__init__.py")) { throw "Missing indicators package" }
-          if (Test-Path "logo.ico") {
-            Write-Host "Using logo.ico for exe + window icon"
-          } elseif (Test-Path "app_icon.ico") {
-            Write-Host "logo.ico not found — using app_icon.ico"
-          } else {
-            Write-Host "No .ico in repo — build will use default PyInstaller icon"
-          }
 
-      - name: Build executable (PyInstaller spec)
+      - name: Build one-file executable (PyInstaller spec)
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
       - name: Smoke-check EXE
         shell: pwsh
         run: |
-          $exe = "dist/HammerCandleBacktestDashboard/HammerCandleBacktestDashboard.exe"
+          $exe = "dist/HammerCandleBacktestDashboard.exe"
           if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
           $size = (Get-Item $exe).Length
-          if ($size -lt 1MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
+          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes) — likely incomplete bundle" }
           Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
 
-      - name: Package delivery folder
+      - name: Package delivery zip (exe + readme)
         shell: pwsh
         run: |
-          $folder = "dist/HammerCandleBacktestDashboard"
+          New-Item -ItemType Directory -Force -Path "dist/HammerCandleBacktestDashboard" | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard/"
           @"
           Hammer Candle Backtest Dashboard (Windows)
 
-          1. Copy the whole HammerCandleBacktestDashboard folder next to your data/ folder.
-          2. Double-click HammerCandleBacktestDashboard.exe inside that folder.
+          1. Put this folder next to your data/ CSVs (or copy data/ here).
+          2. Double-click HammerCandleBacktestDashboard.exe
           3. If SmartScreen appears: More info -> Run anyway (unsigned app).
 
-          Live MT5: Windows only — install MetaTrader 5 terminal.
-          Self-update: attach HammerCandleBacktestDashboard-windows.zip to GitHub Releases.
-          "@ | Set-Content -Encoding UTF8 "$folder/README.txt"
-          Compress-Archive -Path "$folder/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
+          Self-update: Help -> Check for Updates (needs .exe on GitHub Release — auto on each tag).
+          "@ | Set-Content -Encoding UTF8 "dist/HammerCandleBacktestDashboard/README.txt"
+          Compress-Archive -Path "dist/HammerCandleBacktestDashboard/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
 
-      - name: Upload artifact (onedir folder)
+      - name: Upload artifact (exe)
         uses: actions/upload-artifact@v4
         with:
-          name: HammerCandleBacktestDashboard-windows
-          path: dist/HammerCandleBacktestDashboard/
+          name: HammerCandleBacktestDashboard.exe
+          path: dist/HammerCandleBacktestDashboard.exe
           if-no-files-found: error
 
-      - name: Upload artifact (windows zip for releases)
+      - name: Upload artifact (zip with readme)
         uses: actions/upload-artifact@v4
         with:
           name: HammerCandleBacktestDashboard-windows-zip

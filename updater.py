@@ -173,6 +173,7 @@ _SKIP_DIR_NAMES = {
     ".cursor",
     "_hammer_update_staging",
     "_hammer_update_extract",
+    "_hammer_pyi",
 }
 _SKIP_FILE_NAMES = {
     "run_history.db",
@@ -215,7 +216,9 @@ def _version_tuple(v: str):
     return tuple(parts)
 
 
-def is_newer(remote_version: str, local_version: str = CURRENT_VERSION) -> bool:
+def is_newer(remote_version: str, local_version: Optional[str] = None) -> bool:
+    if local_version is None:
+        local_version = CURRENT_VERSION
     return _version_tuple(remote_version) > _version_tuple(local_version)
 
 
@@ -341,10 +344,9 @@ def check_for_update() -> Optional[ReleaseInfo]:
     if not asset:
         if getattr(sys, "frozen", False):
             raise UpdateError(
-                "Latest release has no Windows .exe or *-windows.zip asset.\n\n"
-                "Frozen Hammer needs a built Windows package on the release — not the "
-                "source-only Hammer-x.y.z.zip. Attach HammerCandleBacktestDashboard.exe "
-                "or HammerCandleBacktestDashboard-windows.zip from GitHub Actions."
+                "Latest release has no HammerCandleBacktestDashboard.exe yet.\n\n"
+                "Wait for the Release Windows EXE GitHub Action to finish for this "
+                "version (runs automatically on each v* tag), then try again."
             )
         raise UpdateError(
             "Latest release has no .zip or .exe asset attached. "
@@ -372,7 +374,7 @@ def check_for_update() -> Optional[ReleaseInfo]:
         asset_id=asset.get("id"),
     )
 
-    if is_newer(info.version):
+    if is_newer(info.version, CURRENT_VERSION):
         return info
     return None
 
@@ -560,8 +562,12 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
         bat = _write_windows_update_bat(
             pid=os.getpid(),
             lines=[
+                f'rmdir /S /Q "{root}\\_hammer_pyi" 2>nul',
+                f'del /F /Q "{current_exe}.old" 2>nul',
+                f'move /Y "{current_exe}" "{current_exe}.old" >nul',
                 f'copy /Y "{staged}" "{current_exe}" >nul',
                 f'del /F /Q "{staged}" 2>nul',
+                f'del /F /Q "{current_exe}.old" 2>nul',
                 f'start "" /D "{root}" "{current_exe}"',
             ],
         )

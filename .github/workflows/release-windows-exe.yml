@@ -1,0 +1,49 @@
+# Builds the Windows one-file exe and attaches it to the GitHub Release for this tag.
+# Push a tag (e.g. v1.0.7) — clients on older .exe builds can self-update from Help → Check for Updates.
+
+name: Release Windows EXE
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install build dependencies
+        run: pip install -r requirements-build.txt
+
+      - name: Build one-file executable
+        run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
+
+      - name: Smoke-check EXE
+        shell: pwsh
+        run: |
+          $exe = "dist/HammerCandleBacktestDashboard.exe"
+          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
+          $size = (Get-Item $exe).Length
+          if ($size -lt 5MB) { throw "EXE suspiciously small ($size bytes)" }
+          Write-Host "Built $exe ($([math]::Round($size/1MB, 1)) MB)"
+
+      - name: Upload EXE to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/HammerCandleBacktestDashboard.exe
+          generate_release_notes: true
