@@ -9,7 +9,12 @@ import sys
 import sysconfig
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import (
+    collect_all,
+    collect_data_files,
+    collect_dynamic_libs,
+    collect_submodules,
+)
 
 ROOT = Path(SPECPATH)
 entry_script = str(ROOT / "main.py")
@@ -119,19 +124,14 @@ def _collect_package(name: str) -> None:
         print(f"[spec] collect_all({name}) skipped: {exc}")
 
 
-def _dedupe_binaries(items: list) -> list:
-    """Keep first copy of each DLL/PYD basename — duplicates often break Windows startup."""
-    seen: set[str] = set()
-    out: list = []
-    for item in items:
-        src = item[0] if isinstance(item, (tuple, list)) else item
-        key = os.path.basename(str(src)).lower()
-        if key in seen:
-            print(f"[spec] skip duplicate binary: {key}")
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
+def _collect_dynamic(name: str) -> None:
+    """Native .dll/.pyd for packages like polars, pyarrow, PySide6."""
+    try:
+        libs = collect_dynamic_libs(name)
+        binaries.extend(libs)
+        print(f"[spec] collect_dynamic_libs({name}): {len(libs)} binaries")
+    except Exception as exc:
+        print(f"[spec] collect_dynamic_libs({name}) skipped: {exc}")
 
 
 for _pkg in _ALL_PACKAGES:
@@ -159,8 +159,25 @@ for _data_pkg in ("matplotlib", "certifi", "tzdata", "pyarrow", "PySide6", "shib
     except Exception as exc:
         print(f"[spec] collect_data_files({_data_pkg}) skipped: {exc}")
 
-# Only force-bundle sqlite3 — do NOT copy libcrypto/libssl manually (OpenSSL mismatch crashes exe)
+# Extra native libs — do NOT dedupe by basename; different folders need their own copies.
+for _dyn in (
+    "PySide6", "shiboken6", "polars", "pyarrow", "numpy",
+    "pydantic_core", "grpc", "rpds", "matplotlib", "PIL", "psutil",
+):
+    _collect_dynamic(_dyn)
+
+# Windows Python stdlib .pyd + OpenSSL (fixes "LoadLibrary / specified module could not be found")
 if sys.platform == "win32":
+    _win_native = (
+        "_sqlite3.pyd", "sqlite3.dll",
+        "_ssl.pyd", "_hashlib.pyd",
+        "libcrypto-3.dll", "libssl-3.dll",
+        "_bz2.pyd", "_lzma.pyd", "_ctypes.pyd",
+        "_socket.pyd", "select.pyd",
+        "pyexpat.pyd", "_elementtree.pyd",
+        "unicodedata.pyd", "_decimal.pyd",
+        "_multiprocessing.pyd",
+    )
     for base in (
         sysconfig.get_path("stdlib"),
         os.path.join(sys.base_prefix, "DLLs"),
@@ -168,13 +185,18 @@ if sys.platform == "win32":
     ):
         if not base or not os.path.isdir(base):
             continue
-        for fname in ("_sqlite3.pyd", "sqlite3.dll"):
+        for fname in _win_native:
             fpath = os.path.join(base, fname)
             if os.path.isfile(fpath):
                 binaries.append((fpath, "."))
                 print(f"[spec] bundled {fname}")
+        for fname in os.listdir(base):
+            if fname.lower().startswith("libffi") and fname.lower().endswith(".dll"):
+                binaries.append((os.path.join(base, fname), "."))
+                print(f"[spec] bundled {fname}")
 
-binaries = _dedupe_binaries(binaries)
+# Do NOT dedupe binaries — keeping "first" copy dropped Qt/OpenSSL DLLs and caused
+# "The specified module could not be found" on Windows.
 
 _exe_icon = None
 for icon_name in ("logo.ico", "app_icon.ico"):

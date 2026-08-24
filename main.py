@@ -41,10 +41,43 @@ def _cleanup_stale_update_artifacts() -> None:
             pass
 
 
+def _report_pending_update_failure() -> None:
+    """Show a dialog if the last Check-for-Updates bat failed (Windows)."""
+    if not getattr(sys, "frozen", False) or os.name != "nt":
+        return
+    try:
+        import updater
+
+        message = updater.read_pending_update_message()
+    except Exception:
+        return
+    if not message:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, message, "Hammer — update failed", 0x10)
+    except Exception:
+        pass
+
+
 def _run_dashboard() -> None:
     os.chdir(_app_dir())
-    # Import the module (not runpy on a .py path). Frozen onefile has no
-    # dashboard.py next to the exe — only inside the bundle as a module.
+    # Stepwise imports in frozen builds — pinpoints "module could not be found" DLL errors.
+    if getattr(sys, "frozen", False):
+        for mod in (
+            "sqlite3", "_sqlite3", "ssl", "_ssl",
+            "PySide6", "shiboken6",
+            "numpy", "polars", "pyarrow",
+            "matplotlib", "PIL",
+        ):
+            try:
+                __import__(mod)
+            except Exception as exc:
+                raise ImportError(
+                    f"Hammer could not load native library for '{mod}': {exc}\n"
+                    "Usually a missing .dll in the exe bundle (rebuild with latest spec)."
+                ) from exc
     import dashboard
     dashboard.launch()
 
@@ -110,6 +143,7 @@ def main() -> int:
     # public reset flag so child workers (ray/multiprocessing) behave normally.
     os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
 
+    _report_pending_update_failure()
     _cleanup_stale_update_artifacts()
     parser = argparse.ArgumentParser(description="Hammer candle backtest dashboard")
     parser.add_argument(

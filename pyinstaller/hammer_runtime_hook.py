@@ -1,12 +1,23 @@
 """
 PyInstaller runtime hook — run before main.py in the frozen exe.
 
-- Puts _MEIPASS on PATH / DLL search path (sqlite3, polars, pyarrow, etc.)
-- Points Qt at bundled platform plugins (qwindows.dll) — without this the
-  windowed exe often exits silently on Windows.
+- Puts _MEIPASS on PATH and registers every folder that contains .dll/.pyd
+- Points Qt at bundled platform plugins (qwindows.dll)
 """
 import os
 import sys
+
+
+def _register_dll_dir(path: str, seen: set[str]) -> None:
+    if not path or path in seen or not os.path.isdir(path):
+        return
+    seen.add(path)
+    if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(path)
+        except OSError:
+            pass
+
 
 if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
     meipass = sys._MEIPASS
@@ -15,24 +26,22 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
 
     os.environ["PATH"] = meipass + os.pathsep + os.environ.get("PATH", "")
 
-    if sys.platform == "win32" and hasattr(os, "add_dll_directory"):
-        try:
-            os.add_dll_directory(meipass)
-        except OSError:
-            pass
-        for sub in (
-            os.path.join(meipass, "PySide6"),
-            os.path.join(meipass, "PySide6", "plugins"),
-            os.path.join(meipass, "PySide6", "plugins", "platforms"),
-            os.path.join(meipass, "shiboken6"),
-        ):
-            if os.path.isdir(sub):
-                try:
-                    os.add_dll_directory(sub)
-                except OSError:
-                    pass
+    _seen_dirs: set[str] = set()
+    _register_dll_dir(meipass, _seen_dirs)
 
-    # PySide6 platform plugin (qwindows.dll) — required for QApplication to start
+    # Register every folder under _MEIPASS that contains native libraries
+    try:
+        for dirpath, dirnames, filenames in os.walk(meipass):
+            if any(
+                name.lower().endswith(ext)
+                for name in filenames
+                for ext in (".dll", ".pyd", ".so")
+            ):
+                _register_dll_dir(dirpath, _seen_dirs)
+    except OSError:
+        pass
+
+    # PySide6 platform plugin (qwindows.dll) — required for QApplication
     for plugins in (
         os.path.join(meipass, "PySide6", "plugins"),
         os.path.join(meipass, "PySide6", "Qt6", "plugins"),
@@ -42,13 +51,6 @@ if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
             os.environ["QT_PLUGIN_PATH"] = plugins
             platforms = os.path.join(plugins, "platforms")
             os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = platforms
-            if (
-                os.path.isdir(platforms)
-                and sys.platform == "win32"
-                and hasattr(os, "add_dll_directory")
-            ):
-                try:
-                    os.add_dll_directory(platforms)
-                except OSError:
-                    pass
+            _register_dll_dir(plugins, _seen_dirs)
+            _register_dll_dir(platforms, _seen_dirs)
             break

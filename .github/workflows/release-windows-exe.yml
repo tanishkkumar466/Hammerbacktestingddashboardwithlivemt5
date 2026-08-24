@@ -32,6 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Verify Python syntax
+        run: python scripts/verify_syntax.py
+
       - name: Verify runtime imports (must pass before PyInstaller)
         shell: pwsh
         run: |

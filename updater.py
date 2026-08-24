@@ -187,6 +187,7 @@ _SKIP_FILE_NAMES = {
     ".DS_Store",
     "_hammer_apply_update.bat",
     "_hammer_relaunch.bat",
+    "_hammer_update.log",
 }
 
 
@@ -507,6 +508,7 @@ def _is_onedir_payload(payload_root: str) -> bool:
 
 # Windows: apply update after this process exits (exe swap or onedir folder copy)
 _WINDOWS_UPDATE_BAT: list = [None]
+_UPDATE_LOG_NAME = "_hammer_update.log"
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 _PYI_RELAUNCH_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
@@ -529,45 +531,133 @@ def _strip_pyi_env(env: dict) -> dict:
     return cleaned
 
 
-def _windows_relaunch_lines(root: str, exe_path: str) -> list[str]:
+def update_log_path() -> str:
+    return os.path.join(app_root(), _UPDATE_LOG_NAME)
+
+
+def read_pending_update_message() -> Optional[str]:
     """
-    Relaunch lines for update .bat files.
-
-    Why Check-for-Updates breaks but double-click works
-    ----------------------------------------------------
-    The update bat is started from the frozen Hammer process, so cmd.exe
-    inherits PyInstaller private env vars (_PYI_*). The new one-file exe then
-    thinks it is a *child* of that old instance. Its real parent is cmd.exe,
-    so the bootloader fails with:
-      Security validation failure: Failed to obtain executable path for parent process
-
-    Double-click works because Explorer starts the exe with a clean environment.
-
-    Fix: wipe every _PYI_* var in the bat, set PYINSTALLER_RESET_ENVIRONMENT=1,
-    then start the new exe so it boots as a fresh top-level one-file instance.
+    If the last self-update bat failed or succeeded, return text for a startup dialog.
+    Consumes (deletes) the log file after reading.
     """
-    # Clear any _PYI_* that exist (names vary by PyInstaller version)
+    path = update_log_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read().strip()
+    except OSError:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if not text:
+        return None
+    if "UPDATE_FAILED" in text:
+        return (
+            "The last Check for Updates could not replace the .exe.\n\n"
+            "Details (_hammer_update.log):\n"
+            f"{text}\n\n"
+            "Fix: close all Hammer windows, download the latest "
+            "HammerCandleBacktestDashboard.exe from GitHub Releases "
+            "(~420–450 MB), replace the file manually, then double-click it."
+        )
+    if "UPDATE_OK" in text:
+        return None
+    return None
+
+
+def _bat_echo_log(log_path: str, message: str) -> str:
+    safe = message.replace('"', "'")
+    return f'echo {safe}>>"{log_path}"'
+
+
+def _windows_clear_pyi_env_lines() -> list[str]:
+    """Strip PyInstaller private env vars before relaunching a one-file exe."""
     lines = [
         'for /f "tokens=1 delims==" %%V in (\'set _PYI_ 2^>nul\') do set "%%V="',
     ]
     for _var in _PYI_PRIVATE_ENV_VARS:
         lines.append(f'set "{_var}="')
     lines.append(f'set "{_PYI_RELAUNCH_ENV}=1"')
-    # Prefer PowerShell Start-Process after env wipe — more reliable than start
-    # when cmd itself was spawned from a frozen one-file process.
-    ps = (
-        f"Get-ChildItem Env: | Where-Object {{ $_.Name -like '_PYI_*' }} | "
-        f"ForEach-Object {{ Remove-Item -LiteralPath ('Env:' + $_.Name) -ErrorAction SilentlyContinue }}; "
-        f"$env:{_PYI_RELAUNCH_ENV}='1'; "
-        f"Start-Process -FilePath '{exe_path}' -WorkingDirectory '{root}'"
-    )
-    # Escape for cmd: keep as one powershell -Command string
-    ps_escaped = ps.replace('"', '\\"')
-    lines.append(
-        f'powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
-        f'-Command "{ps_escaped}"'
-    )
     return lines
+
+
+def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str]:
+    """
+    Relaunch after update with a clean PyInstaller environment.
+
+    PyInstaller one-file apps inherit _PYI_* vars from the parent process. After
+    Check for Updates, cmd can still carry those vars unless cleared. The child
+    bootloader then fails with "Security validation failure" or missing DLL load.
+
+    Use plain `start` (not PowerShell) after env wipe — PowerShell is blocked on
+    some PCs and was a silent failure mode for relaunch.
+    """
+    lines = list(_windows_clear_pyi_env_lines())
+    lines.append(_bat_echo_log(log_path, "Relaunching Hammer..."))
+    lines.append(f'start "" /D "{root}" "{exe_path}"')
+    lines.append("if errorlevel 1 (")
+    lines.append(_bat_echo_log(log_path, "UPDATE_FAILED relaunch start command"))
+    lines.append("  exit /b 1")
+    lines.append(")")
+    lines.append(_bat_echo_log(log_path, "UPDATE_OK relaunch started"))
+    return lines
+
+
+def _windows_wait_for_exit_lines(*, pid: int, exe_path: str, log_path: str) -> list[str]:
+    """Wait until Hammer fully exits (PID + process image name)."""
+    exe_name = os.path.basename(exe_path)
+    label_pid = f"wait_pid_{pid}"
+    label_img = "wait_img"
+    return [
+        _bat_echo_log(log_path, f"Waiting for Hammer PID {pid} to exit..."),
+        f":{label_pid}",
+        f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul',
+        "if %ERRORLEVEL%==0 (",
+        "  timeout /t 1 /nobreak >nul",
+        f"  goto {label_pid}",
+        ")",
+        _bat_echo_log(log_path, f"Waiting for {exe_name} processes to finish..."),
+        f":{label_img}",
+        f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul',
+        "if %ERRORLEVEL%==0 (",
+        "  timeout /t 1 /nobreak >nul",
+        f"  goto {label_img}",
+        ")",
+        # one-file parent bootloader may still hold the exe briefly
+        "timeout /t 3 /nobreak >nul",
+    ]
+
+
+def _windows_replace_exe_lines(*, staged: str, current_exe: str, log_path: str) -> list[str]:
+    """Replace running one-file exe with retries; log failures to update log."""
+    return [
+        _bat_echo_log(log_path, "Replacing executable..."),
+        f'del /F /Q "{current_exe}.old" 2>nul',
+        f'move /Y "{current_exe}" "{current_exe}.old"',
+        "if errorlevel 1 (",
+        _bat_echo_log(log_path, "UPDATE_FAILED could not move old exe (still locked?)"),
+        "  exit /b 1",
+        ")",
+        "set COPY_TRIES=0",
+        ":copy_retry",
+        "set /a COPY_TRIES+=1",
+        f'copy /Y "{staged}" "{current_exe}"',
+        "if errorlevel 1 (",
+        "  if !COPY_TRIES! lss 30 (",
+        _bat_echo_log(log_path, "copy retry (exe still locked)"),
+        "    timeout /t 2 /nobreak >nul",
+        "    goto copy_retry",
+        "  )",
+        _bat_echo_log(log_path, "UPDATE_FAILED copy failed after 30 tries"),
+        "  exit /b 1",
+        ")",
+        f'del /F /Q "{staged}" 2>nul',
+        f'del /F /Q "{current_exe}.old" 2>nul',
+        _bat_echo_log(log_path, "UPDATE_OK exe replaced"),
+    ]
 
 
 def _spawn_frozen_relaunch(exe_path: str, root: str) -> None:
@@ -579,19 +669,21 @@ def _spawn_frozen_relaunch(exe_path: str, root: str) -> None:
     subprocess.Popen([exe_path], **kwargs)
 
 
-def _write_windows_update_bat(*, pid: int, lines: list[str]) -> str:
+def _write_windows_update_bat(*, pid: int, exe_path: str, lines: list[str]) -> str:
     """Batch script that waits for Hammer to exit, then runs update commands."""
     bat = os.path.join(app_root(), "_hammer_apply_update.bat")
-    script = ["@echo off", "setlocal EnableExtensions"]
-    label = f"wait_{pid}"
-    script.append(f":{label}")
-    script.append(f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul')
-    script.append("if %ERRORLEVEL%==0 (")
-    script.append("  timeout /t 1 /nobreak >nul")
-    script.append(f"  goto {label}")
-    script.append(")")
-    # Extra wait: one-file parent process may still be releasing the .exe lock
-    script.append("timeout /t 3 /nobreak >nul")
+    log_path = update_log_path()
+    try:
+        if os.path.isfile(log_path):
+            os.remove(log_path)
+    except OSError:
+        pass
+    script = [
+        "@echo off",
+        "setlocal EnableExtensions EnableDelayedExpansion",
+        f'echo Hammer update started >"{log_path}"',
+    ]
+    script.extend(_windows_wait_for_exit_lines(pid=pid, exe_path=exe_path, log_path=log_path))
     script.extend(lines)
     script.append('del /F /Q "%~f0" 2>nul')
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
@@ -624,11 +716,18 @@ def _schedule_windows_onedir_update(payload_root: str, status_cb: Callable[[str]
 
     exe_name = os.path.basename(sys.executable)
     target_exe = os.path.join(root, exe_name)
+    log_path = update_log_path()
     bat = _write_windows_update_bat(
         pid=os.getpid(),
+        exe_path=target_exe,
         lines=[
-            f'xcopy /E /Y /I /Q "{staging}\\*" "{root}\\" >nul',
-            *_windows_relaunch_lines(root, target_exe),
+            _bat_echo_log(log_path, "Installing onedir update folder..."),
+            f'xcopy /E /Y /I /Q "{staging}\\*" "{root}\\"',
+            "if errorlevel 1 (",
+            _bat_echo_log(log_path, "UPDATE_FAILED xcopy onedir staging"),
+            "  exit /b 1",
+            ")",
+            *_windows_relaunch_lines(root, target_exe, log_path),
             f'rmdir /S /Q "{staging}" 2>nul',
         ],
     )
@@ -651,17 +750,24 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
     staged = os.path.join(root, dest_name + ".new")
     status_cb("Staging new executable...")
     shutil.copy2(downloaded_exe, staged)
+    staged_size = os.path.getsize(staged)
+    if staged_size < 350_000_000:
+        raise UpdateError(
+            f"Downloaded exe is only {staged_size / (1024 * 1024):.1f} MB — expected ~420–450 MB.\n\n"
+            "The release may be incomplete or the wrong file was attached. "
+            "Use HammerCandleBacktestDashboard.exe from GitHub Actions, not a source zip."
+        )
 
     if os.name == "nt":
+        log_path = update_log_path()
         bat = _write_windows_update_bat(
             pid=os.getpid(),
+            exe_path=current_exe,
             lines=[
-                f'del /F /Q "{current_exe}.old" 2>nul',
-                f'move /Y "{current_exe}" "{current_exe}.old" >nul',
-                f'copy /Y "{staged}" "{current_exe}" >nul',
-                f'del /F /Q "{staged}" 2>nul',
-                f'del /F /Q "{current_exe}.old" 2>nul',
-                *_windows_relaunch_lines(root, current_exe),
+                *_windows_replace_exe_lines(
+                    staged=staged, current_exe=current_exe, log_path=log_path
+                ),
+                *_windows_relaunch_lines(root, current_exe, log_path),
             ],
         )
         _WINDOWS_UPDATE_BAT[0] = bat
