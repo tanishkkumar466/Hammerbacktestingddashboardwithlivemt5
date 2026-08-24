@@ -44,7 +44,10 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
+          pip uninstall -y polars polars-lts-cpu 2>nul || true
           pip install -r requirements-build.txt
+          pip uninstall -y polars 2>nul || true
+          pip show polars-lts-cpu
 
       - name: Assert PyInstaller matches known-good local (6.19.0)
         shell: pwsh
@@ -58,6 +61,7 @@ jobs:
         shell: pwsh
         run: |
           python -c "import sqlite3, _sqlite3, ssl, PySide6, shiboken6, polars, pyarrow, numpy, matplotlib; import matplotlib.backends.backend_qtagg, matplotlib.backends.backend_qt; import openpyxl, et_xmlfile, defusedxml, tzdata, psutil, ray, MetaTrader5; import aiohttp, pydantic, pydantic_core, virtualenv, watchfiles, colorful, ray._private.object_ref_generator; print('imports OK')"
+          python -c "import importlib.metadata as m; names=[d.metadata['Name'].lower() for d in m.distributions()]; print([n for n in names if 'polars' in n]); assert any(n=='polars-lts-cpu' or n.startswith('polars-lts') for n in names), 'need polars-lts-cpu installed'"
 
       - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec

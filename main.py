@@ -110,6 +110,10 @@ def _run_dashboard() -> None:
     boot_log("main: splash shown")
 
     if getattr(sys, "frozen", False):
+        # polars must be the LTS CPU wheel (see requirements.txt). Default polars
+        # dies here with Windows 0xC000001D illegal instruction on non-AVX CPUs.
+        splash.setText("Loading data engine (polars)…")
+        app.processEvents()
         for mod in ("numpy", "polars", "pyarrow", "matplotlib", "PIL"):
             try:
                 boot_log(f"main: import {mod} ...")
@@ -118,10 +122,15 @@ def _run_dashboard() -> None:
                 boot_log(f"main: import {mod} OK")
                 app.processEvents()
             except Exception as exc:
+                boot_log(f"main: import {mod} FAILED: {exc}")
                 raise ImportError(
                     f"Hammer could not load native library for '{mod}': {exc}\n"
-                    "Usually a missing .dll in the exe bundle (rebuild with latest spec)."
+                    "Usually a missing .dll in the exe bundle (rebuild with latest spec).\n"
+                    "If this is polars: rebuild with polars-lts-cpu (not plain polars)."
                 ) from exc
+        boot_log("main: polars import path finished")
+        splash.setText("Loading dashboard…")
+        app.processEvents()
 
     boot_log("main: import dashboard ...")
     app.processEvents()

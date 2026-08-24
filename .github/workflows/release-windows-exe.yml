@@ -30,7 +30,11 @@ jobs:
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
+          # Never leave AVX-default polars installed alongside LTS (same import name).
+          pip uninstall -y polars polars-lts-cpu 2>nul || true
           pip install -r requirements-build.txt
+          pip uninstall -y polars 2>nul || true
+          pip show polars-lts-cpu
 
       - name: Assert PyInstaller matches known-good local (6.19.0)
         shell: pwsh
@@ -47,6 +51,9 @@ jobs:
           import sqlite3, _sqlite3, ssl
           import PySide6, shiboken6
           import polars, pyarrow, numpy, matplotlib, PIL, openpyxl, psutil
+          # Prove we built with LTS CPU wheel (not AVX-default polars)
+          import polars as pl
+          print('polars', pl.__version__, getattr(pl, '__package__', 'polars'))
           import matplotlib.backends.backend_qtagg, matplotlib.backends.backend_qt
           import et_xmlfile, defusedxml, tzdata
           import ray
@@ -56,6 +63,7 @@ jobs:
           print('ray', ray.__version__)
           "@
           python -c "import MetaTrader5; print('MetaTrader5 OK')"
+          python -c "import importlib.metadata as m; dists=[d.metadata['Name'] for d in m.distributions() if d.metadata['Name'].lower().replace('_','-') in ('polars','polars-lts-cpu')]; print('polars dists:', dists); assert 'polars-lts-cpu' in [x.lower() for x in dists] or any('lts' in x.lower() for x in dists), dists"
 
       - name: Build one-file executable
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
