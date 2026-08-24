@@ -32,6 +32,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Assert PyInstaller matches known-good local (6.19.0)
+        shell: pwsh
+        run: |
+          python -c "import PyInstaller; v=PyInstaller.__version__; print('PyInstaller', v); assert v=='6.19.0', f'expected 6.19.0 got {v}'"
+
       - name: Verify Python syntax
         run: python scripts/verify_syntax.py
 
@@ -75,10 +80,15 @@ jobs:
         run: |
           # Catch the real bug: CI exe downloads fine but never opens (OpenSSL/DLL).
           # hammer_boot.log is written by the runtime hook as soon as Python starts.
+          # Use a minimal PATH so the test does not silently use runner-global DLLs.
           $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
           Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
+          # Clear Mark-of-the-Web (same as a real GitHub download)
+          Unblock-File -LiteralPath (Join-Path $work "HammerCandleBacktestDashboard.exe") -ErrorAction SilentlyContinue
           Push-Location $work
+          $sys32 = Join-Path $env:SystemRoot "System32"
+          $env:PATH = "$sys32;$env:SystemRoot"
           $env:QT_QPA_PLATFORM = "offscreen"
           $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Hidden
           $deadline = (Get-Date).AddSeconds(45)
@@ -103,7 +113,7 @@ jobs:
           if ($boot -notmatch "python started") {
             throw "hammer_boot.log incomplete:`n$boot"
           }
-          Write-Host "Smoke OK — Python bootloader path works."
+          Write-Host "Smoke OK — Python bootloader path works (minimal PATH)."
 
       - name: Upload EXE to GitHub Release
         uses: softprops/action-gh-release@v2

@@ -267,6 +267,14 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
     if not assets:
         return None
 
+    # Exact exe name first — never grab Source code.zip by accident
+    if getattr(sys, "frozen", False):
+        for asset in assets:
+            name = str(asset.get("name", "")).lower()
+            size = int(asset.get("size", 0) or 0)
+            if name == "hammercandlebacktestdashboard.exe" and size >= 350_000_000:
+                return asset
+
     def score(asset: dict) -> int:
         name = str(asset.get("name", "")).lower()
         size = int(asset.get("size", 0) or 0)
@@ -401,6 +409,8 @@ def _download_file(
     url: str,
     dest_path: str,
     progress_cb: Callable[[int, int], None],
+    *,
+    expected_size: Optional[int] = None,
 ) -> None:
     global GITHUB_TOKEN
     GITHUB_TOKEN = _load_github_token()
@@ -412,6 +422,11 @@ def _download_file(
     try:
         with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, "wb") as out_file:
             total = int(resp.headers.get("Content-Length", 0) or 0)
+            if expected_size and total and abs(total - expected_size) > 1024:
+                raise UpdateError(
+                    f"Download Content-Length ({total} bytes) does not match "
+                    f"GitHub asset size ({expected_size} bytes). Aborting."
+                )
             downloaded = 0
             chunk_size = 65536
             while True:
@@ -420,7 +435,7 @@ def _download_file(
                     break
                 out_file.write(chunk)
                 downloaded += len(chunk)
-                progress_cb(downloaded, total)
+                progress_cb(downloaded, total or expected_size or 0)
     except urllib.error.HTTPError as e:
         raise UpdateError(
             f"Download failed (HTTP {e.code}). "
@@ -429,6 +444,63 @@ def _download_file(
         ) from e
     except urllib.error.URLError as e:
         raise UpdateError(f"Download network error: {e.reason}") from e
+
+    got = os.path.getsize(dest_path)
+    if expected_size and expected_size > 0:
+        # Exact match required — truncated downloads must never be installed
+        if got != expected_size:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            raise UpdateError(
+                f"Download incomplete or corrupted.\n"
+                f"Got {got} bytes, GitHub asset is {expected_size} bytes.\n"
+                "Delete any partial file and try Check for Updates again."
+            )
+    if got < 50_000_000 and dest_path.lower().endswith(".exe"):
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise UpdateError(
+            f"Downloaded file is only {got / (1024 * 1024):.1f} MB — that is not the "
+            "Windows exe (likely source zip). Need HammerCandleBacktestDashboard.exe."
+        )
+
+
+def _unblock_windows_download(path: str) -> None:
+    """
+    Clear Mark-of-the-Web so SmartScreen does not silently block the new exe.
+    Browser / GitHub downloads set Zone.Identifier; local PyInstaller builds do not.
+    """
+    if os.name != "nt":
+        return
+    zone = path + ":Zone.Identifier"
+    try:
+        if os.path.exists(zone):
+            os.remove(zone)
+    except OSError:
+        pass
+    # Also try PowerShell Unblock-File (handles some edge cases)
+    try:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f'Unblock-File -LiteralPath "{path}"',
+            ],
+            check=False,
+            capture_output=True,
+            creationflags=creationflags,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def app_root() -> str:
@@ -825,6 +897,7 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
     staged = os.path.join(root, dest_name + ".new")
     status_cb("Staging new executable...")
     shutil.copy2(downloaded_exe, staged)
+    _unblock_windows_download(staged)
     staged_size = os.path.getsize(staged)
     if staged_size < 350_000_000:
         raise UpdateError(
@@ -958,7 +1031,13 @@ def download_and_install(
     tmp_dir = tempfile.mkdtemp(prefix="hammer_update_")
     try:
         asset_path = os.path.join(tmp_dir, release.asset_name)
-        _download_file(release.download_url, asset_path, progress_cb)
+        _download_file(
+            release.download_url,
+            asset_path,
+            progress_cb,
+            expected_size=release.asset_size or None,
+        )
+        _unblock_windows_download(asset_path)
 
         if release.asset_kind == "exe" or release.asset_name.lower().endswith(".exe"):
             return _install_exe(asset_path, status_cb)

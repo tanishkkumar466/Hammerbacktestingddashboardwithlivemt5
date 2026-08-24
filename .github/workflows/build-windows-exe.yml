@@ -46,6 +46,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-build.txt
 
+      - name: Assert PyInstaller matches known-good local (6.19.0)
+        shell: pwsh
+        run: |
+          python -c "import PyInstaller; v=PyInstaller.__version__; print('PyInstaller', v); assert v=='6.19.0', f'expected 6.19.0 got {v}'"
+
       - name: Verify Python syntax
         run: python scripts/verify_syntax.py
 
@@ -74,7 +79,10 @@ jobs:
           $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
           Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
+          Unblock-File -LiteralPath (Join-Path $work "HammerCandleBacktestDashboard.exe") -ErrorAction SilentlyContinue
           Push-Location $work
+          $sys32 = Join-Path $env:SystemRoot "System32"
+          $env:PATH = "$sys32;$env:SystemRoot"
           $env:QT_QPA_PLATFORM = "offscreen"
           $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Hidden
           $deadline = (Get-Date).AddSeconds(45)
@@ -94,7 +102,7 @@ jobs:
           Pop-Location
           if ($crash) { throw "EXE wrote hammer_crash.log:`n$crash" }
           if (-not $boot) { throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL)." }
-          Write-Host "Smoke OK"
+          Write-Host "Smoke OK (minimal PATH)"
 
       - name: Package delivery zip
         shell: pwsh

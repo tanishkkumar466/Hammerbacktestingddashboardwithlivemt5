@@ -274,8 +274,8 @@ a.binaries = _sanitize_binaries(list(a.binaries))
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
 # One-file exe — default _MEI temp directory (do not set a custom runtime_tmpdir).
-# Built with PyInstaller 6.21.0 (see requirements-build.txt) to avoid 6.22.1+
-# "Security validation failure: Failed to obtain executable path for parent process".
+# Built with PyInstaller 6.19.0 — MUST match the local Windows build that opens.
+# See requirements-build.txt (do not bump without rebuilding + testing on a clean PC).
 exe = EXE(
     pyz,
     a.scripts,
