@@ -10527,7 +10527,7 @@ def _generate_checkmark_icon() -> str:
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
-def launch() -> None:
+def launch(app=None) -> None:
     """Start the Qt dashboard. Used by python dashboard.py and by frozen main.py."""
     from hammer_boot import boot_log, write_crash
 
@@ -10542,18 +10542,17 @@ def launch() -> None:
         del _early_settings
 
     try:
-        if getattr(sys, "frozen", False):
-            # Avoid silent GPU/OpenGL crashes on some Windows PCs (CI used offscreen — real
-            # qwindows path was never tested until the user double-clicks).
-            from PySide6.QtCore import Qt
-            from PySide6.QtGui import QGuiApplication
+        if app is None:
+            if getattr(sys, "frozen", False):
+                from PySide6.QtGui import QGuiApplication
 
-            QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
-            boot_log("launch: AA_UseSoftwareOpenGL set")
-
-        boot_log("launch: QApplication() ...")
-        app = QApplication(sys.argv)
-        boot_log("launch: QApplication OK")
+                QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+                boot_log("launch: AA_UseSoftwareOpenGL set")
+            boot_log("launch: QApplication() ...")
+            app = QApplication.instance() or QApplication(sys.argv)
+            boot_log("launch: QApplication OK")
+        else:
+            boot_log("launch: using existing QApplication")
     except Exception as exc:
         boot_log(f"launch: QApplication FAILED: {exc}")
         write_crash(exc)

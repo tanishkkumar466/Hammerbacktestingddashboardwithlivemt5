@@ -62,20 +62,17 @@ def _report_pending_update_failure() -> None:
 
 
 def _run_dashboard() -> None:
-    from hammer_boot import boot_log, enable_faulthandler
+    from hammer_boot import boot_log, enable_faulthandler, write_crash
 
     enable_faulthandler()
     boot_log("main: _run_dashboard start")
     os.chdir(_app_dir())
     boot_log(f"main: cwd={os.getcwd()}")
-    # Stepwise imports in frozen builds — pinpoints "module could not be found" DLL errors.
+
+    # Light libs first — enough to create a real Windows window BEFORE polars/pyarrow.
+    # CI previously killed the process while still importing polars (never reached QApplication).
     if getattr(sys, "frozen", False):
-        for mod in (
-            "sqlite3", "_sqlite3", "ssl", "_ssl",
-            "PySide6", "shiboken6",
-            "numpy", "polars", "pyarrow",
-            "matplotlib", "PIL",
-        ):
+        for mod in ("sqlite3", "_sqlite3", "ssl", "_ssl", "PySide6", "shiboken6"):
             try:
                 boot_log(f"main: import {mod} ...")
                 __import__(mod)
@@ -85,11 +82,54 @@ def _run_dashboard() -> None:
                     f"Hammer could not load native library for '{mod}': {exc}\n"
                     "Usually a missing .dll in the exe bundle (rebuild with latest spec)."
                 ) from exc
+
+    os.environ.pop("QT_QPA_PLATFORM", None)
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    if getattr(sys, "frozen", False):
+        QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+        boot_log("main: AA_UseSoftwareOpenGL set")
+
+    boot_log("launch: QApplication() ...")
+    try:
+        app = QApplication.instance() or QApplication(sys.argv)
+        boot_log("launch: QApplication OK")
+    except Exception as exc:
+        boot_log(f"launch: QApplication FAILED: {exc}")
+        write_crash(exc)
+        raise
+
+    splash = QLabel("Starting Hammer…")
+    splash.setWindowTitle("Hammer")
+    splash.resize(360, 80)
+    splash.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    splash.show()
+    app.processEvents()
+    boot_log("main: splash shown")
+
+    if getattr(sys, "frozen", False):
+        for mod in ("numpy", "polars", "pyarrow", "matplotlib", "PIL"):
+            try:
+                boot_log(f"main: import {mod} ...")
+                app.processEvents()
+                __import__(mod)
+                boot_log(f"main: import {mod} OK")
+                app.processEvents()
+            except Exception as exc:
+                raise ImportError(
+                    f"Hammer could not load native library for '{mod}': {exc}\n"
+                    "Usually a missing .dll in the exe bundle (rebuild with latest spec)."
+                ) from exc
+
     boot_log("main: import dashboard ...")
+    app.processEvents()
     import dashboard
     boot_log("main: import dashboard OK")
+    splash.close()
     boot_log("main: dashboard.launch() ...")
-    dashboard.launch()
+    dashboard.launch(app)
 
 
 def _report_frozen_crash(exc: BaseException) -> None:

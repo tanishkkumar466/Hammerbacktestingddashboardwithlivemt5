@@ -54,6 +54,7 @@ try:
 
         # Prefer _MEIPASS first so bundled OpenSSL/Qt win over PATH copies
         os.environ["PATH"] = meipass + os.pathsep + os.environ.get("PATH", "")
+        os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
         _seen_dirs: set = set()
         _register_dll_dir(meipass, _seen_dirs)

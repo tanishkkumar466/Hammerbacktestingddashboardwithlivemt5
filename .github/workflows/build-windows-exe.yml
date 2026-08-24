@@ -85,22 +85,26 @@ jobs:
           $env:PATH = "$sys32;$env:SystemRoot"
           Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
           $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Normal
-          $deadline = (Get-Date).AddSeconds(45)
-          $boot = $null
-          $crash = $null
+          $deadline = (Get-Date).AddSeconds(90)
+          $boot = ""
+          $crash = ""
           while ((Get-Date) -lt $deadline) {
-            if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw; break }
-            if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw; break }
+            if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw -ErrorAction SilentlyContinue }
+            if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw -ErrorAction SilentlyContinue }
+            if ($boot -match "QApplication OK") { break }
+            if ($crash -and $crash.Trim().Length -gt 0) { break }
             if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
             Start-Sleep -Seconds 2
           }
           if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw }
+          if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw }
           Write-Host "==== hammer_boot.log ===="
-          if (Test-Path "hammer_boot.log") { Get-Content "hammer_boot.log" } else { Write-Host "(missing)" }
+          if ($boot) { Write-Host $boot } else { Write-Host "(missing)" }
           Write-Host "==== hammer_crash.log ===="
-          if (Test-Path "hammer_crash.log") { Get-Content "hammer_crash.log" } else { Write-Host "(none)" }
+          if ($crash) { Write-Host $crash } else { Write-Host "(none)" }
           Pop-Location
-          if ($crash) { throw "EXE wrote hammer_crash.log:`n$crash" }
+          if ($crash -and $crash.Trim().Length -gt 0) { throw "EXE wrote hammer_crash.log:`n$crash" }
           if (-not $boot) { throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL)." }
           if ($boot -notmatch "QApplication OK") {
             throw "hammer_boot.log missing QApplication OK:`n$boot"

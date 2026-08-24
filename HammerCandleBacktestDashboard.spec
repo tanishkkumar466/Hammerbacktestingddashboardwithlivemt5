@@ -78,7 +78,7 @@ hiddenimports = [
     "matplotlib.pyplot", "matplotlib.dates", "matplotlib.patches",
     # --- data ---
     "numpy", "numpy.core", "numpy.core._multiarray_umath",
-    "polars", "pyarrow", "fsspec",
+    "polars", "polars.polars", "pyarrow", "fsspec",
     # --- images (no PIL._imagingtk — requires tkinter which we exclude) ---
     "PIL", "PIL.Image", "PIL._imaging",
     # --- excel ---
@@ -167,6 +167,56 @@ for _dyn in (
     "pydantic_core", "grpc", "rpds", "matplotlib", "PIL", "psutil",
 ):
     _collect_dynamic(_dyn)
+
+
+def _collect_package_natives(pkg: str) -> None:
+    """Walk site-packages/<pkg> for .pyd/.dll — collect_dynamic_libs(polars) often returns 0."""
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec(pkg)
+        if spec is None:
+            print(f"[spec] native walk {pkg}: not installed")
+            return
+        roots = []
+        if spec.origin and os.path.isfile(spec.origin):
+            roots.append(os.path.dirname(spec.origin))
+        if spec.submodule_search_locations:
+            roots.extend(list(spec.submodule_search_locations))
+        seen = set()
+        count = 0
+        for pkg_dir in roots:
+            pkg_dir = os.path.abspath(pkg_dir)
+            if not os.path.isdir(pkg_dir) or pkg_dir in seen:
+                continue
+            seen.add(pkg_dir)
+            parent = os.path.dirname(pkg_dir)
+            for dirpath, _dirnames, filenames in os.walk(pkg_dir):
+                for fn in filenames:
+                    low = fn.lower()
+                    if not low.endswith((".pyd", ".dll", ".so")):
+                        continue
+                    src = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(dirpath, parent)
+                    dest = "." if rel == "." else rel
+                    binaries.append((src, dest))
+                    count += 1
+                    print(f"[spec] native {pkg}: {fn} -> {dest}")
+            libs = pkg_dir + ".libs"
+            if os.path.isdir(libs):
+                dest_libs = os.path.basename(libs)
+                for fn in os.listdir(libs):
+                    if fn.lower().endswith(".dll"):
+                        binaries.append((os.path.join(libs, fn), dest_libs))
+                        count += 1
+                        print(f"[spec] native {pkg}: {dest_libs}/{fn}")
+        print(f"[spec] native walk {pkg}: {count} files")
+    except Exception as exc:
+        print(f"[spec] native walk {pkg} skipped: {exc}")
+
+
+for _pkg in ("polars", "pyarrow", "numpy"):
+    _collect_package_natives(_pkg)
 
 # Only force-bundle sqlite3 — do NOT copy libcrypto/libssl/_ssl manually.
 # PyInstaller + Python already ship matching OpenSSL for _ssl.pyd.
