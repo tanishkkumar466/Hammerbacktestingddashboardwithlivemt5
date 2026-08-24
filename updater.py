@@ -510,6 +510,7 @@ def _is_onedir_payload(payload_root: str) -> bool:
 _WINDOWS_UPDATE_BAT: list = [None]
 _UPDATE_LOG_NAME = "_hammer_update.log"
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+_CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 _DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 _PYI_RELAUNCH_ENV = "PYINSTALLER_RESET_ENVIRONMENT"
 
@@ -525,10 +526,61 @@ _PYI_PRIVATE_ENV_VARS = (
 
 
 def _strip_pyi_env(env: dict) -> dict:
-    """Return a copy of env safe for launching a fresh one-file Hammer instance."""
+    """Env safe for launching a fresh one-file Hammer instance (not for cmd helpers)."""
     cleaned = {k: v for k, v in env.items() if not str(k).startswith("_PYI_")}
     cleaned[_PYI_RELAUNCH_ENV] = "1"
     return cleaned
+
+
+def _clean_windows_helper_env() -> dict:
+    """
+    Minimal Windows env for the update CMD window.
+
+    Do NOT inherit the frozen app's full environment — leftover _PYI_* / Qt /
+    Python vars are why post-update relaunch dies while double-click works.
+    """
+    keys = (
+        "SystemRoot",
+        "windir",
+        "WINDIR",
+        "SystemDrive",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "USERNAME",
+        "USERDOMAIN",
+        "USERDOMAIN_ROAMINGPROFILE",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "ComSpec",
+        "PATHEXT",
+        "PUBLIC",
+        "ProgramData",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+    )
+    env: dict = {}
+    for key in keys:
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
+    sysroot = env.get("SystemRoot") or env.get("WINDIR") or r"C:\Windows"
+    env["PATH"] = os.pathsep.join(
+        [
+            os.path.join(sysroot, "System32"),
+            os.path.join(sysroot, "System32", "Wbem"),
+            os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0"),
+            sysroot,
+        ]
+    )
+    return env
 
 
 def update_log_path() -> str:
@@ -580,29 +632,46 @@ def _windows_clear_pyi_env_lines() -> list[str]:
     ]
     for _var in _PYI_PRIVATE_ENV_VARS:
         lines.append(f'set "{_var}="')
+    # Also clear MEIPASS leftovers from older bootloaders
+    lines.append('set "_MEIPASS2="')
     lines.append(f'set "{_PYI_RELAUNCH_ENV}=1"')
     return lines
 
 
 def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str]:
     """
-    Relaunch after update with a clean PyInstaller environment.
+    Relaunch after update the same way Explorer double-click does.
 
-    PyInstaller one-file apps inherit _PYI_* vars from the parent process. After
-    Check for Updates, cmd can still carry those vars unless cleared. The child
-    bootloader then fails with "Security validation failure" or missing DLL load.
+    Why local build works but Check-for-Updates does not
+    ----------------------------------------------------
+    Local / double-click: Explorer starts the exe with a clean environment.
+    Check for Updates: we used to spawn a HIDDEN cmd (CREATE_NO_WINDOW) that
+    still carried frozen-app env. Then `start` from that hidden process often
+    never shows the GUI — download finishes, app never opens.
 
-    Use plain `start` (not PowerShell) after env wipe — PowerShell is blocked on
-    some PCs and was a silent failure mode for relaunch.
+    Fix: wipe _PYI_*, then ShellExecute via rundll32 (same path as double-click),
+    with `start` as fallback. Update runs in a VISIBLE console so progress/errors
+    are visible.
     """
     lines = list(_windows_clear_pyi_env_lines())
-    lines.append(_bat_echo_log(log_path, "Relaunching Hammer..."))
-    lines.append(f'start "" /D "{root}" "{exe_path}"')
+    lines.append("echo.")
+    lines.append("echo Starting Hammer (same as double-click)...")
+    lines.append(_bat_echo_log(log_path, "Relaunching Hammer via ShellExecute..."))
+    # FileProtocolHandler == Explorer "open" — not a child of the frozen process
+    lines.append(f'rundll32 url.dll,FileProtocolHandler "{exe_path}"')
     lines.append("if errorlevel 1 (")
-    lines.append(_bat_echo_log(log_path, "UPDATE_FAILED relaunch start command"))
-    lines.append("  exit /b 1")
+    lines.append(_bat_echo_log(log_path, "ShellExecute failed — trying start"))
+    lines.append(f'  start "" /D "{root}" "{exe_path}"')
+    lines.append("  if errorlevel 1 (")
+    lines.append(_bat_echo_log(log_path, "UPDATE_FAILED relaunch"))
+    lines.append("    echo UPDATE FAILED — double-click the .exe manually")
+    lines.append("    pause")
+    lines.append("    exit /b 1")
+    lines.append("  )")
     lines.append(")")
     lines.append(_bat_echo_log(log_path, "UPDATE_OK relaunch started"))
+    lines.append("echo Done. This window will close in 5 seconds.")
+    lines.append("timeout /t 5 /nobreak >nul")
     return lines
 
 
@@ -693,15 +762,21 @@ def _write_windows_update_bat(*, pid: int, exe_path: str, lines: list[str]) -> s
 
 def _spawn_detached(cmd: list[str]) -> None:
     """
-    Spawn update/relaunch helper without leaking PyInstaller _PYI_* env into cmd.
+    Spawn the update CMD in a NEW VISIBLE console with a clean Windows env.
 
-    If cmd inherits _PYI_*, even a careful bat can relaunch Hammer as a 'child'
-    and trigger security validation failure after Check for Updates.
+    CREATE_NO_WINDOW was the main bug: hidden cmd + inherited _PYI_* meant
+    `start` never opened the GUI after download (local double-click still worked).
     """
-    env = _strip_pyi_env(os.environ.copy())
-    kwargs: dict = {"env": env, "close_fds": True}
     if os.name == "nt":
-        kwargs["creationflags"] = _CREATE_NO_WINDOW
+        env = _clean_windows_helper_env()
+        kwargs: dict = {
+            "env": env,
+            "cwd": app_root(),
+            "close_fds": True,
+            "creationflags": _CREATE_NEW_CONSOLE,
+        }
+    else:
+        kwargs = {"env": _strip_pyi_env(os.environ.copy()), "close_fds": True}
     subprocess.Popen(cmd, **kwargs)
 
 

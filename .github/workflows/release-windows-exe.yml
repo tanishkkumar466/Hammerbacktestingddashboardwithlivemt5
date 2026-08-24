@@ -70,6 +70,41 @@ jobs:
             Write-Warning "EXE is $mb MB (target ~430 MB). Check ray[default] deps in requirements-build.txt."
           }
 
+      - name: Smoke-test EXE starts (boot log)
+        shell: pwsh
+        run: |
+          # Catch the real bug: CI exe downloads fine but never opens (OpenSSL/DLL).
+          # hammer_boot.log is written by the runtime hook as soon as Python starts.
+          $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
+          Push-Location $work
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Hidden
+          $deadline = (Get-Date).AddSeconds(45)
+          $boot = $null
+          $crash = $null
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw; break }
+            if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw; break }
+            if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          Write-Host "==== hammer_boot.log ===="
+          if (Test-Path "hammer_boot.log") { Get-Content "hammer_boot.log" } else { Write-Host "(missing)" }
+          Write-Host "==== hammer_crash.log ===="
+          if (Test-Path "hammer_crash.log") { Get-Content "hammer_crash.log" } else { Write-Host "(none)" }
+          Pop-Location
+          if ($crash) { throw "EXE wrote hammer_crash.log — will not open on user PCs:`n$crash" }
+          if (-not $boot) {
+            throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL). Same as 'downloaded update won't open'."
+          }
+          if ($boot -notmatch "python started") {
+            throw "hammer_boot.log incomplete:`n$boot"
+          }
+          Write-Host "Smoke OK — Python bootloader path works."
+
       - name: Upload EXE to GitHub Release
         uses: softprops/action-gh-release@v2
         with:

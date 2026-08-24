@@ -68,6 +68,34 @@ jobs:
           if ($size -lt 400MB) { throw "EXE too small ($mb MB) — expected ~420-450 MB" }
           if ($size -lt 420MB) { Write-Warning "EXE is $mb MB (target ~430 MB)" }
 
+      - name: Smoke-test EXE starts (boot log)
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
+          Push-Location $work
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Hidden
+          $deadline = (Get-Date).AddSeconds(45)
+          $boot = $null
+          $crash = $null
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw; break }
+            if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw; break }
+            if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          Write-Host "==== hammer_boot.log ===="
+          if (Test-Path "hammer_boot.log") { Get-Content "hammer_boot.log" } else { Write-Host "(missing)" }
+          Write-Host "==== hammer_crash.log ===="
+          if (Test-Path "hammer_crash.log") { Get-Content "hammer_crash.log" } else { Write-Host "(none)" }
+          Pop-Location
+          if ($crash) { throw "EXE wrote hammer_crash.log:`n$crash" }
+          if (-not $boot) { throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL)." }
+          Write-Host "Smoke OK"
+
       - name: Package delivery zip
         shell: pwsh
         run: |

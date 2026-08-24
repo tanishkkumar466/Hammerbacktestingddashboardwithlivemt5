@@ -159,25 +159,20 @@ for _data_pkg in ("matplotlib", "certifi", "tzdata", "pyarrow", "PySide6", "shib
     except Exception as exc:
         print(f"[spec] collect_data_files({_data_pkg}) skipped: {exc}")
 
-# Extra native libs — do NOT dedupe by basename; different folders need their own copies.
+# Extra native libs for packages PyInstaller often under-collects.
+# Keep collect_dynamic_libs — but NEVER force-copy libcrypto/libssl into the
+# bundle root (that caused OpenSSL mismatches: CI exe won't open, local can).
 for _dyn in (
     "PySide6", "shiboken6", "polars", "pyarrow", "numpy",
     "pydantic_core", "grpc", "rpds", "matplotlib", "PIL", "psutil",
 ):
     _collect_dynamic(_dyn)
 
-# Windows Python stdlib .pyd + OpenSSL (fixes "LoadLibrary / specified module could not be found")
+# Only force-bundle sqlite3 — do NOT copy libcrypto/libssl/_ssl manually.
+# PyInstaller + Python already ship matching OpenSSL for _ssl.pyd.
+# Manually adding libcrypto-3.dll / libssl-3.dll next to Qt's libcrypto-3-x64.dll
+# makes the CI one-file exe crash on start ("module could not be found" / silent exit).
 if sys.platform == "win32":
-    _win_native = (
-        "_sqlite3.pyd", "sqlite3.dll",
-        "_ssl.pyd", "_hashlib.pyd",
-        "libcrypto-3.dll", "libssl-3.dll",
-        "_bz2.pyd", "_lzma.pyd", "_ctypes.pyd",
-        "_socket.pyd", "select.pyd",
-        "pyexpat.pyd", "_elementtree.pyd",
-        "unicodedata.pyd", "_decimal.pyd",
-        "_multiprocessing.pyd",
-    )
     for base in (
         sysconfig.get_path("stdlib"),
         os.path.join(sys.base_prefix, "DLLs"),
@@ -185,18 +180,69 @@ if sys.platform == "win32":
     ):
         if not base or not os.path.isdir(base):
             continue
-        for fname in _win_native:
+        for fname in ("_sqlite3.pyd", "sqlite3.dll"):
             fpath = os.path.join(base, fname)
             if os.path.isfile(fpath):
                 binaries.append((fpath, "."))
                 print(f"[spec] bundled {fname}")
-        for fname in os.listdir(base):
-            if fname.lower().startswith("libffi") and fname.lower().endswith(".dll"):
-                binaries.append((os.path.join(base, fname), "."))
-                print(f"[spec] bundled {fname}")
 
-# Do NOT dedupe binaries — keeping "first" copy dropped Qt/OpenSSL DLLs and caused
-# "The specified module could not be found" on Windows.
+
+def _binary_src(item) -> str:
+    if isinstance(item, (tuple, list)) and item:
+        return str(item[0])
+    return str(item)
+
+
+def _is_openssl_dll(path: str) -> bool:
+    name = os.path.basename(path).lower()
+    return name.startswith("libssl") or name.startswith("libcrypto")
+
+
+def _openssl_priority(path: str) -> int:
+    """Higher = keep. Prefer Python's DLLs and PySide6 over random PATH copies."""
+    low = path.replace("\\", "/").lower()
+    score = 0
+    if "pyside6" in low or "shiboken6" in low:
+        score += 100
+    if "/dlls/" in low or low.endswith("/dlls") or "\\dlls\\" in path.lower():
+        score += 80
+    if "python" in low:
+        score += 40
+    if "program files" in low and "python" not in low:
+        score -= 200  # MySQL / FireDaemon / HP OpenSSL on CI runners
+    if "openssl" in low and "python" not in low and "pyside" not in low:
+        score -= 100
+    return score
+
+
+def _sanitize_binaries(items: list) -> list:
+    """
+    Drop conflicting OpenSSL DLLs collected from PATH (common on GitHub Actions).
+    Keep at most one libssl* / libcrypto* pair from the best source.
+    """
+    openssl: dict[str, tuple[int, object]] = {}
+    out: list = []
+    for item in items:
+        src = _binary_src(item)
+        if not _is_openssl_dll(src):
+            out.append(item)
+            continue
+        # Normalize key: libssl-3.dll and libssl-3-x64.dll are different Qt vs CPython names
+        key = os.path.basename(src).lower()
+        pri = _openssl_priority(src)
+        prev = openssl.get(key)
+        if prev is None or pri > prev[0]:
+            if prev is not None:
+                print(f"[spec] drop weaker OpenSSL: {_binary_src(prev[1])} (pri={prev[0]})")
+            openssl[key] = (pri, item)
+            print(f"[spec] keep OpenSSL: {src} (pri={pri})")
+        else:
+            print(f"[spec] drop OpenSSL: {src} (pri={pri} < {prev[0]})")
+    out.extend(item for _, item in openssl.values())
+    return out
+
+
+binaries = _sanitize_binaries(binaries)
 
 _exe_icon = None
 for icon_name in ("logo.ico", "app_icon.ico"):
@@ -220,6 +266,10 @@ a = Analysis(
     cipher=None,
     noarchive=False,
 )
+
+# Analysis discovers more DLLs from PATH — sanitize again (CI runners often have
+# MySQL/FireDaemon OpenSSL that break the frozen exe on a clean user PC).
+a.binaries = _sanitize_binaries(list(a.binaries))
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=None)
 
