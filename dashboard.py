@@ -10529,13 +10529,36 @@ def _generate_checkmark_icon() -> str:
 # ============================================================================
 def launch() -> None:
     """Start the Qt dashboard. Used by python dashboard.py and by frozen main.py."""
+    from hammer_boot import boot_log, write_crash
+
+    boot_log("launch: start")
+    # Never inherit offscreen/minimal platform from CI smoke or parent env
+    os.environ.pop("QT_QPA_PLATFORM", None)
+
     if sys.platform == "darwin":
         # Discard any legacy dock layout before Qt reads it (prevents off-screen float restore).
         _early_settings = QSettings("HammerDashboard", "BacktestDashboard")
         _early_settings.remove("window/dockState")
         del _early_settings
 
-    app = QApplication(sys.argv)
+    try:
+        if getattr(sys, "frozen", False):
+            # Avoid silent GPU/OpenGL crashes on some Windows PCs (CI used offscreen — real
+            # qwindows path was never tested until the user double-clicks).
+            from PySide6.QtCore import Qt
+            from PySide6.QtGui import QGuiApplication
+
+            QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
+            boot_log("launch: AA_UseSoftwareOpenGL set")
+
+        boot_log("launch: QApplication() ...")
+        app = QApplication(sys.argv)
+        boot_log("launch: QApplication OK")
+    except Exception as exc:
+        boot_log(f"launch: QApplication FAILED: {exc}")
+        write_crash(exc)
+        raise
+
     QDir.addSearchPath("checkicon", _generate_checkmark_icon())
     app.setStyleSheet(STYLESHEET)
 
@@ -10547,10 +10570,20 @@ def launch() -> None:
             app.setWindowIcon(app_icon)
             break
 
-    window = BacktestDashboard()
+    try:
+        boot_log("launch: BacktestDashboard() ...")
+        window = BacktestDashboard()
+        boot_log("launch: BacktestDashboard OK")
+    except Exception as exc:
+        boot_log(f"launch: BacktestDashboard FAILED: {exc}")
+        write_crash(exc)
+        raise
+
     if not app.windowIcon().isNull():
         window.setWindowIcon(app.windowIcon())
+    boot_log("launch: window.show() ...")
     window.show()
+    boot_log("launch: app.exec() ...")
     sys.exit(app.exec())
 
 

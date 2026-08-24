@@ -58,7 +58,7 @@ hiddenimports = [
     "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker", "live",
     "live_journal", "fetch", "sessions", "hammer_context_logic",
     "telegram_notify", "telegram_workers", "version", "updater",
-    "update_workers", "update_window",
+    "update_workers", "update_window", "hammer_boot",
     "indicators", "indicators.config", "indicators.filter", "indicators.registry",
     "indicators.supertrend", "indicators.vwap",
     # --- stdlib ---

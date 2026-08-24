@@ -89,8 +89,9 @@ jobs:
           Push-Location $work
           $sys32 = Join-Path $env:SystemRoot "System32"
           $env:PATH = "$sys32;$env:SystemRoot"
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Hidden
+          # MUST use real qwindows — offscreen hid the bug where GUI never opens on user PCs.
+          Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Normal
           $deadline = (Get-Date).AddSeconds(45)
           $boot = $null
           $crash = $null
@@ -110,10 +111,10 @@ jobs:
           if (-not $boot) {
             throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL). Same as 'downloaded update won't open'."
           }
-          if ($boot -notmatch "python started") {
-            throw "hammer_boot.log incomplete:`n$boot"
+          if ($boot -notmatch "QApplication OK") {
+            throw "hammer_boot.log missing QApplication OK — real qwindows path failed:`n$boot"
           }
-          Write-Host "Smoke OK — Python bootloader path works (minimal PATH)."
+          Write-Host "Smoke OK — real qwindows platform + QApplication works (minimal PATH)."
 
       - name: Upload EXE to GitHub Release
         uses: softprops/action-gh-release@v2

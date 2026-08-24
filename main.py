@@ -62,7 +62,12 @@ def _report_pending_update_failure() -> None:
 
 
 def _run_dashboard() -> None:
+    from hammer_boot import boot_log, enable_faulthandler
+
+    enable_faulthandler()
+    boot_log("main: _run_dashboard start")
     os.chdir(_app_dir())
+    boot_log(f"main: cwd={os.getcwd()}")
     # Stepwise imports in frozen builds — pinpoints "module could not be found" DLL errors.
     if getattr(sys, "frozen", False):
         for mod in (
@@ -72,13 +77,18 @@ def _run_dashboard() -> None:
             "matplotlib", "PIL",
         ):
             try:
+                boot_log(f"main: import {mod} ...")
                 __import__(mod)
+                boot_log(f"main: import {mod} OK")
             except Exception as exc:
                 raise ImportError(
                     f"Hammer could not load native library for '{mod}': {exc}\n"
                     "Usually a missing .dll in the exe bundle (rebuild with latest spec)."
                 ) from exc
+    boot_log("main: import dashboard ...")
     import dashboard
+    boot_log("main: import dashboard OK")
+    boot_log("main: dashboard.launch() ...")
     dashboard.launch()
 
 
@@ -142,6 +152,11 @@ def main() -> int:
     # If this process was launched as a fresh instance after update, drop the
     # public reset flag so child workers (ray/multiprocessing) behave normally.
     os.environ.pop("PYINSTALLER_RESET_ENVIRONMENT", None)
+
+    if getattr(sys, "frozen", False):
+        from hammer_boot import boot_log
+
+        boot_log("main: entered")
 
     _report_pending_update_failure()
     _cleanup_stale_update_artifacts()
