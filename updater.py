@@ -275,6 +275,8 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
             if name == "hammercandlebacktestdashboard.exe" and size >= 350_000_000:
                 return asset
 
+    frozen = bool(getattr(sys, "frozen", False))
+
     def score(asset: dict) -> int:
         name = str(asset.get("name", "")).lower()
         size = int(asset.get("size", 0) or 0)
@@ -294,6 +296,9 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
                 pts += 30
             elif size and size < 350_000_000:
                 pts -= 80
+            # From source: never prefer a Windows .exe over a source zip
+            if not frozen:
+                pts -= 250
         if name == "hammercandlebacktestdashboard.exe":
             pts += 60
         if "windows" in name:
@@ -307,7 +312,10 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
             # Source-only git archive (~300 KB) — never use for frozen Windows
             if size and size < 5_000_000:
                 pts -= 150
-        if getattr(sys, "frozen", False) and name.endswith(".zip"):
+            # From source: prefer Hammer source / delivery zips
+            if not frozen and "hammer" in name:
+                pts += 200
+        if frozen and name.endswith(".zip"):
             if "windows" not in name and not name.endswith(".exe"):
                 if name.startswith("hammer-") or name.endswith("src.zip"):
                     pts -= 120
@@ -315,7 +323,7 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
 
     ranked = sorted(assets, key=score, reverse=True)
     best = ranked[0]
-    if getattr(sys, "frozen", False) and score(best) < 40:
+    if frozen and score(best) < 40:
         return None
     return best
 

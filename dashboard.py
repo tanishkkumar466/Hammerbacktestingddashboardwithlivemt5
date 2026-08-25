@@ -3154,6 +3154,11 @@ class LiveSettingsDialog(QDialog):
             d.live_adv_ray = QCheckBox("Use Ray if installed (optional)")
         d.live_adv_thread_pool.setChecked(d._live_thread_pool_checked())
         d.live_adv_ray.setChecked(d._live_ray_checked())
+        if getattr(sys, "frozen", False):
+            d.live_adv_ray.setEnabled(False)
+            d.live_adv_ray.setToolTip(
+                "Not available in packaged exe — Ray spawns console workers that freeze/crash the app."
+            )
         adv_layout.addWidget(d.live_adv_thread_pool)
         adv_layout.addWidget(d.live_adv_ray)
         adv_layout.addStretch()
@@ -3715,7 +3720,16 @@ class BacktestDashboard(QMainWindow):
         self._live_action_ray = QAction("Use Ray if installed", self)
         self._live_action_ray.setCheckable(True)
         self._live_action_ray.setChecked(False)
-        self._live_action_ray.setToolTip("Optional: pip install ray — falls back to thread pool if unavailable.")
+        ray_tip = (
+            "Not available in packaged exe (crashes). "
+            "Optional when running from source: pip install ray."
+        ) if getattr(sys, "frozen", False) else (
+            "Optional: pip install ray — falls back to thread pool if unavailable."
+        )
+        self._live_action_ray.setToolTip(ray_tip)
+        if getattr(sys, "frozen", False):
+            self._live_action_ray.setEnabled(False)
+            self._live_action_ray.setChecked(False)
         self._live_action_ray.triggered.connect(self._on_live_performance_menu_changed)
         perf_menu.addAction(self._live_action_ray)
 
@@ -3777,6 +3791,8 @@ class BacktestDashboard(QMainWindow):
         return True
 
     def _live_ray_checked(self) -> bool:
+        if getattr(sys, "frozen", False):
+            return False
         if hasattr(self, "_live_action_ray"):
             return self._live_action_ray.isChecked()
         return False
@@ -7059,7 +7075,12 @@ class BacktestDashboard(QMainWindow):
         if hasattr(self, "_live_action_dry_run"):
             self._live_action_dry_run.setChecked(s.value("live/dry_run", True, type=bool))
             self._live_action_thread_pool.setChecked(s.value("live/use_thread_pool", True, type=bool))
-            self._live_action_ray.setChecked(s.value("live/use_ray", False, type=bool))
+            # Packaged exe: never restore Ray — it freezes/crashes the frozen app.
+            if getattr(sys, "frozen", False):
+                self._live_action_ray.setChecked(False)
+                self._live_action_ray.setEnabled(False)
+            else:
+                self._live_action_ray.setChecked(s.value("live/use_ray", False, type=bool))
         if hasattr(self, "live_demo_only"):
             self.live_demo_only.setChecked(s.value("live/demo_only", False, type=bool))
             self.live_max_daily_trades.setText(s.value("live/max_daily_trades", "10", type=str))

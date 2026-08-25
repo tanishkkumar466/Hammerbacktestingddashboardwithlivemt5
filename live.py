@@ -8,6 +8,7 @@ Risk limits are enforced only from LiveRunConfig (Live tab), not backtest settin
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 import traceback
@@ -32,6 +33,11 @@ LogFn = Callable[[str], None]
 
 MAX_CONSECUTIVE_POLL_ERRORS = 25
 SIGNAL_COMPUTE_TIMEOUT_SEC = 90.0
+
+
+def _is_frozen_build() -> bool:
+    """True when running as a PyInstaller one-file/one-dir exe (Ray must stay off)."""
+    return bool(getattr(sys, "frozen", False))
 
 
 def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_type: str) -> str:
@@ -396,12 +402,23 @@ class LiveTradingEngine:
         self._telegram = telegram_notify.TelegramNotifier.from_live_config(live_config, log)
 
     def _try_init_ray(self):
+        if _is_frozen_build():
+            self.log(
+                "[LIVE] Ray disabled in packaged exe — it spawns console workers that "
+                "freeze/crash the app. Thread pool is used instead."
+            )
+            return
         try:
-            import psutil  # noqa: F401 — required by Ray; bundled in frozen exe
+            import psutil  # noqa: F401 — required by Ray
             import ray  # type: ignore
 
             if not ray.is_initialized():
-                ray.init(ignore_reinit_error=True, num_cpus=2, include_dashboard=False, logging_level="ERROR")
+                ray.init(
+                    ignore_reinit_error=True,
+                    num_cpus=2,
+                    include_dashboard=False,
+                    logging_level="ERROR",
+                )
 
             @ray.remote
             def _ray_find(
@@ -582,6 +599,15 @@ class LiveTradingEngine:
         finally:
             if self._executor is not None:
                 self._executor.shutdown(wait=False, cancel_futures=True)
+            if self._ray_remote is not None:
+                try:
+                    import ray  # type: ignore
+
+                    if ray.is_initialized():
+                        ray.shutdown()
+                except Exception:
+                    pass
+                self._ray_remote = None
             self.touch_heartbeat()
             self.log("[LIVE] Worker exited.")
 
@@ -1024,14 +1050,14 @@ class LiveTradingEngine:
                                 f"but Direction tab is NO — no order."
                             )
                 elif self.pattern_type in ("hammer_with_candles", "hammer_context") and len(closed) >= 2:
-                    cfg = self.strategy_config
+                    ctx_cfg = self.strategy_config
                     idx = len(closed) - 1
                     signal_bar = closed[idx]
                     body_pct = hammer_context_logic.body_pct_of_candle(
-                        signal_bar, getattr(cfg, "min_range", 1e-9),
+                        signal_bar, getattr(ctx_cfg, "min_range", 1e-9),
                     )
-                    buy_fail = hammer_context_logic.detect_buy_setup(closed, idx, cfg)
-                    sell_fail = hammer_context_logic.detect_sell_setup(closed, idx, cfg)
+                    buy_fail = hammer_context_logic.detect_buy_setup(closed, idx, ctx_cfg)
+                    sell_fail = hammer_context_logic.detect_sell_setup(closed, idx, ctx_cfg)
                     self.log(
                         f"[LIVE] Signal bar body={body_pct:.1f}% of range "
                         f"(wick-off uses this vs Body tab cap)"
@@ -1085,15 +1111,15 @@ class LiveTradingEngine:
                 f"row: {logic.entry_rule_label_for_variant(self.strategy_config, variant)}"
             )
         elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
-            cfg = self.strategy_config
-            n = getattr(cfg, "lookback_candles", "?")
+            ctx_cfg = self.strategy_config
+            n = getattr(ctx_cfg, "lookback_candles", "?")
             body_pct = hammer_context_logic.body_pct_of_candle(
-                sig.hammer_candle, getattr(cfg, "min_range", 1e-9),
+                sig.hammer_candle, getattr(ctx_cfg, "min_range", 1e-9),
             )
             if sig.direction == logic.TradeDirection.BUY:
                 wick_note = (
                     "body only, prev red→BUY, signal color ignored"
-                    if not getattr(cfg, "buy_require_wick", True)
+                    if not getattr(ctx_cfg, "buy_require_wick", True)
                     else "classic wick required"
                 )
                 self.log(
@@ -1104,7 +1130,7 @@ class LiveTradingEngine:
             else:
                 wick_note = (
                     "body only, prev green→SELL, signal color ignored"
-                    if not getattr(cfg, "sell_require_wick", True)
+                    if not getattr(ctx_cfg, "sell_require_wick", True)
                     else "inverted wick required"
                 )
                 self.log(
@@ -1118,9 +1144,9 @@ class LiveTradingEngine:
                 else logic.HammerVariant.CLASSIC
             )
             trade_cfg = (
-                cfg.to_buy_trade_config()
+                ctx_cfg.to_buy_trade_config()
                 if sig.direction == logic.TradeDirection.BUY
-                else cfg.to_sell_trade_config()
+                else ctx_cfg.to_sell_trade_config()
             )
             self.log(
                 f"[SIGNAL] Entry/SL row: "

@@ -42,15 +42,31 @@ def test_pick_zip_for_source_mode(monkeypatch):
     assert picked["name"].endswith(".zip")
 
 
-def test_pick_windows_zip_when_frozen(monkeypatch):
+def test_pick_large_exe_when_frozen(monkeypatch):
+    """Packaged app must prefer the real ~430 MB exe, not tiny source zips."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    assets = [
+        {"name": "Hammer-1.0.4.zip", "browser_download_url": "https://x/src", "size": 100},
+        {
+            "name": "HammerCandleBacktestDashboard.exe",
+            "browser_download_url": "https://x/e",
+            "size": 430_000_000,
+        },
+    ]
+    picked = updater._pick_release_asset(assets)
+    assert picked is not None
+    assert picked["name"].endswith(".exe")
+    assert int(picked["size"]) >= 350_000_000
+
+
+def test_reject_tiny_assets_when_frozen(monkeypatch):
+    """Frozen update with only tiny zips must refuse (would brick the install)."""
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
     assets = [
         {"name": "Hammer-1.0.4.zip", "browser_download_url": "https://x/src", "size": 100},
         {"name": "HammerCandleBacktestDashboard-windows.zip", "browser_download_url": "https://x/win", "size": 200},
     ]
-    picked = updater._pick_release_asset(assets)
-    assert picked is not None
-    assert "windows" in picked["name"]
+    assert updater._pick_release_asset(assets) is None
 
 
 def test_tree_has_source_only_layout(tmp_path):
