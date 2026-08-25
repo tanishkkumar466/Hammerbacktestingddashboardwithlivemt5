@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -705,6 +706,16 @@ def _bat_echo_log(log_path: str, message: str) -> str:
     return f'echo {safe}>>"{log_path}"'
 
 
+def _bat_sleep_seconds(seconds: int) -> str:
+    """
+    Delay without `timeout` — timeout.exe often hangs forever when stdin is
+    not a real console (common after CREATE_NEW_CONSOLE / detached spawn).
+    """
+    # ping -n N waits ~N-1 seconds
+    n = max(2, int(seconds) + 1)
+    return f"ping -n {n} 127.0.0.1 >nul"
+
+
 def _windows_clear_pyi_env_lines() -> list[str]:
     """Strip PyInstaller private env vars before relaunching a one-file exe."""
     lines = [
@@ -722,25 +733,27 @@ def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str
     """
     Relaunch after update the same way Explorer double-click does.
 
-    Why local build works but Check-for-Updates does not
-    ----------------------------------------------------
-    Local / double-click: Explorer starts the exe with a clean environment.
-    Check for Updates: we used to spawn a HIDDEN cmd (CREATE_NO_WINDOW) that
-    still carried frozen-app env. Then `start` from that hidden process often
-    never shows the GUI — download finishes, app never opens.
-
-    Fix: wipe _PYI_*, then ShellExecute via rundll32 (same path as double-click),
-    with `start` as fallback. Update runs in a VISIBLE console so progress/errors
-    are visible.
+    Prefer PowerShell Start-Process (reliable WorkingDirectory + no inherited
+    PyInstaller env). Fall back to `start`. Avoid rundll32 FileProtocolHandler —
+    it often returns success without actually launching a large one-file exe.
     """
     lines = list(_windows_clear_pyi_env_lines())
     lines.append("echo.")
-    lines.append("echo Starting Hammer (same as double-click)...")
-    lines.append(_bat_echo_log(log_path, "Relaunching Hammer via ShellExecute..."))
-    # FileProtocolHandler == Explorer "open" — not a child of the frozen process
-    lines.append(f'rundll32 url.dll,FileProtocolHandler "{exe_path}"')
+    lines.append("echo Starting Hammer...")
+    lines.append(_bat_echo_log(log_path, "Unblocking new exe (Mark of the Web)..."))
+    ps_exe = exe_path.replace("'", "''")
+    ps_root = root.replace("'", "''")
+    lines.append(
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        f"\"try {{ Unblock-File -LiteralPath '{ps_exe}' }} catch {{ }}\""
+    )
+    lines.append(_bat_echo_log(log_path, "Relaunching Hammer via Start-Process..."))
+    lines.append(
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+        f"\"Start-Process -FilePath '{ps_exe}' -WorkingDirectory '{ps_root}'\""
+    )
     lines.append("if errorlevel 1 (")
-    lines.append(_bat_echo_log(log_path, "ShellExecute failed — trying start"))
+    lines.append(_bat_echo_log(log_path, "Start-Process failed — trying start"))
     lines.append(f'  start "" /D "{root}" "{exe_path}"')
     lines.append("  if errorlevel 1 (")
     lines.append(_bat_echo_log(log_path, "UPDATE_FAILED relaunch"))
@@ -750,44 +763,72 @@ def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str
     lines.append("  )")
     lines.append(")")
     lines.append(_bat_echo_log(log_path, "UPDATE_OK relaunch started"))
-    lines.append("echo Done. This window will close in 5 seconds.")
-    lines.append("timeout /t 5 /nobreak >nul")
+    lines.append("echo Done. This window will close in a few seconds.")
+    lines.append(_bat_sleep_seconds(4))
     return lines
 
 
 def _windows_wait_for_exit_lines(*, pid: int, exe_path: str, log_path: str) -> list[str]:
-    """Wait until Hammer fully exits (PID + process image name)."""
+    """
+    Wait until Hammer exits, then force-clear leftover one-file bootloader
+    processes so the .exe is not locked forever (the old infinite imagename
+    wait is what froze updates after download).
+    """
     exe_name = os.path.basename(exe_path)
-    label_pid = f"wait_pid_{pid}"
-    label_img = "wait_img"
     return [
-        _bat_echo_log(log_path, f"Waiting for Hammer PID {pid} to exit..."),
-        f":{label_pid}",
-        f'tasklist /FI "PID eq {pid}" 2>nul | find /I "{pid}" >nul',
-        "if %ERRORLEVEL%==0 (",
-        "  timeout /t 1 /nobreak >nul",
-        f"  goto {label_pid}",
+        _bat_echo_log(log_path, f"Waiting for Hammer PID {pid} to exit (max ~90s)..."),
+        "set WAIT_N=0",
+        ":wait_pid",
+        f'tasklist /FI "PID eq {pid}" 2>nul | findstr /I /C:"{pid}" >nul',
+        "if errorlevel 1 goto wait_pid_done",
+        "set /a WAIT_N+=1",
+        "if !WAIT_N! GEQ 90 (",
+        _bat_echo_log(log_path, f"PID {pid} still alive after 90s — force continuing"),
+        "  goto wait_pid_done",
         ")",
-        _bat_echo_log(log_path, f"Waiting for {exe_name} processes to finish..."),
-        f":{label_img}",
-        f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul',
-        "if %ERRORLEVEL%==0 (",
-        "  timeout /t 1 /nobreak >nul",
-        f"  goto {label_img}",
+        _bat_sleep_seconds(1),
+        "goto wait_pid",
+        ":wait_pid_done",
+        _bat_echo_log(log_path, "PID gone — clearing leftover Hammer processes..."),
+        # One-file PyInstaller leaves a parent bootloader briefly (same image name).
+        # Cap retries; never loop forever.
+        "set KILL_N=0",
+        ":kill_loop",
+        f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | findstr /I /C:"{exe_name}" >nul',
+        "if errorlevel 1 goto kill_done",
+        "set /a KILL_N+=1",
+        "if !KILL_N! GEQ 15 (",
+        _bat_echo_log(log_path, "WARN leftover processes after force-kill attempts — continuing"),
+        "  goto kill_done",
         ")",
-        # one-file parent bootloader may still hold the exe briefly
-        "timeout /t 3 /nobreak >nul",
+        f'taskkill /F /IM "{exe_name}" /T >nul 2>&1',
+        _bat_sleep_seconds(2),
+        "goto kill_loop",
+        ":kill_done",
+        _bat_echo_log(log_path, "Process wait finished — replacing exe"),
+        _bat_sleep_seconds(2),
     ]
 
 
 def _windows_replace_exe_lines(*, staged: str, current_exe: str, log_path: str) -> list[str]:
-    """Replace running one-file exe with retries; log failures to update log."""
+    """Replace running one-file exe with retries on both move and copy."""
     return [
         _bat_echo_log(log_path, "Replacing executable..."),
         f'del /F /Q "{current_exe}.old" 2>nul',
+        "set MOVE_TRIES=0",
+        ":move_retry",
+        "set /a MOVE_TRIES+=1",
         f'move /Y "{current_exe}" "{current_exe}.old"',
         "if errorlevel 1 (",
+        "  if !MOVE_TRIES! lss 40 (",
+        _bat_echo_log(log_path, "move retry (exe still locked)"),
+        "    " + _bat_sleep_seconds(2),
+        f'    taskkill /F /IM "{os.path.basename(current_exe)}" /T >nul 2>&1',
+        "    goto move_retry",
+        "  )",
         _bat_echo_log(log_path, "UPDATE_FAILED could not move old exe (still locked?)"),
+        "  echo Could not replace exe — close Hammer and antivirus, then retry.",
+        "  pause",
         "  exit /b 1",
         ")",
         "set COPY_TRIES=0",
@@ -795,12 +836,23 @@ def _windows_replace_exe_lines(*, staged: str, current_exe: str, log_path: str) 
         "set /a COPY_TRIES+=1",
         f'copy /Y "{staged}" "{current_exe}"',
         "if errorlevel 1 (",
-        "  if !COPY_TRIES! lss 30 (",
+        "  if !COPY_TRIES! lss 40 (",
         _bat_echo_log(log_path, "copy retry (exe still locked)"),
-        "    timeout /t 2 /nobreak >nul",
+        "    " + _bat_sleep_seconds(2),
         "    goto copy_retry",
         "  )",
-        _bat_echo_log(log_path, "UPDATE_FAILED copy failed after 30 tries"),
+        _bat_echo_log(log_path, "UPDATE_FAILED copy failed after retries"),
+        "  echo Restoring previous exe...",
+        f'  move /Y "{current_exe}.old" "{current_exe}" >nul 2>&1',
+        "  pause",
+        "  exit /b 1",
+        ")",
+        # Verify the new file is a full Windows build, not a tiny partial
+        f'for %%Z in ("{current_exe}") do set NEWSIZE=%%~zZ',
+        "if !NEWSIZE! LSS 350000000 (",
+        _bat_echo_log(log_path, "UPDATE_FAILED new exe too small after copy"),
+        f'  move /Y "{current_exe}.old" "{current_exe}" >nul 2>&1',
+        "  pause",
         "  exit /b 1",
         ")",
         f'del /F /Q "{staged}" 2>nul',
@@ -830,12 +882,17 @@ def _write_windows_update_bat(*, pid: int, exe_path: str, lines: list[str]) -> s
     script = [
         "@echo off",
         "setlocal EnableExtensions EnableDelayedExpansion",
+        "title Hammer — applying update",
         f'echo Hammer update started >"{log_path}"',
+        _bat_echo_log(log_path, "Apply script started"),
+        "echo Applying Hammer update — do not close this window.",
+        "echo.",
     ]
     script.extend(_windows_wait_for_exit_lines(pid=pid, exe_path=exe_path, log_path=log_path))
     script.extend(lines)
+    # Delete bat after relaunch scheduling (not mid-script)
     script.append('del /F /Q "%~f0" 2>nul')
-    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+    with open(bat, "w", encoding="ascii", newline="\r\n", errors="replace") as f:
         f.write("\r\n".join(script) + "\r\n")
     return bat
 
@@ -849,15 +906,23 @@ def _spawn_detached(cmd: list[str]) -> None:
     """
     if os.name == "nt":
         env = _clean_windows_helper_env()
+        comspec = env.get("ComSpec") or os.environ.get("ComSpec") or r"C:\Windows\System32\cmd.exe"
+        # Always invoke via full ComSpec path; wrap bat with "call" so errors propagate
+        if len(cmd) >= 3 and str(cmd[0]).lower() in ("cmd", "cmd.exe") and cmd[1].lower() == "/c":
+            bat = cmd[2]
+            argv = [comspec, "/d", "/c", "call", bat]
+        else:
+            argv = cmd
         kwargs: dict = {
             "env": env,
             "cwd": app_root(),
             "close_fds": True,
             "creationflags": _CREATE_NEW_CONSOLE,
         }
+        subprocess.Popen(argv, **kwargs)
     else:
         kwargs = {"env": _strip_pyi_env(os.environ.copy()), "close_fds": True}
-    subprocess.Popen(cmd, **kwargs)
+        subprocess.Popen(cmd, **kwargs)
 
 
 def _schedule_windows_onedir_update(payload_root: str, status_cb: Callable[[str], None]) -> str:
@@ -951,6 +1016,8 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
     update_bat = _WINDOWS_UPDATE_BAT[0]
     if update_bat and os.path.isfile(update_bat):
         _spawn_detached(["cmd", "/c", update_bat])
+        # Give the visible CMD a moment to start before we kill this process
+        time.sleep(1.0)
         os._exit(0)
 
     if os.name == "nt":
@@ -958,12 +1025,13 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
             _spawn_frozen_relaunch(python_exe, root)
         else:
             relauncher = os.path.join(root, "_hammer_relaunch.bat")
-            with open(relauncher, "w", encoding="utf-8", newline="\r\n") as f:
+            with open(relauncher, "w", encoding="ascii", newline="\r\n", errors="replace") as f:
                 f.write("@echo off\r\n")
-                f.write("timeout /t 1 /nobreak >nul\r\n")
+                f.write(f"{_bat_sleep_seconds(1)}\r\n")
                 f.write(f'start "" /D "{root}" "{python_exe}" "{main_script}"\r\n')
                 f.write('del /F /Q "%~f0" 2>nul\r\n')
             _spawn_detached(["cmd", "/c", relauncher])
+            time.sleep(0.5)
     else:
         if getattr(sys, "frozen", False):
             env = os.environ.copy()

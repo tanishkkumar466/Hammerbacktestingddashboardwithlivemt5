@@ -91,3 +91,33 @@ def test_load_token_from_txt_filename(monkeypatch):
 def test_normalize_github_token_strips_quotes_and_bom():
     assert updater._normalize_github_token('"ghp_abc"') == "ghp_abc"
     assert updater._normalize_github_token("\ufeffghp_abc") == "ghp_abc"
+
+
+def test_windows_update_bat_is_bounded_and_uses_ping(tmp_path, monkeypatch):
+    """Apply bat must never infinite-loop on imagename; use ping not timeout."""
+    monkeypatch.setattr(updater, "app_root", lambda: str(tmp_path))
+    bat = updater._write_windows_update_bat(
+        pid=12345,
+        exe_path=str(tmp_path / "HammerCandleBacktestDashboard.exe"),
+        lines=updater._windows_replace_exe_lines(
+            staged=str(tmp_path / "HammerCandleBacktestDashboard.exe.new"),
+            current_exe=str(tmp_path / "HammerCandleBacktestDashboard.exe"),
+            log_path=str(tmp_path / "_hammer_update.log"),
+        )
+        + updater._windows_relaunch_lines(
+            str(tmp_path),
+            str(tmp_path / "HammerCandleBacktestDashboard.exe"),
+            str(tmp_path / "_hammer_update.log"),
+        ),
+    )
+    text = open(bat, encoding="ascii", errors="replace").read()
+    assert "setlocal EnableExtensions EnableDelayedExpansion" in text
+    assert "WAIT_N" in text
+    assert "KILL_N" in text
+    assert "taskkill" in text
+    assert "ping -n" in text
+    assert "timeout /t" not in text
+    assert "Start-Process" in text
+    assert "MOVE_TRIES" in text
+    assert "rundll32" not in text
+

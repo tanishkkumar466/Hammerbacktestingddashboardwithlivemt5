@@ -173,11 +173,13 @@ class UpdateWindow(QDialog):
     def _on_install_done(self, app_root: str):
         self.icon_label.setText("✓")
         self.icon_label.setStyleSheet("color: #22c55e; font-size: 30px;")
-        self.title_label.setText("Update installed")
-        self.status_label.setText("Relaunching app...")
+        self.title_label.setText("Update downloaded")
+        self.status_label.setText(
+            "A console window will replace the .exe and restart Hammer — leave it open."
+        )
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
-        QTimer.singleShot(1000, lambda: updater.relaunch_and_exit(app_root))
+        QTimer.singleShot(800, lambda: updater.relaunch_and_exit(app_root))
 
     def _on_install_error(self, message: str):
         self.icon_label.setText("⚠")
