@@ -346,11 +346,101 @@ def disconnect_from_mt5(mt5, *, owned: bool = True, log=None):
     _log("[OK] MT5 connection closed.")
 
 
+def _safe_print(msg: str) -> None:
+    """print() can abort a windowed frozen exe when stdout is None/closed."""
+    try:
+        out = getattr(sys, "stdout", None)
+        if out is None:
+            return
+        print(msg)
+    except OSError:
+        pass
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _mt5_timestamp(dt: datetime) -> int:
     """Unix seconds for MT5 API (reliable on Windows vs naive/aware datetime)."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+    return int(_as_utc(dt).timestamp())
+
+
+def _rates_to_candles(rates) -> List[dict]:
+    """
+    Convert MT5 copy_rates_* output to candle dicts without crashing.
+
+    Native numpy records can carry bad timestamps; Windows fromtimestamp()
+    on those values raises OSError and has been seen to abort the process
+    if left uncaught around the C extension.
+    """
+    candles: List[dict] = []
+    if rates is None:
+        return candles
+    try:
+        n = len(rates)
+    except TypeError:
+        return candles
+    if n == 0:
+        return candles
+    for r in rates:
+        try:
+            ts = int(r["time"])
+            if ts <= 0 or ts >= 4_102_444_800:  # year 2100
+                continue
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+            candles.append({
+                "datetime": dt,
+                "open": float(r["open"]),
+                "high": float(r["high"]),
+                "low": float(r["low"]),
+                "close": float(r["close"]),
+                "volume": int(float(r["tick_volume"])),
+            })
+        except (OSError, OverflowError, ValueError, KeyError, TypeError, IndexError):
+            continue
+    return candles
+
+
+def _copy_rates_range_safe(mt5, symbol: str, timeframe_const, start: datetime, end: datetime):
+    """copy_rates_range can abort the process on some Windows MT5 builds."""
+    start_u = _as_utc(start)
+    end_u = _as_utc(end)
+    if end_u <= start_u:
+        return None
+    try:
+        rates = mt5.copy_rates_range(symbol, timeframe_const, start_u, end_u)
+    except Exception:
+        try:
+            rates = mt5.copy_rates_range(
+                symbol, timeframe_const, int(start_u.timestamp()), int(end_u.timestamp()),
+            )
+        except Exception:
+            return None
+    return rates
+
+
+def iter_fetch_subchunks(chunk_start: datetime, chunk_end: datetime, timeframe_label: str):
+    """
+    Split a month into week windows for small timeframes.
+
+    Requesting a full month of M1/M3 via one copy_rates_range has crashed
+    the MetaTrader5 C module (and the whole Hammer exe) on Windows.
+    """
+    minutes = TIMEFRAME_MINUTES.get(timeframe_label, 60)
+    if minutes > 5:
+        yield chunk_start, chunk_end
+        return
+    cur = chunk_start
+    step = timedelta(days=7)
+    while cur <= chunk_end:
+        piece_end = min(cur + step - timedelta(seconds=1), chunk_end)
+        if piece_end < cur:
+            break
+        yield cur, piece_end
+        cur = piece_end + timedelta(seconds=1)
 
 
 def verify_symbol(mt5, symbol: str, log=None) -> Tuple[bool, str]:
@@ -397,7 +487,11 @@ def warmup_mt5_history(mt5, symbol: str, mt5_timeframe_name: str, log=None) -> N
     try:
         tf = getattr(mt5, mt5_timeframe_name)
         mt5.symbol_select(symbol, True)
-        seed = mt5.copy_rates_from_pos(symbol, tf, 0, 500)
+        try:
+            seed = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
+        except Exception as exc:
+            _log(f"[WARN] History warm-up failed for {symbol}: {exc}")
+            return
         if seed is not None and len(seed) > 0:
             _log(f"[OK] MT5 history warm-up: {len(seed)} recent bar(s) for {symbol} [{mt5_timeframe_name}]")
         else:
@@ -416,52 +510,50 @@ def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, e
     silently treating a server hiccup as "no data for this period" --
     over a 20-year pull, transient failures WILL happen occasionally.
     """
-    timeframe_const = getattr(mt5, mt5_timeframe_name)
-    ts_from = _mt5_timestamp(start)
-    ts_to = _mt5_timestamp(end)
+    try:
+        timeframe_const = getattr(mt5, mt5_timeframe_name)
+    except AttributeError:
+        _safe_print(f"    [FAIL] This MT5 build has no {mt5_timeframe_name}")
+        return None
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
-        rates = mt5.copy_rates_range(symbol, timeframe_const, ts_from, ts_to)
+        try:
+            rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
+        except Exception as exc:
+            last_error = exc
+            rates = None
 
         if rates is not None:
             if len(rates) == 0 and attempt == 1:
                 # Terminal may not have synced history yet — trigger download once
                 try:
-                    mt5.copy_rates_from(symbol, timeframe_const, ts_to, 5000)
-                    rates = mt5.copy_rates_range(symbol, timeframe_const, ts_from, ts_to)
+                    mt5.copy_rates_from(symbol, timeframe_const, _as_utc(end), 500)
+                    rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
                 except Exception:
                     pass
 
             if rates is not None and len(rates) == 0:
                 return []  # genuinely no data for this period (e.g. before history starts)
 
-            candles = []
-            for r in rates:
-                candles.append({
-                    # MT5 timestamps are in the BROKER'S SERVER time, not
-                    # UTC. We keep it timezone-naive here and label it
-                    # clearly so nobody mistakes it for true UTC -- if you
-                    # need true UTC, convert using your broker's known
-                    # server UTC offset.
-                    "datetime": datetime.fromtimestamp(r["time"], tz=timezone.utc).replace(tzinfo=None),
-                    "open": float(r["open"]),
-                    "high": float(r["high"]),
-                    "low": float(r["low"]),
-                    "close": float(r["close"]),
-                    "volume": int(r["tick_volume"]),
-                })
-            return candles
+            return _rates_to_candles(rates)
 
         # rates is None -> request failed, retry
-        last_error = mt5.last_error()
-        print(f"    [WARN] copy_rates_range failed (attempt {attempt}/{MAX_RETRIES}), "
-              f"error: {last_error}. Retrying in {RETRY_DELAY_SECONDS}s...")
+        try:
+            last_error = mt5.last_error()
+        except Exception:
+            pass
+        _safe_print(
+            f"    [WARN] copy_rates_range failed (attempt {attempt}/{MAX_RETRIES}), "
+            f"error: {last_error}. Retrying in {RETRY_DELAY_SECONDS}s..."
+        )
         time.sleep(RETRY_DELAY_SECONDS)
 
-    print(f"    [FAIL] Giving up on {symbol} {mt5_timeframe_name} "
-          f"{start.date()}->{end.date()} after {MAX_RETRIES} attempts. "
-          f"Last error: {last_error}")
+    _safe_print(
+        f"    [FAIL] Giving up on {symbol} {mt5_timeframe_name} "
+        f"{start.date()}->{end.date()} after {MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
     return None  # explicit failure, distinct from [] (genuinely empty period)
 
 
@@ -640,10 +732,33 @@ def detect_latest_bar(
         return latest
 
     full_path = full_history_csv_path(symbol, timeframe_label, output_root=output_root)
-    candles = read_csv_candles(full_path)
-    if not candles:
+    return _last_csv_datetime(full_path)
+
+
+def _last_csv_datetime(filepath: str) -> Optional[datetime]:
+    """Last datetime in a CSV without loading the whole file into RAM."""
+    if not os.path.isfile(filepath):
         return None
-    return max(c["datetime"] for c in candles)
+    try:
+        with open(filepath, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size <= 0:
+                return None
+            chunk = min(size, 8192)
+            f.seek(-chunk, os.SEEK_END)
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed([ln.strip() for ln in tail.splitlines() if ln.strip()]):
+            if line.lower().startswith("datetime"):
+                continue
+            part = line.split(",", 1)[0].strip()
+            try:
+                return datetime.strptime(part, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+    except OSError:
+        return None
+    return None
 
 
 def detect_data_folder_symbols(output_root: Optional[str] = None) -> List[str]:
@@ -768,12 +883,14 @@ def print_quality_report(symbol: str, report: dict) -> None:
         status = "CLEAN"
     else:
         status = "NEEDS REVIEW"
-    print(f"  [QUALITY] {symbol} | {report['timeframe']}: "
-          f"{report['total_candles']} candles | "
-          f"dupes={report['duplicate_timestamps']} | "
-          f"bad_prices={report['invalid_price_rows']} | "
-          f"high<low={report['high_low_violations']} | "
-          f"gaps={report['suspicious_gaps']} | {status}")
+    _safe_print(
+        f"  [QUALITY] {symbol} | {report['timeframe']}: "
+        f"{report['total_candles']} candles | "
+        f"dupes={report['duplicate_timestamps']} | "
+        f"bad_prices={report['invalid_price_rows']} | "
+        f"high<low={report['high_low_violations']} | "
+        f"gaps={report['suspicious_gaps']} | {status}"
+    )
 
 
 # ============================================================================
@@ -795,7 +912,8 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
     _log = log or (lambda msg: print(msg))
     total_saved = 0
     failed_chunks = []
-    all_candles: List[dict] = []
+    quality_sample: List[dict] = []
+    QUALITY_SAMPLE_MAX = 8000
 
     if not use_mock and mt5 is not None and not history_warmed:
         warmup_mt5_history(mt5, symbol, mt5_timeframe_name, log=_log)
@@ -804,6 +922,8 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
 
     if not update_existing and os.path.exists(full_path):
         os.remove(full_path)
+
+    full_tip = _last_csv_datetime(full_path) if update_existing else None
 
     if CHUNK_BY == "month":
         chunks = list(iter_month_chunks(start, end))
@@ -819,12 +939,24 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
 
         period_label = f"{year}-{month:02d}" if month else str(year)
 
+        candles: List[dict] = []
+        sub_failed = False
         if use_mock:
             candles = fetch_from_mock(symbol, timeframe_label, chunk_start, chunk_end)
+            if candles is None:
+                sub_failed = True
         else:
-            candles = fetch_from_mt5(mt5, symbol, mt5_timeframe_name, chunk_start, chunk_end)
+            for sub_start, sub_end in iter_fetch_subchunks(
+                chunk_start, chunk_end, timeframe_label,
+            ):
+                part = fetch_from_mt5(mt5, symbol, mt5_timeframe_name, sub_start, sub_end)
+                if part is None:
+                    sub_failed = True
+                    continue
+                if part:
+                    candles.extend(part)
 
-        if candles is None:
+        if sub_failed and not candles:
             failed_chunks.append(period_label)
             continue
 
@@ -839,24 +971,25 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
             folder = month_folder(symbol, timeframe_label, year, output_root=output_root)
             out_path = os.path.join(folder, f"{symbol}_{timeframe_label}_{year}.csv")
 
-        before = len(read_csv_candles(out_path)) if update_existing else 0
+        before = 0
+        if update_existing and os.path.isfile(out_path):
+            before = len(read_csv_candles(out_path))
         written = write_or_merge_monthly(out_path, candles, merge=update_existing)
-        new_rows = max(0, written - before) if update_existing else written
+        new_rows = max(0, written - before) if update_existing else len(candles)
 
-        if update_existing:
-            # Append only bars newer than previous FULL tip (avoid full rewrite)
-            existing_full = read_csv_candles(full_path) if os.path.isfile(full_path) else []
-            if existing_full:
-                tip = max(c["datetime"] for c in existing_full)
-                to_append = [c for c in candles if c["datetime"] > tip]
-            else:
-                to_append = candles
-            if to_append:
-                append_to_full_history(full_path, to_append)
+        if update_existing and full_tip is not None:
+            to_append = [c for c in candles if c["datetime"] > full_tip]
         else:
-            append_to_full_history(full_path, candles)
+            to_append = candles
+        if to_append:
+            append_to_full_history(full_path, to_append)
+            tip_candidate = max(c["datetime"] for c in to_append)
+            if full_tip is None or tip_candidate > full_tip:
+                full_tip = tip_candidate
 
-        all_candles.extend(candles)
+        if len(quality_sample) < QUALITY_SAMPLE_MAX:
+            room = QUALITY_SAMPLE_MAX - len(quality_sample)
+            quality_sample.extend(candles[:room])
         total_saved += new_rows if update_existing else len(candles)
         _log(
             f"  [{symbol} | {timeframe_label}] {period_label}: "
@@ -871,7 +1004,7 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
             f"{len(failed_chunks)} period(s) FAILED after retries: {failed_chunks}"
         )
 
-    quality = check_data_quality(timeframe_label, all_candles)
+    quality = check_data_quality(timeframe_label, quality_sample)
 
     return {
         "total_saved": total_saved,

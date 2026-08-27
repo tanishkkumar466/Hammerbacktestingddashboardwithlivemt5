@@ -2522,6 +2522,9 @@ class FetchDataWorker(QThread):
             self.finished_ok.emit(result)
         except Exception as e:
             self.failed.emit(f"{e}\n{traceback.format_exc()}")
+        except BaseException as e:
+            # Catch SystemExit / KeyboardInterrupt-style aborts from MT5 wrappers
+            self.failed.emit(f"Fetch aborted: {e}")
 
 
 class FetchDataDialog(QDialog):

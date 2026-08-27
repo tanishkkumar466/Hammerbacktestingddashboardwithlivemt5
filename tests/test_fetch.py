@@ -92,9 +92,27 @@ def test_write_or_merge_monthly(tmp_path: Path):
     assert len(fetcher.read_csv_candles(str(path))) == 2
 
 
-def test_mt5_timestamp_uses_utc():
-    dt = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
-    assert fetcher._mt5_timestamp(dt) == int(dt.timestamp())
+def test_rates_to_candles_skips_bad_timestamps():
+    class Row(dict):
+        pass
+
+    good = Row(time=1_704_067_200, open=1, high=2, low=0.5, close=1.5, tick_volume=3)
+    bad = Row(time=-1, open=1, high=2, low=0.5, close=1.5, tick_volume=3)
+    candles = fetcher._rates_to_candles([good, bad])
+    assert len(candles) == 1
+    assert candles[0]["close"] == 1.5
+    assert candles[0]["volume"] == 3
+
+
+def test_iter_fetch_subchunks_splits_m1_not_h1():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 20, 23, 59, 59, tzinfo=timezone.utc)
+    m1 = list(fetcher.iter_fetch_subchunks(start, end, "1min"))
+    h1 = list(fetcher.iter_fetch_subchunks(start, end, "1hour"))
+    assert len(m1) >= 2
+    assert len(h1) == 1
+    assert h1[0][0] == start
+    assert h1[0][1] == end
 
 
 def test_verify_symbol_resolves_alias(monkeypatch):
