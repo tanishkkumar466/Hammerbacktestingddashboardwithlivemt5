@@ -748,9 +748,10 @@ def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str
         f"\"try {{ Unblock-File -LiteralPath '{ps_exe}' }} catch {{ }}\""
     )
     lines.append(_bat_echo_log(log_path, "Relaunching Hammer via Start-Process..."))
+    lines.append(f'if not defined HAMMER_LAUNCH set "HAMMER_LAUNCH={exe_path}"')
     lines.append(
         "powershell -NoProfile -ExecutionPolicy Bypass -Command "
-        f"\"Start-Process -FilePath '{ps_exe}' -WorkingDirectory '{ps_root}'\""
+        f"\"Start-Process -FilePath ([string]$env:HAMMER_LAUNCH) -WorkingDirectory '{ps_root}'\""
     )
     lines.append("if errorlevel 1 (")
     lines.append(_bat_echo_log(log_path, "Start-Process failed — trying start"))
@@ -768,13 +769,55 @@ def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str
     return lines
 
 
+def _swap_exe_while_running(staged: str, current_exe: str) -> bool:
+    """
+    Windows: rename the running one-file exe, then copy the new file into
+    the original name.
+
+    A running .exe can be RENAMED even when it cannot be deleted or
+    overwritten. Waiting until after exit (old bat `move`) is what failed
+    with "exe still locked" — Defender / bootloader still holds the path.
+    """
+    if os.name != "nt":
+        return False
+    old = current_exe + ".old"
+    try:
+        if os.path.isfile(old):
+            try:
+                os.remove(old)
+            except OSError:
+                old = current_exe + f".old.{os.getpid()}"
+        os.replace(current_exe, old)
+    except OSError:
+        return False
+    try:
+        shutil.copy2(staged, current_exe)
+        _unblock_windows_download(current_exe)
+        if os.path.getsize(current_exe) < 350_000_000:
+            raise OSError("copied exe too small")
+        try:
+            os.remove(staged)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        try:
+            if os.path.isfile(current_exe):
+                os.remove(current_exe)
+        except OSError:
+            pass
+        try:
+            os.replace(old, current_exe)
+        except OSError:
+            pass
+        return False
+
+
 def _windows_wait_for_exit_lines(*, pid: int, exe_path: str, log_path: str) -> list[str]:
     """
-    Wait until Hammer exits, then force-clear leftover one-file bootloader
-    processes so the .exe is not locked forever (the old infinite imagename
-    wait is what froze updates after download).
+    Wait until this Hammer PID exits. Do not taskkill by image name —
+    that re-locks the .exe while we try to replace it.
     """
-    exe_name = os.path.basename(exe_path)
     return [
         _bat_echo_log(log_path, f"Waiting for Hammer PID {pid} to exit (max ~90s)..."),
         "set WAIT_N=0",
@@ -789,74 +832,58 @@ def _windows_wait_for_exit_lines(*, pid: int, exe_path: str, log_path: str) -> l
         _bat_sleep_seconds(1),
         "goto wait_pid",
         ":wait_pid_done",
-        _bat_echo_log(log_path, "PID gone — clearing leftover Hammer processes..."),
-        # One-file PyInstaller leaves a parent bootloader briefly (same image name).
-        # Cap retries; never loop forever.
-        "set KILL_N=0",
-        ":kill_loop",
-        f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | findstr /I /C:"{exe_name}" >nul',
-        "if errorlevel 1 goto kill_done",
-        "set /a KILL_N+=1",
-        "if !KILL_N! GEQ 15 (",
-        _bat_echo_log(log_path, "WARN leftover processes after force-kill attempts — continuing"),
-        "  goto kill_done",
-        ")",
-        f'taskkill /F /IM "{exe_name}" /T >nul 2>&1',
-        _bat_sleep_seconds(2),
-        "goto kill_loop",
-        ":kill_done",
-        _bat_echo_log(log_path, "Process wait finished — replacing exe"),
-        _bat_sleep_seconds(2),
+        _bat_echo_log(log_path, "PID gone"),
+        # Do NOT taskkill /IM the exe — that re-locks the file during move.
+        _bat_echo_log(log_path, "Ready to finish update"),
+        _bat_sleep_seconds(3),
     ]
 
 
 def _windows_replace_exe_lines(*, staged: str, current_exe: str, log_path: str) -> list[str]:
-    """Replace running one-file exe with retries on both move and copy."""
+    """
+    Fallback if rename-while-running failed.
+
+    Copy the new file to a sidecar first (never blocked by the old lock),
+    try a short rename of the old exe, then either copy onto the original
+    name or launch the sidecar.
+    """
+    sidecar = (
+        current_exe[:-4] + "-updated.exe"
+        if current_exe.lower().endswith(".exe")
+        else current_exe + "-updated.exe"
+    )
     return [
-        _bat_echo_log(log_path, "Replacing executable..."),
+        _bat_echo_log(log_path, "Fallback replace via sidecar copy"),
+        f'copy /Y "{staged}" "{sidecar}"',
+        "if errorlevel 1 (",
+        _bat_echo_log(log_path, "UPDATE_FAILED could not copy sidecar"),
+        "  pause",
+        "  exit /b 1",
+        ")",
+        f'powershell -NoProfile -ExecutionPolicy Bypass -Command "try {{ Unblock-File -LiteralPath \'{sidecar.replace(chr(39), chr(39)+chr(39))}\' }} catch {{ }}"',
+        f'set "HAMMER_LAUNCH={sidecar}"',
         f'del /F /Q "{current_exe}.old" 2>nul',
         "set MOVE_TRIES=0",
         ":move_retry",
         "set /a MOVE_TRIES+=1",
         f'move /Y "{current_exe}" "{current_exe}.old"',
         "if errorlevel 1 (",
-        "  if !MOVE_TRIES! lss 40 (",
+        "  if !MOVE_TRIES! lss 8 (",
         _bat_echo_log(log_path, "move retry (exe still locked)"),
-        "    " + _bat_sleep_seconds(2),
-        f'    taskkill /F /IM "{os.path.basename(current_exe)}" /T >nul 2>&1',
+        "    " + _bat_sleep_seconds(3),
         "    goto move_retry",
         "  )",
-        _bat_echo_log(log_path, "UPDATE_FAILED could not move old exe (still locked?)"),
-        "  echo Could not replace exe — close Hammer and antivirus, then retry.",
-        "  pause",
-        "  exit /b 1",
+        _bat_echo_log(log_path, "Old exe stayed locked — will launch -updated.exe"),
+        "  goto replace_done",
         ")",
-        "set COPY_TRIES=0",
-        ":copy_retry",
-        "set /a COPY_TRIES+=1",
-        f'copy /Y "{staged}" "{current_exe}"',
-        "if errorlevel 1 (",
-        "  if !COPY_TRIES! lss 40 (",
-        _bat_echo_log(log_path, "copy retry (exe still locked)"),
-        "    " + _bat_sleep_seconds(2),
-        "    goto copy_retry",
-        "  )",
-        _bat_echo_log(log_path, "UPDATE_FAILED copy failed after retries"),
-        "  echo Restoring previous exe...",
-        f'  move /Y "{current_exe}.old" "{current_exe}" >nul 2>&1',
-        "  pause",
-        "  exit /b 1",
+        f'copy /Y "{sidecar}" "{current_exe}"',
+        "if not errorlevel 1 (",
+        f'  set "HAMMER_LAUNCH={current_exe}"',
+        f'  del /F /Q "{sidecar}" 2>nul',
+        f'  del /F /Q "{current_exe}.old" 2>nul',
         ")",
-        # Verify the new file is a full Windows build, not a tiny partial
-        f'for %%Z in ("{current_exe}") do set NEWSIZE=%%~zZ',
-        "if !NEWSIZE! LSS 350000000 (",
-        _bat_echo_log(log_path, "UPDATE_FAILED new exe too small after copy"),
-        f'  move /Y "{current_exe}.old" "{current_exe}" >nul 2>&1',
-        "  pause",
-        "  exit /b 1",
-        ")",
+        ":replace_done",
         f'del /F /Q "{staged}" 2>nul',
-        f'del /F /Q "{current_exe}.old" 2>nul',
         _bat_echo_log(log_path, "UPDATE_OK exe replaced"),
     ]
 
@@ -981,18 +1008,33 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
 
     if os.name == "nt":
         log_path = update_log_path()
-        bat = _write_windows_update_bat(
-            pid=os.getpid(),
-            exe_path=current_exe,
-            lines=[
-                *_windows_replace_exe_lines(
-                    staged=staged, current_exe=current_exe, log_path=log_path
-                ),
-                *_windows_relaunch_lines(root, current_exe, log_path),
-            ],
-        )
+        swapped = _swap_exe_while_running(staged, current_exe)
+        if swapped:
+            status_cb("New exe installed (old file renamed). Closing to finish...")
+            bat = _write_windows_update_bat(
+                pid=os.getpid(),
+                exe_path=current_exe,
+                lines=[
+                    _bat_echo_log(log_path, "New exe already in place"),
+                    f'del /F /Q "{current_exe}.old" 2>nul',
+                    f'del /F /Q "{current_exe}.old.*" 2>nul',
+                    _bat_echo_log(log_path, "UPDATE_OK exe replaced"),
+                    *_windows_relaunch_lines(root, current_exe, log_path),
+                ],
+            )
+        else:
+            status_cb("Could not rename running exe — will copy sidecar after close.")
+            bat = _write_windows_update_bat(
+                pid=os.getpid(),
+                exe_path=current_exe,
+                lines=[
+                    *_windows_replace_exe_lines(
+                        staged=staged, current_exe=current_exe, log_path=log_path
+                    ),
+                    *_windows_relaunch_lines(root, current_exe, log_path),
+                ],
+            )
         _WINDOWS_UPDATE_BAT[0] = bat
-        status_cb("Executable staged — will replace after the app closes.")
     else:
         status_cb("Replacing executable...")
         shutil.move(staged, current_exe)

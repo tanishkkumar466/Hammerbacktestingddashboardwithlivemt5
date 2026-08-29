@@ -113,11 +113,11 @@ def test_windows_update_bat_is_bounded_and_uses_ping(tmp_path, monkeypatch):
     text = open(bat, encoding="ascii", errors="replace").read()
     assert "setlocal EnableExtensions EnableDelayedExpansion" in text
     assert "WAIT_N" in text
-    assert "KILL_N" in text
-    assert "taskkill" in text
     assert "ping -n" in text
     assert "timeout /t" not in text
     assert "Start-Process" in text
     assert "MOVE_TRIES" in text
     assert "rundll32" not in text
+    assert "taskkill" not in text
+    assert "sidecar" in text.lower() or "-updated.exe" in text
 
