@@ -14,7 +14,14 @@ import pytest
 import backtest
 import hammer_context_logic as hc
 import logic
-from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperTrendConfig, VWAPConfig
+from indicators.config import (
+    IndicatorCombineMode,
+    IndicatorStackConfig,
+    RollingVWAPConfig,
+    RSIConfig,
+    SuperTrendConfig,
+    VWAPConfig,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 PRESET_PATHS = [
@@ -22,6 +29,8 @@ PRESET_PATHS = [
     ROOT / "template" / "preset_example_hammer_green_buy_red_sell.json",
     ROOT / "presets" / "preset_example_hammer_with_candles.json",
     ROOT / "template" / "preset_example_hammer_with_candles.json",
+    ROOT / "presets" / "preset_example_hammer_with_candle_35.json",
+    ROOT / "template" / "preset_example_hammer_with_candle_35.json",
 ]
 
 
@@ -121,6 +130,8 @@ def build_hammer_strategy(data: dict) -> logic.StrategyConfig:
 
 def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
     fields = data.get("fields") or {}
+    pattern = data.get("pattern", "")
+    default_pull = 35.0 if pattern == hc.PATTERN_LABEL_35 else 0.0
     return hc.HammerContextConfig(
         buy_hammer_ratios=_ratio_from_fields(fields, "buy"),
         sell_hammer_ratios=_ratio_from_fields(fields, "sell"),
@@ -131,6 +142,7 @@ def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
         sell_require_wick=_bool(_f(fields, "sell_require_wick"), True),
         entry_rule=logic.coerce_entry_rule(_f(fields, "entry_rule", "NEXT_CANDLE_OPEN")),
         entry_offset=_float(_f(fields, "entry_offset"), 0.0),
+        entry_pullback_pct=_float(_f(fields, "entry_pullback_pct"), default_pull),
         sl_mode=logic.coerce_stop_loss_mode(_f(fields, "sl_mode", "CANDLE_EXTREME")),
         sl_fixed_distance=_float(_f(fields, "sl_fixed_distance"), 5.0),
         buffer_mode=logic.coerce_buffer_mode(_f(fields, "buffer_mode", "PERCENT_OF_RANGE")),
@@ -160,6 +172,8 @@ def build_indicator_stack(data: dict) -> IndicatorStackConfig:
     inds = data.get("indicators") or {}
     st = inds.get("supertrend") or {}
     vw = inds.get("vwap") or {}
+    rv = inds.get("rolling_vwap") or {}
+    rsi = inds.get("rsi") or {}
     added = set(data.get("indicators_added") or [])
     combine = str(
         _f(fields, "indicators_combine_mode", inds.get("combine_mode", "ALL")) or "ALL"
@@ -186,6 +200,30 @@ def build_indicator_stack(data: dict) -> IndicatorStackConfig:
                 True,
             ),
         ),
+        rolling_vwap=RollingVWAPConfig(
+            enabled="rolling_vwap" in added or _bool(rv.get("enabled"), False),
+            period=_int(
+                _f(fields, "indicators_rolling_vwap_period", rv.get("period")), 20
+            ),
+            apply_trade_filter=_bool(
+                _f(fields, "indicators_rolling_vwap_apply_filter", rv.get("apply_trade_filter")),
+                True,
+            ),
+        ),
+        rsi=RSIConfig(
+            enabled="rsi" in added or _bool(rsi.get("enabled"), False),
+            period=_int(_f(fields, "indicators_rsi_period", rsi.get("period")), 14),
+            buy_above=_float(
+                _f(fields, "indicators_rsi_buy_above", rsi.get("buy_above")), 50.0
+            ),
+            sell_below=_float(
+                _f(fields, "indicators_rsi_sell_below", rsi.get("sell_below")), 60.0
+            ),
+            apply_trade_filter=_bool(
+                _f(fields, "indicators_rsi_apply_filter", rsi.get("apply_trade_filter")),
+                True,
+            ),
+        ),
     )
 
 
@@ -193,8 +231,8 @@ def build_backtest_config(data: dict, strategy) -> backtest.BacktestConfig:
     bt = data.get("backtest") or {}
     fields = data.get("fields") or {}
     pattern = data.get("pattern", "Hammer")
-    if pattern == "Hammer with candles":
-        pattern_type = "hammer_with_candles"
+    if hc.is_context_pattern_label(pattern):
+        pattern_type = hc.pattern_type_for_label(pattern)
     elif pattern == "Doji":
         pattern_type = "doji"
     else:
@@ -259,7 +297,12 @@ def _load(path: Path) -> dict:
 def test_preset_json_builds_strict_algo_configs(path: Path):
     data = _load(path)
     assert data.get("version") == 2
-    assert data.get("pattern") in ("Hammer", "Hammer with candles", "Doji")
+    assert data.get("pattern") in (
+        "Hammer",
+        "Hammer with candles",
+        "Hammer with candle 35%",
+        "Doji",
+    )
     assert data.get("fields"), "fields required for algo params"
     assert data.get("timeframes"), "timeframes required"
     assert data.get("backtest"), "backtest block required"
@@ -285,7 +328,7 @@ def test_preset_json_builds_strict_algo_configs(path: Path):
         stack = build_indicator_stack(data)
         assert stack.supertrend.enabled and stack.supertrend.apply_trade_filter
         assert stack.vwap.enabled and stack.vwap.apply_trade_filter
-    elif pattern == "Hammer with candles":
+    elif hc.is_context_pattern_label(pattern):
         strategy = build_hammer_context_strategy(data)
         assert strategy.lookback_candles == 5
         assert strategy.enable_buy and strategy.enable_sell
@@ -293,6 +336,11 @@ def test_preset_json_builds_strict_algo_configs(path: Path):
         assert strategy.entry_rule == logic.EntryRule.NEXT_CANDLE_OPEN
         assert strategy.sl_mode == logic.StopLossMode.CANDLE_EXTREME
         assert "BUY" in hc.describe_hammer_context_rules(strategy)
+        assert hc.pattern_type_for_label(pattern) in hc.CONTEXT_PATTERN_TYPES
+        if pattern == hc.PATTERN_LABEL_35:
+            assert strategy.entry_pullback_pct == 35.0
+        else:
+            assert strategy.entry_pullback_pct == 0.0
     else:
         pytest.skip("Doji example not in this suite")
 
@@ -308,3 +356,10 @@ def test_presets_folder_has_examples():
     presets = ROOT / "presets"
     assert (presets / "preset_example_hammer_green_buy_red_sell.json").is_file()
     assert (presets / "preset_example_hammer_with_candles.json").is_file()
+    assert (presets / "preset_example_hammer_with_candle_35.json").is_file()
+
+
+def test_context_pattern_helpers():
+    assert hc.is_context_pattern_label("Hammer with candle 35%")
+    assert hc.pattern_type_for_label("Hammer with candle 35%") == hc.PATTERN_TYPE_35
+    assert hc.is_context_pattern_type(hc.PATTERN_TYPE_35)

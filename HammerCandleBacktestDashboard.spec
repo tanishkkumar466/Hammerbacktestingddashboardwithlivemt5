@@ -55,12 +55,13 @@ _ALL_PACKAGES = (
 
 hiddenimports = [
     # --- app modules ---
-    "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker", "live",
+    "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker",     "live",
+    "live_accounts", "live_account_ipc", "live_account_worker",
     "live_journal", "fetch", "sessions", "hammer_context_logic",
     "telegram_notify", "telegram_workers", "version", "updater",
     "update_workers", "update_window", "hammer_boot",
     "indicators", "indicators.config", "indicators.filter", "indicators.registry",
-    "indicators.supertrend", "indicators.vwap",
+    "indicators.supertrend", "indicators.vwap", "indicators.rolling_vwap", "indicators.rsi",
     # --- stdlib ---
     "sqlite3", "_sqlite3",
     "ssl", "_ssl", "hashlib", "_hashlib",

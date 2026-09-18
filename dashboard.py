@@ -65,7 +65,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QDir, QPointF, QSettings, QRectF, QUrl, QThread
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QDir, QPointF, QSettings, QRectF, QUrl, QThread, QTime
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QPixmap, QPolygonF, QImage, QAction, QKeySequence,
     QLinearGradient, QRadialGradient, QPainterPath, QFontMetrics, QIcon, QDesktopServices,
@@ -77,17 +77,23 @@ from PySide6.QtWidgets import (
     QProgressBar, QMessageBox, QFrame, QDialog, QSizePolicy,
     QDockWidget, QInputDialog, QPlainTextEdit, QFormLayout,
     QAbstractItemView, QDialogButtonBox, QButtonGroup, QColorDialog, QRadioButton,
-    QFileDialog,
+    QFileDialog, QTimeEdit, QTextBrowser, QToolButton, QToolTip,
 )
 
 import logic
 import doji_logic
 import hammer_context_logic
 import backtest
-import plotting
+# plotting + polars are heavy (matplotlib/polars). Load lazily when plots / ledger sort run.
 import sessions
-import polars as pl
-from indicators.config import IndicatorCombineMode, IndicatorStackConfig, SuperTrendConfig, VWAPConfig
+from indicators.config import (
+    IndicatorCombineMode,
+    IndicatorStackConfig,
+    RollingVWAPConfig,
+    RSIConfig,
+    SuperTrendConfig,
+    VWAPConfig,
+)
 from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDICATOR_FILTER_LOGIC_FILE
 import live as live_trading
 import telegram_notify
@@ -100,7 +106,17 @@ except ImportError:
         return True
 import fetch as data_fetcher
 from broker import BrokerCredentials, MT5Broker
-from live_journal import append_session_log, live_journal_dir, session_log_path
+from live_journal import (
+    append_log_file,
+    append_session_log,
+    app_live_log_path,
+    app_logs_dir,
+    live_journal_dir,
+    session_log_path,
+    slot_journal_dir,
+)
+import live_accounts
+from live_account_ipc import AccountWorkerHandle, apply_worker_event
 
 
 # ============================================================================
@@ -132,13 +148,18 @@ def get_asset_path(filename: str) -> str:
 
 
 APP_DIR = get_app_dir()
-DOCK_LAYOUT_VERSION = 7  # client layout: Preview | Live, bottom tabs for Results/Params
+DOCK_LAYOUT_VERSION = 8  # per-account Live tabs next to Results / Parameters
 DEFAULT_DATA_DIR = os.path.join(APP_DIR, "data")
 DEFAULT_OUTPUT_DIR = os.path.join(APP_DIR, "output")
 PRESETS_DIR = os.path.join(APP_DIR, "presets")
 DEFAULT_PLOTS_DIR = os.path.join(APP_DIR, "plots")
 RUN_DATABASE_PATH = os.path.join(APP_DIR, "run_history.db")
-LIVE_JOURNAL_DIR = live_journal_dir(DEFAULT_OUTPUT_DIR)
+# Live trading text logs + trade CSVs (safe to delete logs/ anytime)
+LOGS_DIR = app_logs_dir(APP_DIR)
+LIVE_JOURNAL_DIR = live_journal_dir(APP_DIR)
+# Account desk config stays under output/ so clearing logs does not wipe accounts
+LIVE_DESK_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "live", "live_desk.json")
+APP_LIVE_LOG_PATH = app_live_log_path(APP_DIR)
 
 LIVE_ORDER_MODES = (
     ("market", "Market — instant at ask/bid"),
@@ -567,9 +588,13 @@ class RunDatabase:
             body_tol = doji.get("max_body_tol")
             dominant_wick_tol = doji.get("min_wick_tol")
             small_wick_tol = doji.get("min_wick_tol")
-        elif pattern_type in ("hammer_with_candles", "hammer_context"):
-            pattern_label = "Hammer with candles"
-            entry_signal = "Hammer with candles"
+        elif hammer_context_logic.is_context_pattern_type(pattern_type):
+            if pattern_type == hammer_context_logic.PATTERN_TYPE_35:
+                pattern_label = hammer_context_logic.PATTERN_LABEL_35
+                entry_signal = hammer_context_logic.PATTERN_LABEL_35
+            else:
+                pattern_label = hammer_context_logic.PATTERN_LABEL
+                entry_signal = hammer_context_logic.PATTERN_LABEL
             buy = strategy.get("buy_hammer_ratios") or {}
             sell = strategy.get("sell_hammer_ratios") or {}
             try:
@@ -890,7 +915,16 @@ PATTERN_REGISTRY = {
             "signal color ignored; previous candle red→BUY, green→SELL."
         ),
         "ratio_config_class": logic.HammerRatioConfig,
-        "pattern_type": "hammer_with_candles",
+        "pattern_type": hammer_context_logic.PATTERN_TYPE,
+    },
+    "Hammer with candle 35%": {
+        "description": (
+            "Same shape/context as Hammer with candles, but entry waits for a configurable "
+            "% of the SL distance toward the stop (default 35%). "
+            "BUY: wait for a drop; SELL: wait for a rise. Then enter; SL stays at candle extreme."
+        ),
+        "ratio_config_class": logic.HammerRatioConfig,
+        "pattern_type": hammer_context_logic.PATTERN_TYPE_35,
     },
 }
 
@@ -1061,6 +1095,7 @@ CONTEXT_UI_ATTR_OVERRIDES = {
     "context_lookback_candles": "lookback_candles",
     "context_enable_buy": "enable_buy",
     "context_enable_sell": "enable_sell",
+    "entry_pullback_pct": "entry_pullback_pct",
 }
 
 # Per-indicator parameter widgets (field name -> label, type). Registry keys = dropdown ids.
@@ -1072,6 +1107,16 @@ INDICATOR_WIDGET_GROUPS: Dict[str, List[tuple]] = {
     ],
     "vwap": [
         ("indicators_vwap_apply_filter", "Apply trade filter (backtest + live)", FIELD_TYPE_CHECK, None),
+    ],
+    "rolling_vwap": [
+        ("indicators_rolling_vwap_period", "Period (bars)", FIELD_TYPE_TEXT, None),
+        ("indicators_rolling_vwap_apply_filter", "Apply trade filter (backtest + live)", FIELD_TYPE_CHECK, None),
+    ],
+    "rsi": [
+        ("indicators_rsi_period", "RSI period", FIELD_TYPE_TEXT, None),
+        ("indicators_rsi_buy_above", "BUY if RSI above", FIELD_TYPE_TEXT, None),
+        ("indicators_rsi_sell_below", "SELL if RSI below", FIELD_TYPE_TEXT, None),
+        ("indicators_rsi_apply_filter", "Apply trade filter (backtest + live)", FIELD_TYPE_CHECK, None),
     ],
 }
 
@@ -1124,14 +1169,27 @@ CONTEXT_PATTERN_FIELDS = [
     ("context_lookback_candles", "Prior candles to check (count)", FIELD_TYPE_TEXT, None),
     ("context_enable_buy", "Enable BUY (classic green hammer)", FIELD_TYPE_CHECK, None),
     ("context_enable_sell", "Enable SELL (inverted red hammer)", FIELD_TYPE_CHECK, None),
+    (
+        "entry_pullback_pct",
+        "Entry pullback % of SL (35% pattern)",
+        FIELD_TYPE_TEXT,
+        None,
+    ),
 ]
 CONTEXT_PATTERN_FIELD_NAMES = {f[0] for f in CONTEXT_PATTERN_FIELDS}
+ENTRY_PULLBACK_FIELD_NAMES = {"entry_pullback_pct"}
 
 INDICATOR_UI_DEFAULTS = {
     "indicators_st_atr_period": 10,
     "indicators_st_multiplier": 3.0,
     "indicators_st_apply_filter": True,
     "indicators_vwap_apply_filter": True,
+    "indicators_rolling_vwap_period": 20,
+    "indicators_rolling_vwap_apply_filter": True,
+    "indicators_rsi_period": 14,
+    "indicators_rsi_buy_above": 50.0,
+    "indicators_rsi_sell_below": 60.0,
+    "indicators_rsi_apply_filter": True,
     "indicators_combine_mode": IndicatorCombineMode.ALL.value,
 }
 
@@ -1296,6 +1354,14 @@ FIELD_HELP: Dict[str, str] = {
         "Wick off = signal body ≤ Body % (any color); previous candle must be green. "
         "Prior closes must stay at or below candle high."
     ),
+    "entry_pullback_pct": (
+        "After the signal, do not enter at the normal entry. Wait for price to move this "
+        "percent of the SL distance toward the stop, then enter there. "
+        "BUY example: entry 4010, SL 4000 → 35% wait at 4006.5. "
+        "Target still uses signal entry × RR (4010 + 2×10 = 4030 if RR=2) — pullback does not move TP. "
+        "SELL is the mirror (wait for a rise toward the high SL). "
+        "Only used by Hammer with candle 35%."
+    ),
     "buy_require_wick": (
         "On (default): BUY needs a classic hammer (long lower wick) that closes green.\n"
         "Off: ignore wick shape AND signal candle color. BUY when the previous candle is RED "
@@ -1316,7 +1382,27 @@ FIELD_HELP: Dict[str, str] = {
     "inverted_hammer_allow_buy": "Legacy — use Inverted green/red = BUY instead.",
     "inverted_hammer_allow_sell": "Legacy — use Inverted green/red = SELL instead.",
     "indicators_st_enabled": "Compute SuperTrend and show it in Pattern In Context; optional backtest filter.",
-    "indicators_vwap_enabled": "Compute VWAP and show it in Pattern In Context; optional backtest filter.",
+    "indicators_vwap_enabled": "Compute session VWAP (resets daily) and show it in Pattern In Context; optional backtest filter.",
+    "indicators_rolling_vwap_period": (
+        "Number of bars in the Rolling VWAP window on the same timeframe as the run "
+        "(e.g. 20 on 3m = last 20 three-minute bars). Does not reset at the day."
+    ),
+    "indicators_rolling_vwap_apply_filter": (
+        "On: BUY only if close is above Rolling VWAP; SELL only if close is below. "
+        "Off: still drawn on inspect charts, but does not block trades."
+    ),
+    "indicators_rsi_period": "Wilder RSI length on close. Default 14 (same as TradingView RSI).",
+    "indicators_rsi_buy_above": (
+        "BUY only if RSI is strictly above this level (example 50). "
+        "Independent from the sell level."
+    ),
+    "indicators_rsi_sell_below": (
+        "SELL only if RSI is strictly below this level (example 60). "
+        "Independent from the buy level."
+    ),
+    "indicators_rsi_apply_filter": (
+        "On: block BUY when RSI is at or below the buy level, and block SELL when RSI is at or above the sell level."
+    ),
     "entry_rule": "Classic hammer entry: next candle open/close, or this candle’s close / high / low.",
     "entry_offset": "Classic hammer: extra $ added to the classic entry price.",
     "sl_mode": (
@@ -1514,11 +1600,21 @@ def _stylesheet_mono_font_family() -> str:
 
 
 STYLESHEET = """
-QMainWindow, QWidget {
+/* Page chrome only — do NOT paint every QWidget grey (that boxed every field label). */
+QMainWindow, QDialog {
     background-color: #F3F5F7;
     font-family: @@APP_FONT@@;
     font-size: 13px;
     color: #202124;
+}
+QWidget {
+    font-family: @@APP_FONT@@;
+    font-size: 13px;
+    color: #202124;
+    background-color: transparent;
+}
+QLabel, QCheckBox, QRadioButton {
+    background-color: transparent;
 }
 QGroupBox {
     background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
@@ -1539,14 +1635,14 @@ QTabBar::tab:selected { background: #FFFFFF; color: #188038; font-weight: 700; b
 QTabBar::tab:hover:!selected { background: #F1F3F4; color: #188038; }
 
 /* ---- Inputs ---- */
-QLineEdit, QComboBox {
+QLineEdit, QComboBox, QTimeEdit, QSpinBox, QDoubleSpinBox {
     border: 1px solid #D2D6DB; border-radius: 6px; padding: 7px 10px;
     background: #FFFFFF; selection-background-color: #34A853; selection-color: white;
     font-size: 13.5px; font-weight: 500;
 }
-QLineEdit:hover, QComboBox:hover { border: 1px solid #9AA0A6; }
-QLineEdit:focus, QComboBox:focus { border: 1.5px solid #34A853; }
-QLineEdit:disabled, QComboBox:disabled { background: #F1F3F4; color: #9AA0A6; }
+QLineEdit:hover, QComboBox:hover, QTimeEdit:hover { border: 1px solid #9AA0A6; }
+QLineEdit:focus, QComboBox:focus, QTimeEdit:focus { border: 1.5px solid #34A853; }
+QLineEdit:disabled, QComboBox:disabled, QTimeEdit:disabled { background: #F1F3F4; color: #9AA0A6; }
 QComboBox::drop-down { border: none; width: 24px; }
 QComboBox::down-arrow {
     image: none; width: 0; height: 0;
@@ -1607,33 +1703,35 @@ QLineEdit#tableNumberInput:focus { border: 1.5px solid #34A853; background: #FFF
 
 QProgressBar { border: 1px solid #DDE1E6; border-radius: 6px; text-align: center; background: #F1F3F4; height: 10px; }
 QProgressBar::chunk { background-color: #34A853; border-radius: 6px; }
-QScrollArea { border: none; }
+QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget { background: transparent; }
 
-QCheckBox { spacing: 8px; font-size: 12.5px; }
+QCheckBox { spacing: 8px; font-size: 12.5px; background: transparent; }
 QCheckBox::indicator { width: 16px; height: 16px; border-radius: 4px; border: 1.5px solid #9AA0A6; background: #FFFFFF; }
 QCheckBox::indicator:hover { border: 1.5px solid #34A853; }
 QCheckBox::indicator:checked { background-color: #34A853; border: 1.5px solid #34A853; image: url(checkicon:checkmark.png); }
+QRadioButton { background: transparent; spacing: 8px; font-size: 12.5px; }
 
-QLabel#sectionHint { color: #5F6368; font-size: 11.5px; }
+QLabel#sectionHint { color: #5F6368; font-size: 11.5px; background: transparent; }
 QFrame#topBar { background-color: #FFFFFF; border-bottom: 1px solid #DDE1E6; }
 QFrame#candleCard { background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px; }
 
 QFrame#liveHero {
-    background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
-    padding: 12px 16px;
+    background-color: transparent; border: none;
+    padding: 0px;
 }
 QLabel#liveHeroTitle { font-size: 15px; font-weight: 700; color: #188038; }
 QLabel#liveStepChip {
-    background-color: #E6F4EA; color: #188038; border-radius: 6px;
-    padding: 4px 10px; font-size: 11px; font-weight: 700;
+    background-color: transparent; color: #5F6368; border: none;
+    padding: 0px; font-size: 11.5px; font-weight: 600;
 }
 QFrame#liveControlBar {
-    background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
-    padding: 10px 12px;
+    background-color: transparent; border: none;
+    padding: 0px;
 }
 QFrame#liveNotifyBar {
-    background-color: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px;
-    padding: 10px 12px;
+    background-color: transparent; border: none;
+    padding: 0px;
 }
 QLabel#liveNotifyTitle { font-size: 12.5px; font-weight: 700; color: #188038; }
 QLabel#liveNotifyStatus {
@@ -1647,18 +1745,56 @@ QLabel#liveStatusBadge {
     background-color: #F1F3F4; border: 1px solid #DDE1E6; border-radius: 8px;
     padding: 10px 14px; font-size: 12.5px; font-weight: 600; color: #444B52;
 }
+QLabel#liveStatusChip {
+    border-radius: 6px; padding: 5px 10px; font-size: 11.5px; font-weight: 700;
+    background-color: #F1F3F4; border: 1px solid #E8EAED; color: #5F6368;
+}
+QLabel#liveStatusChip[tone="ok"] {
+    background-color: #E6F4EA; border-color: #CEEAD6; color: #137333;
+}
+QLabel#liveStatusChip[tone="run"] {
+    background-color: #E8F0FE; border-color: #D2E3FC; color: #1967D2;
+}
+QLabel#liveStatusChip[tone="warn"] {
+    background-color: #FEF7E0; border-color: #FDE293; color: #B06000;
+}
+QLabel#liveStatusChip[tone="bad"] {
+    background-color: #FCE8E6; border-color: #F5C6C2; color: #C5221F;
+}
+QToolButton#infoHintButton {
+    font-size: 13px; font-weight: 700; color: #1967D2;
+    border: 1px solid #D2E3FC; border-radius: 11px; background: #E8F0FE;
+    padding: 0px;
+}
+QToolButton#infoHintButton:hover { background: #D2E3FC; }
+QToolButton#liveAdvancedToggle {
+    border: none; background: transparent; font-size: 12.5px; font-weight: 700;
+    color: #3C4043; text-align: left; padding: 2px 0;
+}
+QToolButton#liveAdvancedToggle:hover { color: #188038; }
+
 QLabel#liveSummaryCard {
-    background-color: #F7F9FA; border: 1px solid #E8EAED; border-radius: 8px;
-    padding: 10px 12px; font-size: 12px; color: #3C4043; line-height: 140%;
+    background-color: transparent; border: none;
+    padding: 0px; font-size: 12px; color: #5F6368; line-height: 140%;
+}
+QLabel#previewSummary {
+    color: #5F6368; font-size: 11.5px; background: transparent; border: none;
+}
+QPlainTextEdit, QTextBrowser, QTextEdit {
+    background: #FFFFFF; border: 1px solid #E8EAED; border-radius: 8px;
+    color: #202124;
 }
 QPlainTextEdit#liveLogConsole {
     font-family: @@MONO_FONT@@; font-size: 11.5px;
     background: #FAFBFC; border: 1px solid #E8EAED; border-radius: 8px; padding: 8px;
 }
+QTabWidget { background: transparent; }
+QStatusBar { background: #FFFFFF; }
 QGroupBox#liveLogGroup { margin-top: 12px; }
 
 QLabel#fieldLabel {
     color: #3C4043; font-size: 12.5px; font-weight: 600;
+    background-color: transparent;
 }
 QLabel#appStatus {
     color: #188038; font-size: 12.5px; font-weight: 600;
@@ -1706,6 +1842,7 @@ QMenu::item:selected { background-color: #E6F4EA; color: #188038; }
 
 /* ---- Dock widgets: draggable/floatable/resizable panels ---- */
 QDockWidget { font-weight: 700; font-size: 12.5px; color: #202124; }
+QDockWidget > QWidget { background-color: #F3F5F7; }
 QDockWidget::title {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FFFFFF, stop:1 #EEF0F2);
     padding: 10px 12px; text-align: left;
@@ -1861,6 +1998,10 @@ class PatternContextChart(QWidget):
         self.preview_st_bullish = True
         self.preview_show_vwap = False
         self.preview_price_above_vwap = True
+        self.preview_show_rolling_vwap = False
+        self.preview_price_above_rolling_vwap = True
+        self.preview_show_rsi = False
+        self.preview_rsi_ok = True
         self.preview_trade_side = "BUY"
         self.context_lookback = 5
         self.entry_rule = "NEXT_CANDLE_OPEN"
@@ -1870,6 +2011,7 @@ class PatternContextChart(QWidget):
         self.sl_buffer_flat = 0.0
         self.sl_mode = logic.StopLossMode.CANDLE_EXTREME.value
         self.sl_fixed_distance = 5.0
+        self.entry_pullback_pct = 0.0
         self._context_trade_side = None
         self._overlays = []
         self._lead_candles = []
@@ -1881,6 +2023,8 @@ class PatternContextChart(QWidget):
                  rr_multiple, max_sl_usd, timeframe_label, is_doji=False, doji_style="",
                  preview_show_st=False, preview_st_bullish=True,
                  preview_show_vwap=False, preview_price_above_vwap=True,
+                 preview_show_rolling_vwap=False, preview_price_above_rolling_vwap=True,
+                 preview_show_rsi=False, preview_rsi_ok=True,
                  preview_trade_side="BUY",
                  context_lookback=5,
                  entry_rule="NEXT_CANDLE_OPEN",
@@ -1889,7 +2033,8 @@ class PatternContextChart(QWidget):
                  sl_buffer_pct=5.0,
                  sl_buffer_flat=0.0,
                  sl_mode=logic.StopLossMode.CANDLE_EXTREME.value,
-                 sl_fixed_distance=5.0):
+                 sl_fixed_distance=5.0,
+                 entry_pullback_pct=0.0):
         self.body_pct = body_pct
         self.dominant_pct = dominant_pct
         self.small_pct = small_pct
@@ -1901,6 +2046,10 @@ class PatternContextChart(QWidget):
         self.preview_st_bullish = preview_st_bullish
         self.preview_show_vwap = preview_show_vwap
         self.preview_price_above_vwap = preview_price_above_vwap
+        self.preview_show_rolling_vwap = preview_show_rolling_vwap
+        self.preview_price_above_rolling_vwap = preview_price_above_rolling_vwap
+        self.preview_show_rsi = preview_show_rsi
+        self.preview_rsi_ok = preview_rsi_ok
         self.preview_trade_side = preview_trade_side or "BUY"
         try:
             raw_lb = 0 if context_lookback is None else context_lookback
@@ -1929,6 +2078,10 @@ class PatternContextChart(QWidget):
             self.sl_fixed_distance = float(sl_fixed_distance or 0.0)
         except (TypeError, ValueError):
             self.sl_fixed_distance = 0.0
+        try:
+            self.entry_pullback_pct = max(0.0, min(100.0, float(entry_pullback_pct or 0.0)))
+        except (TypeError, ValueError):
+            self.entry_pullback_pct = 0.0
         self.rr_multiple = rr_multiple
         self.max_sl_usd = max_sl_usd
         self.timeframe_label = timeframe_label
@@ -2110,6 +2263,24 @@ class PatternContextChart(QWidget):
             painter.setPen(QPen(QColor("#1A73E8")))
             painter.drawText(int(margin_x + 4), int(vwap_y - 4), "VWAP")
 
+        if self.preview_show_rolling_vwap:
+            rv_y = y_of(0.60 if self.preview_price_above_rolling_vwap else 0.92)
+            rv_pen = QPen(QColor("#9334E6"), 1.6, Qt.DashLine)
+            rv_pen.setDashPattern([2, 4])
+            painter.setPen(rv_pen)
+            painter.drawLine(int(margin_x), int(rv_y), int(w - margin_x), int(rv_y))
+            painter.setPen(QPen(QColor("#9334E6")))
+            painter.drawText(int(margin_x + 4), int(rv_y - 4), "Rolling VWAP")
+
+        if self.preview_show_rsi:
+            rsi_color = QColor("#188038") if self.preview_rsi_ok else QColor("#B3261E")
+            painter.setPen(QPen(rsi_color))
+            painter.drawText(
+                int(margin_x + 4),
+                int(h - 38),
+                "RSI pass" if self.preview_rsi_ok else "RSI block",
+            )
+
         if self.preview_show_st:
             st_y = y_of(0.82 if self.preview_st_bullish else 0.68)
             st_color = QColor("#188038") if self.preview_st_bullish else QColor("#B3261E")
@@ -2247,12 +2418,25 @@ class PatternContextChart(QWidget):
                 sl_y = candle_high_y - buffer_px
             risk_label_usd = self.max_sl_usd
 
-        risk_y_dist = abs(sl_y - entry_y)
-        reward_y_dist = risk_y_dist * max(self.rr_multiple, 0.1)
+        # Pullback entry (Hammer with candle 35%): move ENTRY toward SL by % of risk.
+        # TP stays on the signal-entry RR (pullback does not move target).
+        pull_pct = float(getattr(self, "entry_pullback_pct", 0.0) or 0.0)
+        signal_entry_y = entry_y
+        signal_risk_y = abs(sl_y - signal_entry_y)
+        if pull_pct > 0:
+            shift = signal_risk_y * (min(100.0, pull_pct) / 100.0)
+            if is_buy:
+                # Screen Y increases downward: toward SL (higher Y)
+                entry_y = entry_y + shift
+            else:
+                entry_y = entry_y - shift
+            entry_flag = f"ENTRY −{pull_pct:g}% SL" if is_buy else f"ENTRY +{pull_pct:g}% SL"
+
+        reward_y_dist = signal_risk_y * max(self.rr_multiple, 0.1)
         if is_buy:
-            target_y = max(entry_y - reward_y_dist, resistance_y)
+            target_y = max(signal_entry_y - reward_y_dist, resistance_y)
         else:
-            target_y = min(entry_y + reward_y_dist, support_y)
+            target_y = min(signal_entry_y + reward_y_dist, support_y)
 
         zone_left = signal_x - candle_w * 0.9
         zone_right = signal_x + slot_w * (1.85 if use_next_bar else 0.95)
@@ -2456,6 +2640,8 @@ class BacktestWorker(QObject):
 
     def run(self):
         try:
+            import plotting
+
             tables = backtest.run_backtest_and_export(self.backtest_config)
 
             plots_dir = os.path.join(DEFAULT_PLOTS_DIR, self.backtest_config.run_name)
@@ -3004,8 +3190,595 @@ class LiveNotificationsDialog(QDialog):
         super().closeEvent(event)
 
 
+class LiveAccountDialog(QDialog):
+    """MT5 login for one saved account. Connect always uses the Active account."""
+
+    def __init__(self, parent=None, account: Optional[live_accounts.LiveAccount] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Live account — MT5 login")
+        self.setMinimumWidth(460)
+        acc = account
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "<b>MT5 login lives here</b> — not in Settings.<br>"
+            "A new account opens its own <b>Live</b> tab (Results / Parameters stay shared).<br>"
+            "Each account runs in its own worker process so two logins can trade in parallel. "
+            "Set a separate <b>terminal64.exe</b> path per account when possible."
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.RichText)
+        hint.setObjectName("sectionHint")
+        layout.addWidget(hint)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(acc.name if acc else "Account")
+        self.login_edit = QLineEdit(acc.login if acc else "")
+        self.password_edit = QLineEdit(acc.password if acc else "")
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("Saved on this computer, not in the account file")
+        self.server_edit = QLineEdit(acc.server if acc else "")
+        self.path_edit = QLineEdit(acc.terminal_path if acc else "")
+        self.path_edit.setPlaceholderText("Optional — path to this account’s terminal64.exe")
+        self.loss_edit = QLineEdit(str(acc.max_daily_loss_usd if acc else 100.0))
+        lo, hi = (acc.magic_range() if acc else (live_accounts.MAGIC_BASE, live_accounts.MAGIC_BASE + live_accounts.MAGIC_SERIES_SIZE - 1))
+        self.magic_label = QLabel(f"{lo}–{hi}")
+        self.flatten_edit = QLineEdit(acc.flatten_hhmm if acc else "")
+        self.flatten_edit.setPlaceholderText("HH:MM system clock, empty = off")
+        form.addRow("Display name", self.name_edit)
+        form.addRow("MT5 login", self.login_edit)
+        form.addRow("Password", self.password_edit)
+        form.addRow("Server", self.server_edit)
+        form.addRow("Terminal path", self.path_edit)
+        form.addRow("Account max daily loss ($)", self.loss_edit)
+        form.addRow("Magic series", self.magic_label)
+        form.addRow("Flatten all at (local clock)", self.flatten_edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        try:
+            loss = float(self.loss_edit.text().strip() or 100)
+        except ValueError:
+            loss = 100.0
+        return {
+            "name": self.name_edit.text().strip() or "Account",
+            "login": self.login_edit.text().strip(),
+            "password": self.password_edit.text(),
+            "server": self.server_edit.text().strip(),
+            "terminal_path": self.path_edit.text().strip(),
+            "max_daily_loss_usd": max(0.0, loss),
+            "flatten_hhmm": self.flatten_edit.text().strip(),
+        }
+
+
+class LiveSlotDialog(QDialog):
+    """One bot on this Live tab: timeframe, magic, and which preset.json to run."""
+
+    def __init__(
+        self,
+        parent=None,
+        slot: Optional[live_accounts.LiveSlot] = None,
+        account_name: str = "",
+        preset_choices: Optional[list] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Live slot")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            f"This slot runs on <b>{account_name or 'this Live tab'}</b>. "
+            "Pick a <b>preset.json</b> for the strategy (pattern, indicators, RR/SL). "
+            "Timeframe is independent — same preset can run on 3m and 15m. "
+            "Leave preset empty to use whatever is currently on Backtest Parameters."
+        )
+        hint.setWordWrap(True)
+        hint.setTextFormat(Qt.RichText)
+        hint.setObjectName("sectionHint")
+        layout.addWidget(hint)
+        form = QFormLayout()
+        self.name_edit = QLineEdit(slot.name if slot else "Slot")
+        self.symbol_edit = QLineEdit(slot.symbol if slot else "XAUUSD")
+        self.tf_combo = QComboBox()
+        self.tf_combo.addItems(TIMEFRAME_LABELS)
+        if slot and self.tf_combo.findText(slot.timeframe) >= 0:
+            self.tf_combo.setCurrentText(slot.timeframe)
+        self.lots_edit = QLineEdit(str(slot.volume if slot else "0.01"))
+        self.magic_edit = QLineEdit(str(slot.magic if slot else live_accounts.MAGIC_BASE))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("Parameters panel (no saved preset)", "")
+        for label, filename in (preset_choices or []):
+            self.preset_combo.addItem(label, filename)
+        if slot and slot.preset_file:
+            idx = self.preset_combo.findData(slot.preset_file)
+            if idx >= 0:
+                self.preset_combo.setCurrentIndex(idx)
+        form.addRow("Name", self.name_edit)
+        form.addRow("Symbol", self.symbol_edit)
+        form.addRow("Timeframe", self.tf_combo)
+        form.addRow("Strategy preset", self.preset_combo)
+        form.addRow("Lots", self.lots_edit)
+        form.addRow("Magic", self.magic_edit)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        try:
+            magic = int(self.magic_edit.text().strip() or live_accounts.MAGIC_BASE)
+        except ValueError:
+            magic = live_accounts.MAGIC_BASE
+        return {
+            "name": self.name_edit.text().strip() or "Slot",
+            "symbol": self.symbol_edit.text().strip() or "XAUUSD",
+            "timeframe": self.tf_combo.currentText() or "3m",
+            "volume": self.lots_edit.text().strip() or "0.01",
+            "magic": magic,
+            "preset_file": str(self.preset_combo.currentData() or ""),
+        }
+
+
+class PresetManagerDialog(QDialog):
+    """Browse presets/*.json and inspect strategy contents."""
+
+    def __init__(self, dashboard: "BacktestDashboard"):
+        super().__init__(dashboard)
+        self._dash = dashboard
+        self.setWindowTitle("Preset manager")
+        self.setMinimumSize(720, 480)
+        self.resize(800, 540)
+        self.setWindowFlag(Qt.Window, True)
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "Saved strategies in <b>presets/</b>. Assign the same file to several slots/accounts, "
+            "or a different file per slot. Live Start uses the slot’s preset, not whatever is on screen."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        intro.setObjectName("sectionHint")
+        root.addWidget(intro)
+        split = QHBoxLayout()
+        self.list_table = QTableWidget(0, 3)
+        self.list_table.setHorizontalHeaderLabels(["File", "Name", "Pattern"])
+        self.list_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.list_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.list_table.verticalHeader().setVisible(False)
+        self.list_table.horizontalHeader().setStretchLastSection(True)
+        self.list_table.itemSelectionChanged.connect(self._show_selected)
+        split.addWidget(self.list_table, 2)
+        self.detail = QTextBrowser()
+        self.detail.setOpenExternalLinks(False)
+        split.addWidget(self.detail, 3)
+        root.addLayout(split, 1)
+        btns = QHBoxLayout()
+        refresh = QPushButton("Refresh")
+        refresh.setObjectName("secondaryButton")
+        refresh.clicked.connect(self.refresh)
+        load_p = QPushButton("Load into Parameters")
+        load_p.setObjectName("secondaryButton")
+        load_p.clicked.connect(self._load_into_params)
+        folder = QPushButton("Open folder")
+        folder.setObjectName("secondaryButton")
+        folder.clicked.connect(lambda: self._dash._open_folder(PRESETS_DIR))
+        btns.addWidget(refresh)
+        btns.addWidget(load_p)
+        btns.addWidget(folder)
+        btns.addStretch()
+        root.addLayout(btns)
+        close_btn = QDialogButtonBox(QDialogButtonBox.Close)
+        close_btn.rejected.connect(self.close)
+        close_btn.accepted.connect(self.close)
+        root.addWidget(close_btn)
+        self.refresh()
+
+    def _selected_file(self) -> str:
+        rows = self.list_table.selectionModel().selectedRows() if self.list_table.selectionModel() else []
+        if not rows:
+            return ""
+        item = self.list_table.item(rows[0].row(), 0)
+        if item is None:
+            return ""
+        return str(item.data(Qt.UserRole) or item.text() or "")
+
+    def refresh(self) -> None:
+        self._dash._ensure_example_presets()
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        prev = self._selected_file()
+        self.list_table.blockSignals(True)
+        self.list_table.setRowCount(0)
+        try:
+            names = sorted(f for f in os.listdir(PRESETS_DIR) if f.endswith(".json"))
+        except OSError:
+            names = []
+        for name in names:
+            path = self._dash._preset_path(name)
+            display = name
+            pattern = "—"
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if isinstance(meta, dict):
+                    display = str(meta.get("display_name") or name)
+                    pattern = str(meta.get("pattern") or "—")
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
+            row = self.list_table.rowCount()
+            self.list_table.insertRow(row)
+            for col, text in enumerate([name, display, pattern]):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, name)
+                self.list_table.setItem(row, col, item)
+        self.list_table.blockSignals(False)
+        self.list_table.resizeColumnsToContents()
+        if prev:
+            for r in range(self.list_table.rowCount()):
+                it = self.list_table.item(r, 0)
+                if it is not None and it.data(Qt.UserRole) == prev:
+                    self.list_table.selectRow(r)
+                    break
+        elif self.list_table.rowCount():
+            self.list_table.selectRow(0)
+        self._show_selected()
+
+    def _show_selected(self) -> None:
+        name = self._selected_file()
+        if not name:
+            self.detail.setHtml("<i>Select a preset.</i>")
+            return
+        path = self._dash._preset_path(name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.detail.setPlainText(str(e))
+            return
+        if not isinstance(meta, dict):
+            self.detail.setPlainText("Invalid preset.")
+            return
+        rules = meta.get("trade_rules") or {}
+        tfs = meta.get("timeframes") or {}
+        inds = meta.get("indicators_added") or rules.get("indicators_added") or []
+        tf_lines = []
+        for tf, cfg in tfs.items():
+            if not isinstance(cfg, dict):
+                continue
+            tf_lines.append(
+                f"{tf}: RR {cfg.get('rr', '—')} SL {cfg.get('sl', '—')} "
+                f"{'on' if cfg.get('enabled', True) else 'off'}"
+            )
+        used = []
+        for slot in self._dash._live_desk.slots:
+            if slot.preset_file == name:
+                acc = self._dash._live_desk.account_by_id(slot.account_id)
+                used.append(f"{acc.name if acc else '?'} / {slot.name} @ {slot.timeframe}")
+        html = (
+            f"<b>{meta.get('display_name') or name}</b><br>"
+            f"<b>File</b> {name}<br>"
+            f"<b>Pattern</b> {meta.get('pattern') or '—'}<br>"
+            f"<b>Saved</b> {meta.get('saved_at') or '—'}<br>"
+            f"<b>Indicators</b> {', '.join(str(x) for x in inds) or 'none'}<br>"
+            f"<b>Rules</b> {rules.get('plain_english') or rules or '—'}<br>"
+            f"<b>Timeframes</b><br>{'<br>'.join(tf_lines) or '—'}<br>"
+            f"<b>Used by live slots</b><br>"
+            + ("<br>".join(used) if used else "<i>not assigned to a slot yet</i>")
+        )
+        self.detail.setHtml(html)
+
+    def _load_into_params(self) -> None:
+        name = self._selected_file()
+        if not name:
+            return
+        path = self._dash._preset_path(name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            QMessageBox.warning(self, "Preset", str(e))
+            return
+        if not isinstance(data, dict):
+            return
+        self._dash._apply_preset_snapshot(data)
+        if hasattr(self._dash, "preset_combo"):
+            idx = self._dash.preset_combo.findData(name)
+            if idx >= 0:
+                self._dash.preset_combo.setCurrentIndex(idx)
+        self._dash._focus_backtest_params_dock()
+        self._dash._set_app_status(f"Loaded preset {name} into Parameters.")
+
+
+class LiveManagerDialog(QDialog):
+    """Standalone window: every live account and slot — add, edit, delete."""
+
+    def __init__(self, dashboard: "BacktestDashboard"):
+        super().__init__(dashboard)
+        self._dash = dashboard
+        self.setWindowTitle("Live manager")
+        self.setMinimumSize(820, 520)
+        self.resize(900, 580)
+        # Independent tool window — never modal, never blocks live/backtest
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
+        self.setWindowFlag(Qt.Window, True)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "Accounts and slots (Ctrl+M toggles this window). "
+            "Status refreshes in the background without stealing focus from Live or Backtest. "
+            "Each account has its own magic series."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.RichText)
+        intro.setObjectName("sectionHint")
+        root.addWidget(intro)
+
+        acc_box = QGroupBox("Accounts (each has a Live tab)")
+        acc_layout = QVBoxLayout(acc_box)
+        self.acc_table = QTableWidget(0, 7)
+        self.acc_table.setHorizontalHeaderLabels(
+            ["Account", "Login", "MT5", "Bots", "Risk $", "Magics", "Flatten"]
+        )
+        self.acc_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.acc_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.acc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.acc_table.verticalHeader().setVisible(False)
+        self.acc_table.horizontalHeader().setStretchLastSection(True)
+        self.acc_table.setMaximumHeight(160)
+        self.acc_table.itemSelectionChanged.connect(self._on_account_selected)
+        self.acc_table.cellDoubleClicked.connect(lambda *_: self._edit_account())
+        acc_layout.addWidget(self.acc_table)
+        acc_btns = QHBoxLayout()
+        add_a = QPushButton("Add account")
+        add_a.setObjectName("secondaryButton")
+        add_a.clicked.connect(self._add_account)
+        edit_a = QPushButton("Edit account")
+        edit_a.setObjectName("secondaryButton")
+        edit_a.clicked.connect(self._edit_account)
+        del_a = QPushButton("Delete account")
+        del_a.setObjectName("secondaryButton")
+        del_a.clicked.connect(self._delete_account)
+        open_a = QPushButton("Open Live tab")
+        open_a.setObjectName("secondaryButton")
+        open_a.clicked.connect(self._open_account_tab)
+        conn_a = QPushButton("Connect this account")
+        conn_a.setObjectName("secondaryButton")
+        conn_a.clicked.connect(self._connect_account)
+        acc_btns.addWidget(add_a)
+        acc_btns.addWidget(edit_a)
+        acc_btns.addWidget(del_a)
+        acc_btns.addWidget(open_a)
+        acc_btns.addWidget(conn_a)
+        acc_btns.addStretch()
+        acc_layout.addLayout(acc_btns)
+        root.addWidget(acc_box)
+
+        slot_box = QGroupBox("Slots")
+        slot_layout = QVBoxLayout(slot_box)
+        self.filter_this_account = QCheckBox("Show only selected account")
+        self.filter_this_account.setChecked(True)
+        self.filter_this_account.toggled.connect(self.refresh)
+        slot_layout.addWidget(self.filter_this_account)
+        self.slot_table = QTableWidget(0, 8)
+        self.slot_table.setHorizontalHeaderLabels(
+            ["Account", "Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
+        )
+        self.slot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.slot_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.slot_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.slot_table.verticalHeader().setVisible(False)
+        self.slot_table.horizontalHeader().setStretchLastSection(True)
+        self.slot_table.cellDoubleClicked.connect(lambda *_: self._edit_slot())
+        slot_layout.addWidget(self.slot_table)
+        slot_btns = QHBoxLayout()
+        add_s = QPushButton("Add slot")
+        add_s.setObjectName("secondaryButton")
+        add_s.clicked.connect(self._add_slot)
+        edit_s = QPushButton("Edit slot")
+        edit_s.setObjectName("secondaryButton")
+        edit_s.clicked.connect(self._edit_slot)
+        del_s = QPushButton("Delete slot")
+        del_s.setObjectName("secondaryButton")
+        del_s.clicked.connect(self._delete_slot)
+        slot_btns.addWidget(add_s)
+        slot_btns.addWidget(edit_s)
+        slot_btns.addWidget(del_s)
+        slot_btns.addStretch()
+        slot_layout.addLayout(slot_btns)
+        root.addWidget(slot_box, 1)
+
+        close_btn = QDialogButtonBox(QDialogButtonBox.Close)
+        close_btn.rejected.connect(self.close)
+        close_btn.accepted.connect(self.close)
+        root.addWidget(close_btn)
+        self._poll = QTimer(self)
+        self._poll.setInterval(3000)
+        self._poll.timeout.connect(self._poll_refresh)
+        self._poll.start()
+        self.refresh()
+
+    def _poll_refresh(self) -> None:
+        """Background status only — skip while a backtest worker is busy so we don't fight the UI."""
+        dash = self._dash
+        worker = getattr(dash, "_worker_thread", None)
+        if worker is not None and getattr(worker, "is_alive", lambda: False)():
+            return
+        if not self.isVisible():
+            return
+        self.refresh()
+
+    def closeEvent(self, event) -> None:
+        # Hide instead of destroy so Ctrl+M can reopen the same window quickly
+        self.hide()
+        event.ignore()
+
+    def _selected_account_id(self) -> Optional[str]:
+        rows = self.acc_table.selectionModel().selectedRows() if self.acc_table.selectionModel() else []
+        if not rows:
+            return None
+        item = self.acc_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        sid = item.data(Qt.UserRole)
+        return str(sid) if sid else None
+
+    def _selected_slot_id(self) -> Optional[str]:
+        rows = self.slot_table.selectionModel().selectedRows() if self.slot_table.selectionModel() else []
+        if not rows:
+            return None
+        item = self.slot_table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        sid = item.data(Qt.UserRole)
+        return str(sid) if sid else None
+
+    def refresh(self) -> None:
+        dash = self._dash
+        desk = dash._live_desk
+        desk.ensure_defaults()
+        prev_acc = self._selected_account_id()
+        prev_slot = self._selected_slot_id()
+        self.acc_table.blockSignals(True)
+        self.acc_table.setRowCount(0)
+        for acc in desk.accounts:
+            row = self.acc_table.rowCount()
+            self.acc_table.insertRow(row)
+            nslots = len(desk.slots_for_account(acc.id))
+            nrun = sum(1 for s in desk.slots_for_account(acc.id) if s.id in dash._live_workers)
+            connected = dash._account_connected(acc.id)
+            mt5 = "connected" if connected else "idle"
+            bots = f"{nrun}/{nslots} running" if nslots else "0 slots"
+            lo, hi = acc.magic_range()
+            flatten = acc.flatten_hhmm or "off"
+            values = [
+                acc.name,
+                acc.login or "—",
+                mt5,
+                bots,
+                f"{acc.max_daily_loss_usd:g}",
+                f"{lo}–{hi}",
+                flatten,
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, acc.id)
+                self.acc_table.setItem(row, col, item)
+        self.acc_table.blockSignals(False)
+        self.acc_table.resizeColumnsToContents()
+        picked = False
+        if prev_acc:
+            for r in range(self.acc_table.rowCount()):
+                it = self.acc_table.item(r, 0)
+                if it is not None and it.data(Qt.UserRole) == prev_acc:
+                    self.acc_table.selectRow(r)
+                    picked = True
+                    break
+        if not picked and self.acc_table.rowCount():
+            self.acc_table.selectRow(0)
+        self.acc_table.blockSignals(False)
+        self._fill_slots(prev_slot)
+
+    def _fill_slots(self, prev_slot: Optional[str] = None) -> None:
+        dash = self._dash
+        desk = dash._live_desk
+        filter_id = self._selected_account_id() if self.filter_this_account.isChecked() else None
+        slots = desk.slots_for_account(filter_id) if filter_id else list(desk.slots)
+        self.slot_table.blockSignals(True)
+        self.slot_table.setRowCount(0)
+        names = {a.id: a.name for a in desk.accounts}
+        for slot in slots:
+            row = self.slot_table.rowCount()
+            self.slot_table.insertRow(row)
+            status = "RUNNING" if slot.id in dash._live_workers else "stopped"
+            values = [
+                names.get(slot.account_id, slot.account_id),
+                slot.name,
+                slot.symbol,
+                slot.timeframe,
+                dash._preset_display_name(slot.preset_file),
+                str(slot.magic),
+                str(slot.volume),
+                status,
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, slot.id)
+                self.slot_table.setItem(row, col, item)
+        self.slot_table.blockSignals(False)
+        self.slot_table.resizeColumnsToContents()
+        if prev_slot:
+            for r in range(self.slot_table.rowCount()):
+                it = self.slot_table.item(r, 0)
+                if it is not None and it.data(Qt.UserRole) == prev_slot:
+                    self.slot_table.selectRow(r)
+                    break
+
+    def _on_account_selected(self) -> None:
+        if self.filter_this_account.isChecked():
+            self._fill_slots()
+
+    def _add_account(self) -> None:
+        self._dash._on_add_live_account()
+        self.refresh()
+
+    def _edit_account(self) -> None:
+        acc_id = self._selected_account_id()
+        if not acc_id:
+            return
+        self._dash._on_edit_live_account(acc_id)
+        self.refresh()
+
+    def _delete_account(self) -> None:
+        acc_id = self._selected_account_id()
+        if not acc_id:
+            return
+        self._dash._delete_live_account(acc_id)
+        self.refresh()
+
+    def _open_account_tab(self) -> None:
+        acc_id = self._selected_account_id()
+        if not acc_id:
+            return
+        self._dash._raise_live_account_dock(acc_id)
+
+    def _connect_account(self) -> None:
+        acc_id = self._selected_account_id()
+        if not acc_id:
+            return
+        self._dash._raise_live_account_dock(acc_id)
+        self._dash._on_live_connect_account(acc_id)
+        self.refresh()
+
+    def _add_slot(self) -> None:
+        acc_id = self._selected_account_id()
+        self._dash._on_add_live_slot(acc_id)
+        self.refresh()
+
+    def _edit_slot(self) -> None:
+        sid = self._selected_slot_id()
+        if not sid:
+            return
+        slot = self._dash._live_desk.slot_by_id(sid)
+        if slot is None:
+            return
+        self._dash._focused_live_account_id = slot.account_id
+        self._dash._select_live_slot_id(slot.id, slot.account_id)
+        self._dash._on_edit_live_slot(slot.account_id)
+        self.refresh()
+
+    def _delete_slot(self) -> None:
+        sid = self._selected_slot_id()
+        if not sid:
+            return
+        self._dash._delete_live_slot_by_id(sid, confirm=True)
+        self.refresh()
+
+
 class LiveSettingsDialog(QDialog):
-    """All Live tab configuration: MT5, execution, order type, safety, performance."""
+    """Orders, safety, and poll/history. MT5 login is on the Live panel account, not here."""
 
     def __init__(self, dashboard: "BacktestDashboard"):
         super().__init__(dashboard)
@@ -3016,10 +3789,10 @@ class LiveSettingsDialog(QDialog):
 
         root = QVBoxLayout(self)
         intro = QLabel(
-            "<b>Strategy rules</b> (pattern, RR, SL, indicators) come from <b>Backtest Parameters</b> "
-            "or a loaded preset — not from this dialog.<br>"
-            "Here you set MT5, how orders are sent, and risk limits. "
-            "<b>Dry run</b> is on the main Live panel. Click <b>Save</b> when done."
+            "<b>Strategy</b> comes from Backtest Parameters. "
+            "<b>MT5 login</b> is on the Live panel (Active account / Add account) — not here.<br>"
+            "This dialog is order type, safety caps, and poll/history. "
+            "<b>Dry run</b> is on the Live panel. Click <b>Save</b> when done."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.RichText)
@@ -3068,35 +3841,27 @@ class LiveSettingsDialog(QDialog):
         tabs.addTab(strat_tab, "Strategy (read-only)")
 
         util_row = QHBoxLayout()
-        open_journal = QPushButton("Open live log folder")
+        open_journal = QPushButton("Open logs folder")
         open_journal.setObjectName("secondaryButton")
-        open_journal.setToolTip(f"Opens {LIVE_JOURNAL_DIR} (session log + live_trades.csv)")
-        open_journal.clicked.connect(d._open_live_journal_folder)
+        open_journal.setToolTip(
+            f"Opens {LOGS_DIR} — boot/crash + per-account live logs (safe to delete this folder)"
+        )
+        open_journal.clicked.connect(d._open_logs_folder)
         util_row.addWidget(open_journal)
         util_row.addStretch()
 
-        # —— MT5 ——
-        conn_tab = QWidget()
-        conn_form = QFormLayout(conn_tab)
-        conn_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        conn_form.addRow("Terminal (.exe)", d.live_mt5_path)
-        conn_form.addRow("Login", d.live_login)
-        conn_form.addRow("Password", d.live_password)
-        conn_form.addRow("Server", d.live_server)
-        hint = QLabel("Leave terminal path empty if MT5 is already running and logged in.")
-        hint.setWordWrap(True)
-        hint.setObjectName("sectionHint")
-        conn_form.addRow(hint)
-        tabs.addTab(conn_tab, "MT5 connection")
-
-        # —— Execution ——
+        # —— Execution (shared; symbol/TF/magic live on each slot) ——
         exec_tab = QWidget()
         exec_form = QFormLayout(exec_tab)
-        exec_form.addRow("Symbol", d.live_symbol)
-        exec_form.addRow("Timeframe", d.live_timeframe)
-        exec_form.addRow("Lot size", d.live_volume)
-        exec_form.addRow("Magic number", d.live_magic)
-        exec_form.addRow("Max open positions", d.live_max_positions)
+        exec_note = QLabel(
+            "Symbol, timeframe, lots, and magic are set on each <b>slot</b> in the Live panel. "
+            "These fields are shared by every slot in this window."
+        )
+        exec_note.setWordWrap(True)
+        exec_note.setTextFormat(Qt.RichText)
+        exec_note.setObjectName("sectionHint")
+        exec_form.addRow(exec_note)
+        exec_form.addRow("Max open positions (per slot)", d.live_max_positions)
         exec_form.addRow("Poll interval (sec)", d.live_poll_sec)
         exec_form.addRow("History bars (signal)", d.live_history_bars)
         tabs.addTab(exec_tab, "Execution")
@@ -3216,17 +3981,22 @@ class LiveTradingThread(QThread):
 
     finished_cleanly = Signal()
     crashed = Signal(str)
+    slot_finished = Signal(str)
+    slot_crashed = Signal(str, str)
 
-    def __init__(self, engine: live_trading.LiveTradingEngine):
+    def __init__(self, engine: live_trading.LiveTradingEngine, slot_id: str = "default"):
         super().__init__()
         self.engine = engine
+        self.slot_id = slot_id or "default"
 
     def run(self):
         try:
             self.engine.run()
         except Exception as e:
+            self.slot_crashed.emit(self.slot_id, f"{e}\n{traceback.format_exc()}")
             self.crashed.emit(f"{e}\n{traceback.format_exc()}")
         finally:
+            self.slot_finished.emit(self.slot_id)
             self.finished_cleanly.emit()
 
     def request_stop(self):
@@ -3280,16 +4050,63 @@ class BacktestDashboard(QMainWindow):
         self._live_log_bridge = LiveLogBridge()
         self._live_log_bridge.line_ready.connect(self._append_live_log_line)
         try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
             os.makedirs(LIVE_JOURNAL_DIR, exist_ok=True)
         except OSError:
             pass
         self._live_engine: Optional[live_trading.LiveTradingEngine] = None
         self._live_thread: Optional[LiveTradingThread] = None
+        self._live_workers: Dict[str, Dict[str, Any]] = {}
+        # Phase 2: one OS process per MT5 login (MetaTrader5 is process-global)
+        self._account_handles: Dict[str, AccountWorkerHandle] = {}
+        self._account_session_equity: Optional[float] = None
+        self._account_session_equity_by_id: Dict[str, float] = {}
+        self._live_desk = live_accounts.load_desk(LIVE_DESK_PATH)
+        # Migrate desk from older path under output/live/ if present and new path empty
+        if not os.path.isfile(LIVE_DESK_PATH):
+            legacy_desk = os.path.join(DEFAULT_OUTPUT_DIR, "live", "live_desk.json")
+            if os.path.isfile(legacy_desk):
+                try:
+                    self._live_desk = live_accounts.load_desk(legacy_desk)
+                    os.makedirs(os.path.dirname(LIVE_DESK_PATH), exist_ok=True)
+                    live_accounts.save_desk(LIVE_DESK_PATH, self._live_desk)
+                except OSError:
+                    pass
+        self._live_desk.ensure_defaults()
+        try:
+            from hammer_boot import boot_log
+            boot_log("dashboard: BacktestDashboard __init__")
+        except Exception:
+            pass
+        self._live_account_docks: Dict[str, QDockWidget] = {}
+        self._live_account_tables: Dict[str, QTableWidget] = {}
+        self._live_account_status: Dict[str, QLabel] = {}
+        self._live_account_status_chips: Dict[str, Dict[str, QLabel]] = {}
+        self._live_account_summaries: Dict[str, QLabel] = {}
+        self._live_account_logs: List[QPlainTextEdit] = []
+        self._live_account_dry: List[QCheckBox] = []
+        self._live_strategy_mirrors: List[QLabel] = []
+        self._live_stop_buttons: Dict[str, QPushButton] = {}
+        self._primary_live_account_id = (
+            self._live_desk.accounts[0].id if self._live_desk.accounts else ""
+        )
+        self._focused_live_account_id = self._primary_live_account_id
         self._telegram_test_worker: Optional[TelegramTestWorker] = None
         self._active_live_journal_dir: Optional[str] = None
         self._live_health_timer = QTimer(self)
         self._live_health_timer.setInterval(8000)
         self._live_health_timer.timeout.connect(self._check_live_worker_health)
+        self._flatten_fired_on: Dict[str, str] = {}
+        self._flatten_timer = QTimer(self)
+        self._flatten_timer.setInterval(4000)
+        # Look up the handler when the tick fires (not at bind time) so a stale
+        # reload / partial class never crashes __init__ with AttributeError.
+        self._flatten_timer.timeout.connect(lambda: self._on_flatten_timer_tick())
+        # Started after UI is up (see __init__ singleShot) so cold open stays lighter.
+        self._account_worker_poll = QTimer(self)
+        self._account_worker_poll.setInterval(400)
+        self._account_worker_poll.timeout.connect(self._poll_account_worker_events)
+        self._account_worker_poll.start()
 
         self._live_settings_host = QWidget(self)
         self._live_settings_host.setVisible(False)
@@ -3305,9 +4122,17 @@ class BacktestDashboard(QMainWindow):
         self._build_ui()
         self._build_shortcuts()
         self._dock_layout_busy = False
+        self._preview_redraw_pending = False
+        self._preview_redraw_timer = QTimer(self)
+        self._preview_redraw_timer.setSingleShot(True)
+        self._preview_redraw_timer.timeout.connect(self._redraw_candle_preview_now)
+        self._last_preview_chart_args = None
         QTimer.singleShot(0, self._restore_saved_layout)
-        self._refresh_run_history_table()
+        # Defer SQLite history fill — not needed for first paint
+        QTimer.singleShot(0, self._refresh_run_history_table)
         QTimer.singleShot(0, self._restore_live_settings)
+        # Flatten clock only needed once Live is in play; delay first ticks
+        QTimer.singleShot(2500, self._flatten_timer.start)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3451,6 +4276,12 @@ class BacktestDashboard(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_live_trading()
+        for handle in list(self._account_handles.values()):
+            try:
+                handle.shutdown(timeout=3.0)
+            except Exception:
+                pass
+        self._account_handles.clear()
         self.mt5_broker.disconnect()
         try:
             self._dock_all_panels_before_save()
@@ -3495,6 +4326,7 @@ class BacktestDashboard(QMainWindow):
         self.preview_dock = self._make_dock("Pattern & Preview", self._build_preview_panel())
         self.results_dock = self._make_dock("Results", self._build_results_panel())
         self.live_dock = self._make_dock("Live Trading", self._build_live_panel())
+        self._bind_primary_live_dock()
 
         # Client layout (reference): Pattern & Preview left | Live Trading right;
         # Results + Backtest Parameters as tabs on the bottom of the right stack.
@@ -3511,6 +4343,7 @@ class BacktestDashboard(QMainWindow):
         self._apply_default_dock_sizes()
 
         self._build_menu_bar()
+        self._ensure_live_account_docks()
         # Snapshot the layout we just built so "Reset Layout" can restore
         # it after panels get dragged around / floated out.
         self._default_dock_state = self.saveState()
@@ -3534,13 +4367,13 @@ class BacktestDashboard(QMainWindow):
             return
         floating = any(
             d.isFloating()
-            for d in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock)
+            for d in self._all_main_docks()
             if d is not None
         )
         if floating:
             self._place_docks_default_layout()
         else:
-            for dock in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock):
+            for dock in self._all_main_docks():
                 if dock is not None and not dock.isVisible():
                     dock.show()
             self._apply_default_dock_sizes()
@@ -3588,7 +4421,7 @@ class BacktestDashboard(QMainWindow):
             QTimer.singleShot(50, self._place_docks_default_layout)
             return
         self._dock_layout_busy = True
-        docks = (self.params_dock, self.preview_dock, self.results_dock, self.live_dock)
+        docks = self._all_main_docks()
         try:
             for dock in docks:
                 if dock is None:
@@ -3611,6 +4444,8 @@ class BacktestDashboard(QMainWindow):
             self.addDockWidget(Qt.LeftDockWidgetArea, self.preview_dock)
             self.addDockWidget(Qt.RightDockWidgetArea, self.live_dock)
             self.splitDockWidget(self.preview_dock, self.live_dock, Qt.Horizontal)
+            for extra in self._extra_live_docks():
+                self.tabifyDockWidget(self.live_dock, extra)
             self.tabifyDockWidget(self.live_dock, self.results_dock)
             self.tabifyDockWidget(self.live_dock, self.params_dock)
             self.live_dock.raise_()
@@ -3674,9 +4509,109 @@ class BacktestDashboard(QMainWindow):
         except RuntimeError:
             pass
 
+    def _all_main_docks(self) -> list:
+        docks = [self.params_dock, self.preview_dock, self.results_dock, self.live_dock]
+        docks.extend(self._extra_live_docks())
+        return [d for d in docks if d is not None]
+
+    def _extra_live_docks(self) -> list:
+        extras = []
+        for acc_id, dock in self._live_account_docks.items():
+            if dock is None or dock is self.live_dock:
+                continue
+            extras.append(dock)
+        return extras
+
+    def _live_dock_title(self, acc: live_accounts.LiveAccount) -> str:
+        return f"Live · {acc.name}"
+
+    def _bind_primary_live_dock(self) -> None:
+        desk = self._live_desk
+        desk.ensure_defaults()
+        acc = desk.accounts[0]
+        self._primary_live_account_id = acc.id
+        self._focused_live_account_id = acc.id
+        self._register_live_account_ui(
+            acc.id,
+            dock=self.live_dock,
+            table=self.live_desk_table,
+            status=self.live_status_label,
+            summary=self.live_config_summary,
+        )
+        self._live_stop_buttons[acc.id] = self.live_stop_btn
+        self.live_dock.setWindowTitle(self._live_dock_title(acc))
+        if hasattr(self, "live_primary_account_label"):
+            self.live_primary_account_label.setText(acc.name)
+        self.live_dock.visibilityChanged.connect(
+            lambda vis, i=acc.id: self._on_live_account_dock_shown(i, vis)
+        )
+
+    def _register_live_account_ui(
+        self,
+        acc_id: str,
+        *,
+        dock: QDockWidget,
+        table: QTableWidget,
+        status: QLabel,
+        summary: QLabel,
+    ) -> None:
+        self._live_account_docks[acc_id] = dock
+        self._live_account_tables[acc_id] = table
+        self._live_account_status[acc_id] = status
+        self._live_account_summaries[acc_id] = summary
+
+    def _add_live_dock_to_view_menu(self, dock: QDockWidget) -> None:
+        menu = getattr(self, "_view_menu", None)
+        if menu is None:
+            return
+        action = dock.toggleViewAction()
+        reset = getattr(self, "_reset_action", None)
+        if reset is not None:
+            menu.insertAction(reset, action)
+        else:
+            menu.addAction(action)
+        self._dock_toggle_actions.append(action)
+
+    def _on_live_account_dock_shown(self, acc_id: str, visible: bool) -> None:
+        if not visible:
+            return
+        self._focused_live_account_id = acc_id
+        if not self.mt5_broker.is_connected:
+            self._live_desk.active_account_id = acc_id
+
+    def _ensure_live_account_docks(self) -> None:
+        desk = self._live_desk
+        desk.ensure_defaults()
+        if not getattr(self, "live_dock", None):
+            return
+        for acc in desk.accounts:
+            if acc.id in self._live_account_docks:
+                dock = self._live_account_docks[acc.id]
+                dock.setWindowTitle(self._live_dock_title(acc))
+                continue
+            self._create_extra_live_dock(acc, raise_dock=False)
+
+    def _create_extra_live_dock(
+        self, acc: live_accounts.LiveAccount, *, raise_dock: bool = True
+    ) -> QDockWidget:
+        panel = self._build_extra_live_panel(acc.id)
+        dock = self._make_dock(self._live_dock_title(acc), panel)
+        dock.setObjectName(f"LiveAccountDock_{acc.id}")
+        self._live_account_docks[acc.id] = dock
+        self.tabifyDockWidget(self.live_dock, dock)
+        dock.show()
+        self._add_live_dock_to_view_menu(dock)
+        dock.visibilityChanged.connect(
+            lambda vis, i=acc.id: self._on_live_account_dock_shown(i, vis)
+        )
+        if raise_dock:
+            dock.raise_()
+        return dock
+
     def _build_menu_bar(self):
         menu_bar = self.menuBar()
         view_menu = menu_bar.addMenu("View")
+        self._view_menu = view_menu
 
         self._dock_toggle_actions = []
         for dock in (self.params_dock, self.preview_dock, self.results_dock, self.live_dock):
@@ -3697,8 +4632,42 @@ class BacktestDashboard(QMainWindow):
         """Advanced live toggles — kept off the main Live tab for client simplicity."""
         menu_bar = self.menuBar()
         live_menu = menu_bar.addMenu("Live")
+        mgr = QAction("Manager…", self)
+        mgr.setToolTip("Toggle Live manager (Ctrl+M). Does not block Live or Backtest.")
+        mgr.setShortcut(QKeySequence("Ctrl+M"))
+        mgr.setShortcutContext(Qt.ApplicationShortcut)
+        mgr.triggered.connect(self._toggle_live_manager)
+        live_menu.addAction(mgr)
+        presets_act = QAction("Presets…", self)
+        presets_act.setToolTip("Browse saved preset.json files and see what each strategy contains.")
+        presets_act.triggered.connect(self._open_preset_manager)
+        live_menu.addAction(presets_act)
+        open_logs = QAction("Open logs folder…", self)
+        open_logs.setToolTip(
+            "Boot, crash, and per-account live logs under logs/. Delete that folder to clear clutter."
+        )
+        open_logs.triggered.connect(self._open_logs_folder)
+        live_menu.addAction(open_logs)
+        live_menu.addSeparator()
+        add_acc = QAction("Add live account…", self)
+        add_acc.setToolTip("MT5 login/server/terminal for another account. Then set it Active and Connect.")
+        add_acc.triggered.connect(self._on_add_live_account)
+        live_menu.addAction(add_acc)
+        edit_acc = QAction("Edit active account…", self)
+        edit_acc.setToolTip("Change MT5 login, password, server, and terminal path for the Active account.")
+        edit_acc.triggered.connect(self._on_edit_active_live_account)
+        live_menu.addAction(edit_acc)
+        add_slot = QAction("Add slot…", self)
+        add_slot.setToolTip("Another timeframe/strategy on the Active account (unique magic).")
+        add_slot.triggered.connect(self._on_add_live_slot)
+        live_menu.addAction(add_slot)
+        edit_slot = QAction("Edit selected slot…", self)
+        edit_slot.setToolTip("Symbol, timeframe, lots, and magic for the selected row.")
+        edit_slot.triggered.connect(self._on_edit_live_slot)
+        live_menu.addAction(edit_slot)
+        live_menu.addSeparator()
         open_settings = QAction("Settings…", self)
-        open_settings.setToolTip("MT5, execution, market/limit orders, safety, advanced")
+        open_settings.setToolTip("Order type, safety caps, poll interval — not MT5 login.")
         open_settings.triggered.connect(self._open_live_settings)
         live_menu.addAction(open_settings)
         live_menu.addSeparator()
@@ -3816,7 +4785,21 @@ class BacktestDashboard(QMainWindow):
         self._save_live_settings()
         self._refresh_live_perf_hint()
         self._live_log("Dry run ON — orders will not be sent." if checked else "Dry run OFF — orders will be sent when signals fire.")
+        self._sync_live_dry_run_boxes(checked)
         self._refresh_live_config_summary()
+
+    def _sync_live_dry_run_boxes(self, checked: bool) -> None:
+        boxes = []
+        if hasattr(self, "live_dry_run_cb"):
+            boxes.append(self.live_dry_run_cb)
+        boxes.extend(getattr(self, "_live_account_dry", []) or [])
+        sender = self.sender()
+        for cb in boxes:
+            if cb is sender or not _qt_widget_valid(cb):
+                continue
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
 
     def _refresh_live_perf_hint(self):
         self._refresh_live_config_summary()
@@ -4162,61 +5145,63 @@ class BacktestDashboard(QMainWindow):
         tabs.addTab(self._make_field_tab(
             CONTEXT_PATTERN_FIELDS, defaults_context, live_preview=True,
         ), "Context")
-        context_hint = QLabel(
-            "<b>Hammer with candles — context rule:</b><br>"
-            "• <b>BUY</b> — green signal candle; prior N closes must stay at or above candle low.<br>"
-            "• <b>SELL</b> — red signal candle; prior N closes must stay at or below candle high.<br>"
+        context_tip = (
+            "Hammer with candles — context rule:\n"
+            "• BUY — green signal candle; prior N closes must stay at or above candle low.\n"
+            "• SELL — red signal candle; prior N closes must stay at or below candle high.\n"
             "N = 0 means only the signal candle (no prior bars). Pattern In Context colours "
-            "those N bars plus the signal; later bars stay grey.<br>"
-            "Wick shape is optional: uncheck it on the <b>Wicks</b> tab to detect body size + color only "
-            "(set Body % to 10 for a 10% max). Wick up or down is ignored.<br>"
-            "Entry / stop per side on <b>Entry / Exit</b>."
+            "those N bars plus the signal; later bars stay grey.\n"
+            "Wick shape is optional: uncheck it on the Wicks tab to detect body size + color only "
+            "(set Body % to 10 for a 10% max). Wick up or down is ignored.\n"
+            "Entry / stop per side on Entry / Exit.\n"
+            "Hammer with candle 35%: same context, plus entry pullback % toward SL "
+            "(TP still from signal entry × RR)."
         )
-        context_hint.setObjectName("sectionHint")
-        context_hint.setWordWrap(True)
         ctx_tab = self.parameter_tabs.widget(self._param_tab_context)
         if isinstance(ctx_tab, QScrollArea):
             inner = ctx_tab.widget()
             if inner is not None and inner.layout() is not None:
-                inner.layout().addWidget(context_hint)
+                inner.layout().addWidget(
+                    self._make_info_icon(context_tip, label="How Context works")
+                )
         self._param_tab_hammer_direction = tabs.count()
         tabs.addTab(self._make_field_tab(
             DIRECTION_FIELDS,
             defaults_strategy, live_preview=True,
         ), "Direction")
-        dir_hint = QLabel(
-            "<b>Four choices — each is BUY, SELL, or NO:</b><br>"
-            "• <b>Classic</b> = long lower wick. <b>Inverted</b> = long upper wick.<br>"
-            "• <b>Green / red</b> = the signal candle’s own color (not the next entry bar).<br>"
-            "• <b>NO</b> = skip that combination. Set both colors of a type to NO to turn that type off.<br>"
+        dir_tip = (
+            "Four choices — each is BUY, SELL, or NO:\n"
+            "• Classic = long lower wick. Inverted = long upper wick.\n"
+            "• Green / red = the signal candle’s own color (not the next entry bar).\n"
+            "• NO = skip that combination. Set both colors of a type to NO to turn that type off.\n"
             "Defaults: Classic green BUY, Classic red SELL, Inverted green BUY, Inverted red SELL."
         )
-        dir_hint.setObjectName("sectionHint")
-        dir_hint.setWordWrap(True)
         dir_tab_idx = self._param_tab_hammer_direction
         dir_tab = self.parameter_tabs.widget(dir_tab_idx)
         if isinstance(dir_tab, QScrollArea):
             inner = dir_tab.widget()
             if inner is not None and inner.layout() is not None:
-                inner.layout().addWidget(dir_hint)
+                inner.layout().addWidget(
+                    self._make_info_icon(dir_tip, label="How Direction works")
+                )
         self._param_tab_doji_direction = tabs.count()
         tabs.addTab(self._make_field_tab(
             DOJI_DIRECTION_FIELDS + DOJI_CANDLE_COLOR_FIELDS,
             defaults_doji_strategy, live_preview=True,
         ), "Doji Direction")
-        doji_hint = QLabel(
-            "<b>Doji rules (same in backtest and live):</b><br>"
-            "1) <b>Style</b> — ANY, Classic, Dragonfly, Gravestone, or Long-legged (shape on Body/Wicks tabs).<br>"
-            "2) <b>Direction mode</b> — wick bias, candle color, fixed buy/sell, or next candle color.<br>"
-            "3) Use <b>Pattern & Preview</b> BUY / SELL toggles; Pattern In Context follows the same preview."
+        doji_tip = (
+            "Doji rules (same in backtest and live):\n"
+            "1) Style — ANY, Classic, Dragonfly, Gravestone, or Long-legged (shape on Body/Wicks tabs).\n"
+            "2) Direction mode — wick bias, candle color, fixed buy/sell, or next candle color.\n"
+            "3) Use Pattern Preview BUY / SELL toggles; Pattern In Context follows the same preview."
         )
-        doji_hint.setObjectName("sectionHint")
-        doji_hint.setWordWrap(True)
         doji_tab = self.parameter_tabs.widget(self._param_tab_doji_direction)
         if isinstance(doji_tab, QScrollArea):
             inner = doji_tab.widget()
             if inner is not None and inner.layout() is not None:
-                inner.layout().addWidget(doji_hint)
+                inner.layout().addWidget(
+                    self._make_info_icon(doji_tip, label="How Doji Direction works")
+                )
         tabs.addTab(self._make_indicator_tab(), "Indicators")
         tabs.addTab(self._make_entry_exit_tab(defaults_strategy), "Entry / Exit")
         tabs.addTab(
@@ -4268,7 +5253,7 @@ class BacktestDashboard(QMainWindow):
         """Show hammer / doji / hammer-context fields depending on the selected pattern."""
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
         is_doji = pattern == "Doji"
-        is_hammer_with_candles = pattern == "Hammer with candles"
+        is_hammer_with_candles = hammer_context_logic.is_context_pattern_label(pattern)
         is_plain_hammer = pattern == "Hammer"
 
         for name in HAMMER_ONLY_FIELD_NAMES:
@@ -4298,26 +5283,40 @@ class BacktestDashboard(QMainWindow):
                 self.field_labels[name].setVisible(visible)
 
         for name in CONTEXT_PATTERN_FIELD_NAMES:
-            visible = is_hammer_with_candles
+            if name in ENTRY_PULLBACK_FIELD_NAMES:
+                visible = pattern == hammer_context_logic.PATTERN_LABEL_35
+            else:
+                visible = is_hammer_with_candles
             if name in self.field_widgets:
                 self.field_widgets[name].setVisible(visible)
             if name in self.field_labels:
                 self.field_labels[name].setVisible(visible)
 
+        if pattern == hammer_context_logic.PATTERN_LABEL_35:
+            w = self.field_widgets.get("entry_pullback_pct")
+            if isinstance(w, QLineEdit) and not w.text().strip():
+                w.setText("35")
+            elif isinstance(w, QLineEdit):
+                try:
+                    if float(w.text().strip()) <= 0:
+                        w.setText("35")
+                except ValueError:
+                    w.setText("35")
+
         if hasattr(self, "tolerance_hint_label"):
             if is_doji:
-                self.tolerance_hint_label.setText(
+                self._set_tolerance_hint(
                     "Loosest and tightest candles your current doji tolerance "
                     "settings will still accept."
                 )
             elif is_hammer_with_candles:
-                self.tolerance_hint_label.setText(
+                self._set_tolerance_hint(
                     "With wick required: classic BUY / inverted SELL shape. "
                     "With wick off: Body % max only; direction from previous candle "
                     "(red→BUY, green→SELL) — signal color ignored."
                 )
             else:
-                self.tolerance_hint_label.setText(
+                self._set_tolerance_hint(
                     "Loosest and tightest candles your current tolerance "
                     "settings will still accept as a valid hammer."
                 )
@@ -4337,13 +5336,15 @@ class BacktestDashboard(QMainWindow):
                 self._entry_exit_inverted_box.setTitle("Inverted hammer")
         if hasattr(self, "_entry_exit_hint"):
             if is_doji:
-                self._entry_exit_hint.setText(
-                    "Doji uses these entry and stop settings for every signal."
+                self._set_info_tip(
+                    self._entry_exit_hint,
+                    "Doji uses these entry and stop settings for every signal.",
                 )
             elif not is_hammer_with_candles:
-                self._entry_exit_hint.setText(
+                self._set_info_tip(
+                    self._entry_exit_hint,
                     "Classic (long lower wick) and inverted (long upper wick) have their own entry and stop. "
-                    "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip."
+                    "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip.",
                 )
         if is_hammer_with_candles:
             self._refresh_hwc_copy_for_wick_mode()
@@ -4377,18 +5378,16 @@ class BacktestDashboard(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
 
-        hwc_hint = QLabel(
-            "<b>Hammer with candles — body size</b><br>"
-            "Two independent sections: BUY and SELL.<br>"
-            "When wick is <b>on</b>: Body % is a target with +/- tolerance (hammer shape).<br>"
-            "When wick is <b>off</b>: Body % is a hard maximum (e.g. 10 = body ≤ 10%). "
-            "Wick shape and <b>signal candle color are ignored</b>. "
-            "Direction comes from the previous candle: red → BUY, green → SELL."
+        self._hwc_body_hint = self._make_info_icon(
+            "Hammer with candles — body size\n"
+            "Two independent sections: BUY and SELL.\n"
+            "When wick is on: Body % is a target with +/- tolerance (hammer shape).\n"
+            "When wick is off: Body % is a hard maximum (e.g. 10 = body ≤ 10%). "
+            "Wick shape and signal candle color are ignored. "
+            "Direction comes from the previous candle: red → BUY, green → SELL.",
+            label="How Body works (Hammer with candles)",
         )
-        hwc_hint.setObjectName("sectionHint")
-        hwc_hint.setWordWrap(True)
-        layout.addWidget(hwc_hint)
-        self._hwc_body_hint = hwc_hint
+        layout.addWidget(self._hwc_body_hint)
 
         buy_box = QGroupBox("BUY — Classic green hammer")
         buy_grid = QGridLayout(buy_box)
@@ -4447,18 +5446,16 @@ class BacktestDashboard(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
 
-        hwc_hint = QLabel(
-            "<b>Hammer with candles — wick size</b><br>"
-            "<b>Unchecked (body-only mode):</b> Dominant Wick % is <b>not used</b>. "
+        self._hwc_wicks_hint = self._make_info_icon(
+            "Hammer with candles — wick size\n"
+            "Unchecked (body-only mode): Dominant Wick % is not used. "
             "Only Body % counts. Signal color does not matter. "
-            "Previous candle: <b>red → BUY</b>, <b>green → SELL</b>.<br>"
-            "<b>Checked (default):</b> classic long lower wick for BUY, inverted long upper wick for SELL "
-            "(that is when the 60% ± 18% band applies)."
+            "Previous candle: red → BUY, green → SELL.\n"
+            "Checked (default): classic long lower wick for BUY, inverted long upper wick for SELL "
+            "(that is when the 60% ± 18% band applies).",
+            label="How Wicks works (Hammer with candles)",
         )
-        hwc_hint.setObjectName("sectionHint")
-        hwc_hint.setWordWrap(True)
-        layout.addWidget(hwc_hint)
-        self._hwc_wicks_hint = hwc_hint
+        layout.addWidget(self._hwc_wicks_hint)
 
         buy_box = QGroupBox("BUY — Classic green hammer")
         buy_grid = QGridLayout(buy_box)
@@ -4614,7 +5611,7 @@ class BacktestDashboard(QMainWindow):
     def _refresh_hwc_copy_for_wick_mode(self):
         """Entry/Exit and Body/Wicks titles: 'hammer' only when wick shape is required."""
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else ""
-        if pattern != "Hammer with candles":
+        if not hammer_context_logic.is_context_pattern_label(pattern):
             return
         buy_wick = self._require_wick_checked("buy")
         sell_wick = self._require_wick_checked("sell")
@@ -4639,17 +5636,19 @@ class BacktestDashboard(QMainWindow):
         self._apply_entry_rule_combo_labels("inverted_entry_rule", sell_wick)
         if hasattr(self, "_entry_exit_hint"):
             if not buy_wick and not sell_wick:
-                self._entry_exit_hint.setText(
+                self._set_info_tip(
+                    self._entry_exit_hint,
                     "Wick off: signal color is ignored. Direction = previous candle "
                     "(red → BUY, green → SELL). Body % only on the signal bar. "
                     "BUY uses this box (SL at signal low + buffer by default). "
                     "SELL uses the box below (SL at signal high + buffer). "
-                    "Entry Rule options say <i>Signal candle</i> instead of <i>Hammer candle</i>."
+                    "Entry Rule options say Signal candle instead of Hammer candle.",
                 )
             elif buy_wick and sell_wick:
-                self._entry_exit_hint.setText(
+                self._set_info_tip(
+                    self._entry_exit_hint,
                     "Classic green hammer (BUY) and inverted red hammer (SELL) each have their own entry and stop. "
-                    "Entry Rule lists <i>Hammer candle</i> close / high / low for entries on the signal bar."
+                    "Entry Rule lists Hammer candle close / high / low for entries on the signal bar.",
                 )
             else:
                 wick_bits = []
@@ -4661,7 +5660,7 @@ class BacktestDashboard(QMainWindow):
                     wick_bits.append("SELL: hammer shape — Entry Rule shows Hammer candle …")
                 else:
                     wick_bits.append("SELL: body only — Entry Rule shows Signal candle …")
-                self._entry_exit_hint.setText(" ".join(wick_bits))
+                self._set_info_tip(self._entry_exit_hint, " ".join(wick_bits))
 
     def _wire_sl_mode_fields(self):
         """Enable buffer fields for candle SL; fixed distance for fixed-from-entry SL."""
@@ -4934,12 +5933,11 @@ class BacktestDashboard(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(14)
 
-        hint = QLabel(
+        hint = self._make_info_icon(
             "Classic (long lower wick) and inverted (long upper wick) have their own entry and stop. "
-            "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip."
+            "HAMMER_HIGH on classic is the short-wick side; on inverted it is the long-wick tip.",
+            label="How Entry / Exit works",
         )
-        hint.setObjectName("sectionHint")
-        hint.setWordWrap(True)
         layout.addWidget(hint)
 
         classic_box = QGroupBox("Classic hammer")
@@ -4973,14 +5971,12 @@ class BacktestDashboard(QMainWindow):
 
         preset_box = QGroupBox("Saved parameter sets (optional)")
         preset_layout = QVBoxLayout(preset_box)
-        preset_hint = QLabel(
+        preset_layout.addWidget(self._make_info_icon(
             "You can backtest with any settings — no preset needed. "
             "After a run looks good, save the current parameters here to reload the same setup later "
-            "(for example before live trading). Loading a preset replaces the form; it is never required."
-        )
-        preset_hint.setObjectName("sectionHint")
-        preset_hint.setWordWrap(True)
-        preset_layout.addWidget(preset_hint)
+            "(for example before live trading). Loading a preset replaces the form; it is never required.",
+            label="About saved presets",
+        ))
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel("Saved:"))
@@ -5006,14 +6002,13 @@ class BacktestDashboard(QMainWindow):
         preset_layout.addLayout(preset_row)
         layout.addWidget(preset_box)
 
-        run_hint = QLabel(
-            "Backtest execution: symbol, data folder, date range, position sizing (compare Fixed $ risk vs % equity vs fixed lots), "
-            "overlap, commission/slippage. Signal rules come from the other parameter tabs + Timeframes. "
-            "Bold labels below = fields used by the current Position Sizing Mode."
-        )
-        run_hint.setObjectName("sectionHint")
-        run_hint.setWordWrap(True)
-        layout.addWidget(run_hint)
+        layout.addWidget(self._make_info_icon(
+            "Backtest execution: symbol, data folder, date range, position sizing "
+            "(compare Fixed $ risk vs % equity vs fixed lots), overlap, commission/slippage. "
+            "Signal rules come from the other parameter tabs + Timeframes. "
+            "Bold labels below = fields used by the current Position Sizing Mode.",
+            label="How Run Settings works",
+        ))
 
         layout.addWidget(self._make_field_tab(BACKTEST_FIELDS, defaults_backtest), 1)
         QTimer.singleShot(0, lambda: self._refresh_preset_combo(keep_selection=False))
@@ -5028,8 +6023,8 @@ class BacktestDashboard(QMainWindow):
 
     def _refresh_sizing_field_highlights(self):
         """Bold labels for sizing fields that apply to the selected mode (all fields stay editable)."""
-        normal = "font-weight: normal; color: #3C4043;"
-        active = "font-weight: bold; color: #137333;"
+        normal = "font-weight: normal; color: #3C4043; background-color: transparent;"
+        active = "font-weight: bold; color: #137333; background-color: transparent;"
         mode_raw = ""
         combo = self.field_widgets.get("position_sizing_mode")
         if isinstance(combo, QComboBox):
@@ -5083,13 +6078,11 @@ class BacktestDashboard(QMainWindow):
         layout = QVBoxLayout(inner)
         layout.setContentsMargins(14, 14, 14, 14)
 
-        hint = QLabel(
+        layout.addWidget(self._make_info_icon(
             "Set reward:risk and max stop-loss per timeframe, choose which folders to include in a run, "
-            "and use the risk toggles below to skip trades that exceed max SL or have invalid entry/SL."
-        )
-        hint.setObjectName("sectionHint")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+            "and use the risk toggles below to skip trades that exceed max SL or have invalid entry/SL.",
+            label="How Timeframes works",
+        ))
 
         risk_box = QGroupBox("Signal risk filters")
         risk_box.setObjectName("fieldGroup")
@@ -5110,15 +6103,12 @@ class BacktestDashboard(QMainWindow):
         session_box = QGroupBox("When to take trades")
         session_box.setObjectName("fieldGroup")
         session_layout = QVBoxLayout(session_box)
-        session_hint = QLabel(
-            "Choose <b>one</b>: trading sessions, or Indian time hours. "
+        session_layout.addWidget(self._make_info_icon(
+            "Choose one: trading sessions, or Indian time hours. "
             "IST converts IC Markets server time automatically (GMT+2 winter / GMT+3 summer). "
-            "Same setting is used for backtest and live."
-        )
-        session_hint.setObjectName("sectionHint")
-        session_hint.setWordWrap(True)
-        session_hint.setTextFormat(Qt.RichText)
-        session_layout.addWidget(session_hint)
+            "Same setting is used for backtest and live.",
+            label="When to take trades",
+        ))
 
         self.time_filter_mode_group = QButtonGroup(self)
         self.time_filter_mode_sessions = QRadioButton("Trading sessions (Asian / London / US)")
@@ -5331,15 +6321,13 @@ class BacktestDashboard(QMainWindow):
         outer_layout.setContentsMargins(0, 0, 0, 6)
         outer_layout.setSpacing(6)
 
-        intro = QLabel(
+        self.preview_toolbar_intro = self._make_info_icon(
             "Use the toggles to preview how a valid signal looks for a BUY vs SELL and "
             "for classic (long lower wick) vs inverted (long upper wick). "
-            "This mirrors logic.py: shape first, then candle color → direction from Parameters → Direction."
+            "This mirrors logic.py: shape first, then candle color → direction from Parameters → Direction.",
+            label="How Pattern Preview works",
         )
-        intro.setObjectName("sectionHint")
-        intro.setWordWrap(True)
-        self.preview_toolbar_intro = intro
-        outer_layout.addWidget(intro)
+        outer_layout.addWidget(self.preview_toolbar_intro)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Preview trade:"))
@@ -5375,7 +6363,7 @@ class BacktestDashboard(QMainWindow):
 
         self.preview_summary_label = QLabel("")
         self.preview_summary_label.setWordWrap(True)
-        self.preview_summary_label.setObjectName("sectionHint")
+        self.preview_summary_label.setObjectName("previewSummary")
         outer_layout.addWidget(self.preview_summary_label)
 
         self._sync_preview_toolbar_for_pattern()
@@ -5390,16 +6378,18 @@ class BacktestDashboard(QMainWindow):
         if hasattr(self, "preview_hammer_shape_row"):
             self.preview_hammer_shape_row.setVisible(not is_doji)
         if is_doji:
-            self.preview_toolbar_intro.setText(
+            self._set_info_tip(
+                self.preview_toolbar_intro,
                 "Preview how a doji signal looks for BUY (green) vs SELL (red). "
                 "Shape comes from Parameters → Doji Style and wick/body fields; "
                 "direction comes from Doji Direction (same rules as backtest and live). "
-                "Pattern In Context updates with these toggles."
+                "Pattern In Context updates with these toggles.",
             )
         else:
-            self.preview_toolbar_intro.setText(
+            self._set_info_tip(
+                self.preview_toolbar_intro,
                 "Preview hammer signals: BUY vs SELL candle color, classic vs inverted wick shape. "
-                "Matches logic.py and Parameters → Direction. Pattern In Context uses the same settings."
+                "Matches logic.py and Parameters → Direction. Pattern In Context uses the same settings.",
             )
             self._sync_preview_shape_toggle_enabled()
 
@@ -5455,7 +6445,7 @@ class BacktestDashboard(QMainWindow):
             self.preview_summary_label.setText(
                 f"Preview: {color_word} doji · {trade_side} trade · {detection_line}"
             )
-        elif pattern == "Hammer with candles":
+        elif hammer_context_logic.is_context_pattern_label(pattern):
             self.preview_summary_label.setText(
                 f"Preview: {variant} · {color_word} candle · {trade_side} trade · {detection_line}"
             )
@@ -5499,12 +6489,16 @@ class BacktestDashboard(QMainWindow):
         tolerance_box = QGroupBox("Tolerance Range Preview")
         tolerance_layout = QVBoxLayout(tolerance_box)
 
-        hint = QLabel("Loosest and tightest candles your current tolerance "
-                       "settings will still accept as a valid hammer.")
-        hint.setObjectName("sectionHint")
-        hint.setWordWrap(True)
-        self.tolerance_hint_label = hint
-        tolerance_layout.addWidget(hint)
+        tip_row = self._make_info_icon(
+            "Loosest and tightest candles your current tolerance "
+            "settings will still accept as a valid hammer.",
+            label="Tolerance preview",
+        )
+        self.tolerance_hint_info = tip_row
+        # Keep a hidden label so existing setText call sites still work via wrapper
+        self.tolerance_hint_label = QLabel("")
+        self.tolerance_hint_label.setVisible(False)
+        tolerance_layout.addWidget(tip_row)
 
         pair_row = QHBoxLayout()
         min_col = QVBoxLayout()
@@ -5513,7 +6507,7 @@ class BacktestDashboard(QMainWindow):
         min_col.addWidget(self.tolerance_widget_min)
         self.tolerance_label_min = QLabel("")
         self.tolerance_label_min.setAlignment(Qt.AlignCenter)
-        self.tolerance_label_min.setStyleSheet("font-size: 11px;")
+        self.tolerance_label_min.setStyleSheet("font-size: 11px; background-color: transparent;")
         min_col.addWidget(self.tolerance_label_min)
         pair_row.addLayout(min_col)
 
@@ -5523,7 +6517,7 @@ class BacktestDashboard(QMainWindow):
         max_col.addWidget(self.tolerance_widget_max)
         self.tolerance_label_max = QLabel("")
         self.tolerance_label_max.setAlignment(Qt.AlignCenter)
-        self.tolerance_label_max.setStyleSheet("font-size: 11px;")
+        self.tolerance_label_max.setStyleSheet("font-size: 11px; background-color: transparent;")
         max_col.addWidget(self.tolerance_label_max)
         pair_row.addLayout(max_col)
 
@@ -5547,25 +6541,28 @@ class BacktestDashboard(QMainWindow):
         # multiple / max SL from the Timeframe Table tab. This is what
         # answers "does everything I'm setting actually line up" --
         # not just an isolated candle shape.
-        context_hint = QLabel(
-            "ENTRY / SL / TP follow Entry / Exit for the preview side. "
-            "Hammer with candles: colour the signal candle and the prior N bars from the Context tab. "
-            "Hammer and Doji colour only the signal (single-candle patterns). "
-            "The next bar is the entry candle — it stays grey. Trail bars after that stay grey. "
+        pic_tip = (
+            "ENTRY / SL / TP follow Entry / Exit for the preview side.\n"
+            "Hammer with candles: colour the signal candle and the prior N bars from the Context tab.\n"
+            "Hammer with candle 35%: same, and ENTRY moves toward SL by your pullback % "
+            "(BUY drops, SELL rises); TP stays on signal entry × RR (unchanged by pullback).\n"
+            "Hammer and Doji colour only the signal (single-candle patterns).\n"
+            "The next bar is the entry candle — it stays grey. Trail bars after that stay grey.\n"
             "Every timeframe tab uses the same N; only noise/RR/max SL change per tab."
         )
-        context_hint.setObjectName("sectionHint")
-        context_hint.setWordWrap(True)
-        layout.addWidget(context_hint)
+        layout.addWidget(self._make_info_icon(pic_tip, label="How Pattern In Context works"))
 
         self.context_tabs = QTabWidget()
         self.context_tabs.setObjectName("contextTimeframeTabs")
         self.context_charts: Dict[str, PatternContextChart] = {}
+        self.context_tabs.blockSignals(True)
         for tf in TIMEFRAME_LABELS:
             chart = PatternContextChart()
             chart.setMinimumHeight(230)
             self.context_charts[tf] = chart
             self.context_tabs.addTab(chart, tf)
+        self.context_tabs.blockSignals(False)
+        self.context_tabs.currentChanged.connect(self._on_context_preview_tab_changed)
         layout.addWidget(self.context_tabs, 1)
 
         indicator_row = QHBoxLayout()
@@ -5652,13 +6649,35 @@ class BacktestDashboard(QMainWindow):
         return body_lo, body_hi, dominant_lo, dominant_hi, small_lo, small_hi
 
     def _redraw_candle_preview(self, *args):
+        """Coalesce rapid field edits into one redraw (keeps typing snappy)."""
+        self._preview_redraw_pending = True
+        timer = getattr(self, "_preview_redraw_timer", None)
+        if timer is None:
+            self._redraw_candle_preview_now()
+            return
+        timer.start(60)
+
+    def _redraw_candle_preview_now(self):
+        self._preview_redraw_pending = False
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
-        if pattern == "Hammer with candles":
+        if hammer_context_logic.is_context_pattern_label(pattern):
             self._redraw_hammer_context_preview()
         elif pattern == "Doji":
             self._redraw_doji_candle_preview()
         else:
             self._redraw_hammer_candle_preview()
+
+    def _on_context_preview_tab_changed(self, _index: int = 0):
+        """Repaint only the newly visible timeframe chart (args cached from last redraw)."""
+        args = getattr(self, "_last_preview_chart_args", None)
+        if not args:
+            self._redraw_candle_preview()
+            return
+        body_pct, dominant_pct, small_pct, wick_side, is_green, kwargs = args
+        self._update_context_charts(
+            body_pct, dominant_pct, small_pct, wick_side, is_green,
+            update_all=False, **kwargs,
+        )
 
     def _redraw_hammer_context_preview(self):
         """Preview BUY classic or SELL inverted shape for Hammer with candles."""
@@ -5722,14 +6741,24 @@ class BacktestDashboard(QMainWindow):
 
         n = cfg.lookback_candles
         det = hammer_context_logic.describe_hammer_context_rules(cfg)
+        pattern_label = (
+            self.pattern_combo.currentText()
+            if hasattr(self, "pattern_combo")
+            else hammer_context_logic.PATTERN_LABEL
+        )
         if hasattr(self, "tolerance_hint_label"):
-            self.tolerance_hint_label.setText(
-                f"Hammer with candles — preview {trade_side}. Prior {n} candle(s) must respect hammer "
-                f"{'low' if is_buy else 'high'}. BUY/SELL each have own Body/Wicks rows. {det}"
+            pull = float(getattr(cfg, "entry_pullback_pct", 0.0) or 0.0)
+            pull_note = (
+                f" Entry waits {pull:g}% of SL distance toward the stop."
+                if pull > 0 else ""
+            )
+            self._set_tolerance_hint(
+                f"{pattern_label} — preview {trade_side}. Prior {n} candle(s) must respect hammer "
+                f"{'low' if is_buy else 'high'}. BUY/SELL each have own Body/Wicks rows.{pull_note} {det}"
             )
 
         self._update_preview_summary_label(
-            pattern="Hammer with candles",
+            pattern=pattern_label,
             variant=variant,
             is_green=is_green,
             trade_side=trade_side,
@@ -5776,7 +6805,7 @@ class BacktestDashboard(QMainWindow):
         self.tolerance_label_max.setText(f"Tightest valid shape\nBody: {body_lo:.0f}%  Wick: {dominant_hi:.0f}%")
 
         if hasattr(self, "tolerance_hint_label"):
-            self.tolerance_hint_label.setText(
+            self._set_tolerance_hint(
                 f"Tolerance band for a valid {variant.lower()} hammer ({draw_wick.lower()} dominant wick). "
                 f"Engine: {logic.describe_hammer_detection(cfg)}"
             )
@@ -5937,14 +6966,14 @@ class BacktestDashboard(QMainWindow):
         )
 
         if hasattr(self, "tolerance_hint_label"):
-            self.tolerance_hint_label.setText(
+            self._set_tolerance_hint(
                 f"Tolerance band for doji style {doji_style}. {det}"
             )
 
     def _preview_entry_exit_kwargs(self, is_doji: bool, hammer_variant: str) -> dict:
         """Classic vs inverted Entry / Exit fields for Pattern In Context."""
         pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else "Hammer"
-        if pattern == "Hammer with candles":
+        if hammer_context_logic.is_context_pattern_label(pattern):
             try:
                 cfg = self._build_hammer_context_strategy_config()
             except Exception:
@@ -5959,6 +6988,7 @@ class BacktestDashboard(QMainWindow):
                     "buffer_mode": cfg.inverted_buffer_mode,
                     "sl_buffer_pct": cfg.inverted_sl_buffer_pct,
                     "sl_buffer_flat": cfg.inverted_sl_buffer_flat,
+                    "entry_pullback_pct": float(getattr(cfg, "entry_pullback_pct", 0.0) or 0.0),
                 }
             return {
                 "entry_rule": cfg.entry_rule,
@@ -5968,6 +6998,7 @@ class BacktestDashboard(QMainWindow):
                 "buffer_mode": cfg.buffer_mode,
                 "sl_buffer_pct": cfg.sl_buffer_pct,
                 "sl_buffer_flat": cfg.sl_buffer_flat,
+                "entry_pullback_pct": float(getattr(cfg, "entry_pullback_pct", 0.0) or 0.0),
             }
         use_inverted = (not is_doji) and str(hammer_variant).upper() == "INVERTED"
         defaults = logic.StrategyConfig()
@@ -6010,6 +7041,7 @@ class BacktestDashboard(QMainWindow):
             "buffer_mode": buf.value if hasattr(buf, "value") else buf,
             "sl_buffer_pct": float(pct or 0.0),
             "sl_buffer_flat": float(flat or 0.0),
+            "entry_pullback_pct": 0.0,
         }
 
     def _update_context_charts(
@@ -6018,10 +7050,38 @@ class BacktestDashboard(QMainWindow):
         hammer_variant: str = "CLASSIC",
         preview_trade_side: str = "BUY",
         context_lookback: int = 5,
+        update_all: bool = False,
         **entry_exit_kwargs,
     ):
+        kwargs = dict(
+            is_doji=is_doji,
+            doji_style=doji_style,
+            hammer_variant=hammer_variant,
+            preview_trade_side=preview_trade_side,
+            context_lookback=context_lookback,
+            **entry_exit_kwargs,
+        )
+        self._last_preview_chart_args = (
+            body_pct, dominant_pct, small_pct, wick_side, is_green, kwargs,
+        )
         defaults = logic.DEFAULT_TIMEFRAME_SETTINGS
-        for tf, chart in getattr(self, "context_charts", {}).items():
+        charts = getattr(self, "context_charts", {}) or {}
+        if not charts:
+            return
+        if update_all:
+            targets = list(charts.items())
+        else:
+            # Only the visible Pattern In Context tab — 7 charts on every keystroke was slow
+            current_tf = None
+            tabs = getattr(self, "context_tabs", None)
+            if tabs is not None:
+                current_tf = tabs.tabText(tabs.currentIndex())
+            if current_tf and current_tf in charts:
+                targets = [(current_tf, charts[current_tf])]
+            else:
+                targets = list(charts.items())[:1]
+
+        for tf, chart in targets:
             tf_widgets = self.timeframe_widgets.get(tf)
             try:
                 rr_multiple = float(tf_widgets["rr"].text()) if tf_widgets else defaults[tf].rr_multiple
@@ -6058,6 +7118,8 @@ class BacktestDashboard(QMainWindow):
         """Illustrative ST/VWAP lines for Pattern In Context (aligned with indicators/filter.py)."""
         show_st = "supertrend" in self.added_indicator_ids
         show_vwap = "vwap" in self.added_indicator_ids
+        show_rolling_vwap = "rolling_vwap" in self.added_indicator_ids
+        show_rsi = "rsi" in self.added_indicator_ids
         direction = (
             logic.TradeDirection.SELL if preview_trade_side == "SELL" else logic.TradeDirection.BUY
         )
@@ -6083,6 +7145,10 @@ class BacktestDashboard(QMainWindow):
             "preview_st_bullish": st_bullish,
             "preview_show_vwap": show_vwap,
             "preview_price_above_vwap": above_vwap,
+            "preview_show_rolling_vwap": show_rolling_vwap,
+            "preview_price_above_rolling_vwap": above_vwap,
+            "preview_show_rsi": show_rsi,
+            "preview_rsi_ok": preview_trade_side == "BUY" or not is_green,
         }
 
     def _add_indicator(self, ind_id: str) -> bool:
@@ -6212,14 +7278,13 @@ class BacktestDashboard(QMainWindow):
         outer = QVBoxLayout(inner)
         outer.setContentsMargins(12, 12, 12, 12)
 
-        hint = QLabel(
+        outer.addWidget(self._make_info_icon(
             "Add indicators from the dropdown (required — adding alone enables them), tune parameters, "
             "and keep “Apply trade filter (backtest + live)” checked to block trades that fail "
-            "SuperTrend/VWAP on the same timeframe as live trading. Stop and Start live after changes."
-        )
-        hint.setObjectName("sectionHint")
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
+            "SuperTrend / VWAP / Rolling VWAP / RSI on the same timeframe as live trading. "
+            "Stop and Start live after changes.",
+            label="How Indicators works",
+        ))
 
         logic_row = QHBoxLayout()
         rules_btn = QPushButton("View filter rules…")
@@ -6229,7 +7294,7 @@ class BacktestDashboard(QMainWindow):
         open_code_btn = QPushButton("Open filter logic file")
         open_code_btn.setObjectName("secondaryButton")
         open_code_btn.setToolTip(
-            f"Opens {INDICATOR_FILTER_LOGIC_FILE} in your editor — edit _supertrend_passes / _vwap_passes to change behavior."
+            f"Opens {INDICATOR_FILTER_LOGIC_FILE} in your editor — edit _supertrend_passes / _vwap_passes / _rolling_vwap_passes / _rsi_passes to change behavior."
         )
         open_code_btn.clicked.connect(self._open_indicator_filter_logic_file)
         logic_row.addWidget(rules_btn)
@@ -6344,35 +7409,61 @@ class BacktestDashboard(QMainWindow):
         title.setObjectName("liveHeroTitle")
         hero_layout.addWidget(title)
         steps = QHBoxLayout()
-        steps.setSpacing(8)
-        for text in ("1 · Strategy & risk", "2 · Connect MT5", "3 · Dry run, then go live"):
+        steps.setSpacing(14)
+        for text in ("1 · This Live tab = one MT5 login", "2 · Add slots (TF / magic)", "3 · Dry run, then Start"):
             chip = QLabel(text)
             chip.setObjectName("liveStepChip")
             steps.addWidget(chip)
         steps.addStretch()
         hero_layout.addLayout(steps)
-        sub = QLabel(
-            "Use menu <b>Notifications</b> for Telegram alerts. "
-            "Use <b>Settings…</b> for MT5, orders, and risk limits."
-        )
-        sub.setTextFormat(Qt.RichText)
-        sub.setWordWrap(True)
-        sub.setObjectName("sectionHint")
-        hero_layout.addWidget(sub)
+        hero_layout.addWidget(self._make_info_icon(
+            "Add account opens another Live tab here (same Results / Parameters).\n"
+            "Slot = one timeframe + magic on this login.\n"
+            "Settings… = orders and safety — not the MT5 password.\n"
+            "Each Live account runs in its own worker process so two MT5 logins "
+            "can trade in parallel. Use a separate terminal path per account.",
+            label="How Live works",
+        ))
         root.addWidget(hero)
 
-        control = QFrame()
-        control.setObjectName("liveControlBar")
-        ctrl_layout = QHBoxLayout(control)
-        ctrl_layout.setContentsMargins(10, 8, 10, 8)
-        ctrl_layout.addWidget(self.live_connect_btn)
-        ctrl_layout.addWidget(self.live_disconnect_btn)
+        name_bar = QFrame()
+        name_bar.setObjectName("liveControlBar")
+        name_layout = QHBoxLayout(name_bar)
+        name_layout.setContentsMargins(10, 8, 10, 8)
+        acc_lbl = QLabel("This account")
+        acc_lbl.setToolTip("This Live tab is one MT5 login. Add account opens a new Live tab.")
+        name_layout.addWidget(acc_lbl)
+        self.live_primary_account_label = QLabel("Primary")
+        self.live_primary_account_label.setObjectName("liveHeroTitle")
+        name_layout.addWidget(self.live_primary_account_label, 1)
+        root.addWidget(name_bar)
+
+        root.addWidget(self._make_account_status_strip(self._primary_live_account_id))
+        root.addWidget(self._make_account_ops_bar(
+            self._primary_live_account_id,
+            connect_btn=self.live_connect_btn,
+            disconnect_btn=self.live_disconnect_btn,
+            start_btn=self.live_start_btn,
+            stop_btn=self.live_stop_btn,
+        ))
+        # Keep legacy status label for connect/disconnect text updates, but hide it —
+        # chips replace the big badge for day-to-day scanning.
+        self.live_status_label.setVisible(False)
+
+        self.live_edit_account_btn = QPushButton("Edit MT5…")
+        self.live_edit_account_btn.setObjectName("secondaryButton")
+        self.live_edit_account_btn.setToolTip("Login, password, server, terminal path for this tab.")
+        self.live_edit_account_btn.clicked.connect(
+            lambda: self._on_edit_live_account(self._primary_live_account_id)
+        )
+        self.live_add_account_btn = QPushButton("Add account")
+        self.live_add_account_btn.setObjectName("secondaryButton")
+        self.live_add_account_btn.setToolTip("Opens a new Live tab for another MT5 login.")
+        self.live_add_account_btn.clicked.connect(self._on_add_live_account)
         self.live_settings_btn = QPushButton("Settings…")
         self.live_settings_btn.setObjectName("secondaryButton")
-        self.live_settings_btn.setToolTip("MT5, execution, market/limit orders, safety limits, advanced options")
+        self.live_settings_btn.setToolTip("Order type, safety caps, poll/history — not MT5 login.")
         self.live_settings_btn.clicked.connect(self._open_live_settings)
-        ctrl_layout.addWidget(self.live_settings_btn)
-        ctrl_layout.addStretch()
         self.live_dry_run_cb = QCheckBox("Dry run (no orders)")
         self.live_dry_run_cb.setChecked(True)
         self.live_dry_run_cb.setToolTip(
@@ -6380,14 +7471,65 @@ class BacktestDashboard(QMainWindow):
             "Uncheck only when you intend to place orders."
         )
         self.live_dry_run_cb.toggled.connect(self._on_live_dry_run_checkbox)
-        ctrl_layout.addWidget(self.live_dry_run_cb)
-        ctrl_layout.addWidget(self.live_start_btn)
-        ctrl_layout.addWidget(self.live_stop_btn)
-        root.addWidget(control)
+        root.addWidget(self._make_account_advanced_box(
+            "Advanced (dry run · settings · MT5)",
+            [
+                self.live_dry_run_cb,
+                self.live_settings_btn,
+                self.live_edit_account_btn,
+                self.live_add_account_btn,
+            ],
+        ))
 
-        root.addWidget(self.live_status_label)
+        desk_box = QGroupBox("Slots on this account")
+        desk_layout = QVBoxLayout(desk_box)
+        desk_layout.addWidget(self._make_info_icon(
+            "Each row is one bot on this MT5 login.\n"
+            "Select a row, then Start live. Start again on another row to run both.\n"
+            "Stop live stops slots on this tab only.",
+            label="How slots work",
+        ))
+        desk_btns = QHBoxLayout()
+        self.live_add_slot_btn = QPushButton("Add slot")
+        self.live_add_slot_btn.setObjectName("secondaryButton")
+        self.live_add_slot_btn.clicked.connect(
+            lambda: self._on_add_live_slot(self._primary_live_account_id)
+        )
+        self.live_edit_slot_btn = QPushButton("Edit slot")
+        self.live_edit_slot_btn.setObjectName("secondaryButton")
+        self.live_edit_slot_btn.clicked.connect(
+            lambda: self._on_edit_live_slot(self._primary_live_account_id)
+        )
+        self.live_remove_slot_btn = QPushButton("Remove slot")
+        self.live_remove_slot_btn.setObjectName("secondaryButton")
+        self.live_remove_slot_btn.clicked.connect(
+            lambda: self._on_remove_live_slot(self._primary_live_account_id)
+        )
+        desk_btns.addWidget(self.live_add_slot_btn)
+        desk_btns.addWidget(self.live_edit_slot_btn)
+        desk_btns.addWidget(self.live_remove_slot_btn)
+        desk_btns.addStretch()
+        desk_layout.addLayout(desk_btns)
+        self.live_desk_table = QTableWidget(0, 7)
+        self.live_desk_table.setHorizontalHeaderLabels(
+            ["Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
+        )
+        self.live_desk_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.live_desk_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.live_desk_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.live_desk_table.verticalHeader().setVisible(False)
+        self.live_desk_table.horizontalHeader().setStretchLastSection(True)
+        self.live_desk_table.setMaximumHeight(180)
+        self.live_desk_table.itemSelectionChanged.connect(
+            lambda: self._on_live_desk_selection_changed(self._primary_live_account_id)
+        )
+        self.live_desk_table.cellDoubleClicked.connect(
+            lambda *_: self._on_edit_live_slot(self._primary_live_account_id)
+        )
+        desk_layout.addWidget(self.live_desk_table)
+        root.addWidget(desk_box)
 
-        self.live_config_summary = QLabel("Open Settings to configure MT5, orders, and risk limits.")
+        self.live_config_summary = QLabel("Active account holds the MT5 login. Settings is orders and risk only.")
         self.live_config_summary.setWordWrap(True)
         self.live_config_summary.setObjectName("liveSummaryCard")
         self.live_config_summary.setTextFormat(Qt.RichText)
@@ -6407,8 +7549,8 @@ class BacktestDashboard(QMainWindow):
         apply_live_btn.setObjectName("secondaryButton")
         apply_live_btn.setFixedWidth(100)
         apply_live_btn.setToolTip(
-            "Push current Parameters (direction, shape, indicators, RR/SL) to a running live loop "
-            "without Stop/Start. Use after you change the Direction tab or load a preset."
+            "Push current Parameters to the selected running slot (or all running slots). "
+            "Start another slot after changing Parameters if you want a different strategy."
         )
         apply_live_btn.clicked.connect(self._apply_parameters_to_live)
         pat_row.addWidget(apply_live_btn)
@@ -6428,6 +7570,378 @@ class BacktestDashboard(QMainWindow):
         self.live_log_view.setMaximumHeight(200)
         log_layout.addWidget(self.live_log_view)
         root.addWidget(log_box)
+
+        scroll.setWidget(wrap)
+        QTimer.singleShot(0, self._refresh_live_desk_tables)
+        return scroll
+
+    def _set_status_chip(self, chip: QLabel, text: str, tone: str = "idle") -> None:
+        if chip is None or not _qt_widget_valid(chip):
+            return
+        chip.setText(text)
+        chip.setProperty("tone", tone)
+        chip.style().unpolish(chip)
+        chip.style().polish(chip)
+
+    def _make_account_status_strip(self, account_id: str) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("liveControlBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+        chips = {}
+        for key, tip in (
+            ("mt5", "MT5 connection for this Live tab"),
+            ("bots", "How many slots are running on this account"),
+            ("risk", "Max daily loss ($) for this account"),
+            ("flatten", "Clock flatten time (system clock)"),
+        ):
+            chip = QLabel("—")
+            chip.setObjectName("liveStatusChip")
+            chip.setToolTip(tip)
+            chip.setProperty("tone", "idle")
+            layout.addWidget(chip)
+            chips[key] = chip
+        layout.addStretch()
+        self._live_account_status_chips[account_id] = chips
+        self._refresh_account_status_strip(account_id)
+        return bar
+
+    def _refresh_account_status_strip(self, account_id: str) -> None:
+        chips = self._live_account_status_chips.get(account_id) or {}
+        if not chips:
+            return
+        acc = self._live_desk.account_by_id(account_id)
+        slots = self._live_desk.slots_for_account(account_id)
+        nrun = sum(1 for s in slots if s.id in self._live_workers)
+        connected = self._account_connected(account_id)
+        if connected:
+            self._set_status_chip(chips.get("mt5"), "MT5 · connected", "ok")
+        elif self._any_account_worker_connected() or self.mt5_broker.is_connected:
+            self._set_status_chip(chips.get("mt5"), "MT5 · other account", "idle")
+        else:
+            self._set_status_chip(chips.get("mt5"), "MT5 · idle", "idle")
+        if nrun:
+            self._set_status_chip(
+                chips.get("bots"), f"Bots · {nrun}/{len(slots)} running", "run",
+            )
+        else:
+            self._set_status_chip(
+                chips.get("bots"), f"Bots · 0/{len(slots)} running", "idle",
+            )
+        risk = float(getattr(acc, "max_daily_loss_usd", 0) or 0) if acc else 0.0
+        self._set_status_chip(
+            chips.get("risk"),
+            f"Risk · ${risk:g}" if risk > 0 else "Risk · off",
+            "ok" if risk > 0 else "warn",
+        )
+        flatten = (acc.flatten_hhmm if acc else "") or ""
+        if flatten.strip():
+            self._set_status_chip(chips.get("flatten"), f"Flatten · {flatten}", "warn")
+        else:
+            self._set_status_chip(chips.get("flatten"), "Flatten · off", "idle")
+
+    def _make_account_ops_bar(
+        self,
+        account_id: str,
+        *,
+        connect_btn: QPushButton,
+        disconnect_btn: QPushButton,
+        start_btn: QPushButton,
+        stop_btn: QPushButton,
+    ) -> QFrame:
+        """One operator strip: Connect · Start · Stop · Emergency · Flatten clock."""
+        bar = QFrame()
+        bar.setObjectName("liveControlBar")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+        layout.addWidget(connect_btn)
+        layout.addWidget(disconnect_btn)
+        layout.addWidget(start_btn)
+        layout.addWidget(stop_btn)
+
+        emerg = QPushButton("Emergency close")
+        emerg.setObjectName("secondaryButton")
+        emerg.setToolTip(
+            "Close every MT5 position tagged with this account’s magic series, then stop its slots."
+        )
+        emerg.clicked.connect(lambda: self._emergency_flatten_account(account_id))
+        layout.addWidget(emerg)
+
+        layout.addWidget(QLabel("Flatten"))
+        time_edit = QTimeEdit()
+        time_edit.setDisplayFormat("HH:mm")
+        acc = self._live_desk.account_by_id(account_id)
+        hhmm = (acc.flatten_hhmm if acc else "") or ""
+        parsed = QTime(15, 55)
+        if hhmm and ":" in hhmm:
+            try:
+                h, m = hhmm.split(":")[:2]
+                parsed = QTime(int(h), int(m))
+            except ValueError:
+                parsed = QTime(15, 55)
+        time_edit.setTime(parsed)
+        on = QCheckBox("On")
+        on.setToolTip("Enable system-clock flatten for this account")
+        on.setChecked(bool(hhmm.strip()))
+
+        def _save_flatten(_=None, acc_id=account_id, te=time_edit, cb=on):
+            a = self._live_desk.account_by_id(acc_id)
+            if a is None:
+                return
+            a.flatten_hhmm = te.time().toString("HH:mm") if cb.isChecked() else ""
+            self._save_live_desk()
+            self._refresh_account_status_strip(acc_id)
+            self._refresh_live_manager_if_open()
+
+        time_edit.timeChanged.connect(_save_flatten)
+        on.toggled.connect(_save_flatten)
+        layout.addWidget(time_edit)
+        layout.addWidget(on)
+        layout.addStretch()
+        return bar
+
+    def _make_account_advanced_box(self, title: str, widgets: list) -> QWidget:
+        """Collapsible Advanced row that HIDES (does not disable) children when closed.
+
+        A checkable QGroupBox disables Dry run / Settings when unchecked — that broke Live.
+        """
+        wrap = QFrame()
+        wrap.setObjectName("liveControlBar")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(6)
+
+        toggle = QToolButton()
+        toggle.setObjectName("liveAdvancedToggle")
+        toggle.setCheckable(True)
+        toggle.setChecked(True)  # open by default so Dry run / Settings are usable immediately
+        toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        toggle.setAutoRaise(True)
+        toggle.setCursor(Qt.PointingHandCursor)
+        toggle.setToolTip("Show or hide Dry run, Settings, and MT5 account tools")
+
+        body = QWidget()
+        row = QHBoxLayout(body)
+        row.setContentsMargins(0, 2, 0, 0)
+        row.setSpacing(8)
+        for w in widgets:
+            if w is None:
+                continue
+            w.setEnabled(True)
+            row.addWidget(w)
+        row.addStretch()
+
+        def _apply(checked: bool, t=toggle, b=body, label=title, kids=widgets):
+            b.setVisible(bool(checked))
+            t.setText(("▾  " if checked else "▸  ") + label)
+            for child in kids:
+                if child is not None and _qt_widget_valid(child):
+                    child.setEnabled(True)
+
+        toggle.toggled.connect(_apply)
+        _apply(True)
+        outer.addWidget(toggle)
+        outer.addWidget(body)
+        return wrap
+
+    def _make_info_icon(self, tip: str, *, label: str = "") -> QWidget:
+        """Compact ℹ control — long help lives in the tooltip, not a wall of text."""
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        if label:
+            lbl = QLabel(label)
+            lbl.setObjectName("sectionHint")
+            lay.addWidget(lbl)
+        btn = QToolButton()
+        btn.setObjectName("infoHintButton")
+        btn.setText("ℹ")
+        btn.setAutoRaise(True)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(tip)
+        btn.setFixedSize(22, 22)
+        btn.setToolTipDuration(60000)
+
+        def _show_tip(_checked=False, b=btn):
+            text = b.toolTip() or ""
+            if not text:
+                return
+            QToolTip.showText(b.mapToGlobal(b.rect().bottomLeft()), text, b)
+
+        btn.clicked.connect(_show_tip)
+        lay.addWidget(btn)
+        lay.addStretch(1)
+        # Keep a handle so dynamic tips (preview) can update later
+        row._info_button = btn  # type: ignore[attr-defined]
+        return row
+
+    def _set_info_tip(self, host: QWidget, tip: str) -> None:
+        btn = getattr(host, "_info_button", None)
+        if btn is not None and _qt_widget_valid(btn):
+            btn.setToolTip(tip or "")
+
+    def _set_tolerance_hint(self, tip: str) -> None:
+        """Update the ℹ tooltip for Signal Shape / Pattern preview help."""
+        host = getattr(self, "tolerance_hint_info", None)
+        if host is not None:
+            self._set_info_tip(host, tip)
+        label = getattr(self, "tolerance_hint_label", None)
+        if label is not None and _qt_widget_valid(label):
+            label.setText(tip or "")
+
+    def _make_account_kill_bar(self, account_id: str) -> QFrame:
+        """Legacy helper — ops bar without connect/start (prefer _make_account_ops_bar)."""
+        emerg_only = QFrame()
+        emerg_only.setObjectName("liveControlBar")
+        layout = QHBoxLayout(emerg_only)
+        layout.setContentsMargins(10, 8, 10, 8)
+        emerg = QPushButton("Emergency close")
+        emerg.setObjectName("secondaryButton")
+        emerg.clicked.connect(lambda: self._emergency_flatten_account(account_id))
+        layout.addWidget(emerg)
+        layout.addStretch()
+        return emerg_only
+
+    def _build_extra_live_panel(self, account_id: str) -> QWidget:
+        """Per-account Live tab — slots and Connect only. Parameters / Results stay shared."""
+        acc = self._live_desk.account_by_id(account_id)
+        name = acc.name if acc else "Account"
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        wrap = QWidget()
+        root = QVBoxLayout(wrap)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        hero = QFrame()
+        hero.setObjectName("liveHero")
+        hero_layout = QVBoxLayout(hero)
+        hero_layout.setContentsMargins(12, 10, 12, 10)
+        title = QLabel(f"Live trading · {name}")
+        title.setObjectName("liveHeroTitle")
+        hero_layout.addWidget(title)
+        hero_layout.addWidget(self._make_info_icon(
+            "This tab is only this MT5 login.\n"
+            "Backtest Parameters and Results stay shared.\n"
+            "Each account uses its own worker process — connect several accounts "
+            "in parallel (separate MT5 terminal path recommended).",
+            label="How this Live tab works",
+        ))
+        root.addWidget(hero)
+
+        connect_btn = QPushButton("Connect MT5")
+        connect_btn.setObjectName("secondaryButton")
+        connect_btn.clicked.connect(lambda: self._on_live_connect_account(account_id))
+        disconnect_btn = QPushButton("Disconnect")
+        disconnect_btn.setObjectName("secondaryButton")
+        disconnect_btn.clicked.connect(lambda: self._on_live_disconnect_account(account_id))
+        start_btn = QPushButton("Start live")
+        start_btn.setObjectName("liveStartButton")
+        start_btn.clicked.connect(lambda: self._on_live_start_account(account_id))
+        stop_btn = QPushButton("Stop live")
+        stop_btn.setObjectName("secondaryButton")
+        stop_btn.setEnabled(False)
+        stop_btn.clicked.connect(lambda: self._stop_live_slots_for_account(account_id))
+        self._live_stop_buttons[account_id] = stop_btn
+
+        root.addWidget(self._make_account_status_strip(account_id))
+        root.addWidget(self._make_account_ops_bar(
+            account_id,
+            connect_btn=connect_btn,
+            disconnect_btn=disconnect_btn,
+            start_btn=start_btn,
+            stop_btn=stop_btn,
+        ))
+
+        status = QLabel("MT5: not connected")
+        status.setObjectName("liveStatusBadge")
+        status.setVisible(False)
+        root.addWidget(status)
+
+        edit_btn = QPushButton("Edit MT5…")
+        edit_btn.setObjectName("secondaryButton")
+        edit_btn.clicked.connect(lambda: self._on_edit_live_account(account_id))
+        settings_btn = QPushButton("Settings…")
+        settings_btn.setObjectName("secondaryButton")
+        settings_btn.setToolTip("Shared order type and safety — not this account’s password.")
+        settings_btn.clicked.connect(self._open_live_settings)
+        dry_cb = QCheckBox("Dry run (no orders)")
+        dry_cb.setChecked(self._live_dry_run_checked())
+        dry_cb.toggled.connect(self._on_live_dry_run_checkbox)
+        self._live_account_dry.append(dry_cb)
+        root.addWidget(self._make_account_advanced_box(
+            "Advanced (dry run · settings · MT5)",
+            [dry_cb, settings_btn, edit_btn],
+        ))
+
+        desk_box = QGroupBox("Slots on this account")
+        desk_layout = QVBoxLayout(desk_box)
+        desk_layout.addWidget(self._make_info_icon(
+            "Select a row, then Start live. Assign a preset.json per slot for the strategy; "
+            "timeframe is set on the slot.",
+            label="How slots work",
+        ))
+        btns = QHBoxLayout()
+        add_slot = QPushButton("Add slot")
+        add_slot.setObjectName("secondaryButton")
+        add_slot.clicked.connect(lambda: self._on_add_live_slot(account_id))
+        edit_slot = QPushButton("Edit slot")
+        edit_slot.setObjectName("secondaryButton")
+        edit_slot.clicked.connect(lambda: self._on_edit_live_slot(account_id))
+        remove_slot = QPushButton("Remove slot")
+        remove_slot.setObjectName("secondaryButton")
+        remove_slot.clicked.connect(lambda: self._on_remove_live_slot(account_id))
+        btns.addWidget(add_slot)
+        btns.addWidget(edit_slot)
+        btns.addWidget(remove_slot)
+        btns.addStretch()
+        desk_layout.addLayout(btns)
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels(["Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setMaximumHeight(180)
+        table.itemSelectionChanged.connect(
+            lambda: self._on_live_desk_selection_changed(account_id)
+        )
+        table.cellDoubleClicked.connect(lambda *_: self._on_edit_live_slot(account_id))
+        desk_layout.addWidget(table)
+        root.addWidget(desk_box)
+
+        summary = QLabel("Connect this tab to use this login.")
+        summary.setWordWrap(True)
+        summary.setObjectName("liveSummaryCard")
+        summary.setTextFormat(Qt.RichText)
+        root.addWidget(summary)
+
+        strat = QLabel("Strategy: shared Backtest Parameters (open that tab to change pattern / indicators).")
+        strat.setWordWrap(True)
+        strat.setObjectName("liveSummaryCard")
+        strat.setTextFormat(Qt.RichText)
+        self._live_strategy_mirrors.append(strat)
+        root.addWidget(strat)
+
+        log_box = QGroupBox("Activity log")
+        log_layout = QVBoxLayout(log_box)
+        log_view = QPlainTextEdit()
+        log_view.setObjectName("liveLogConsole")
+        log_view.setReadOnly(True)
+        log_view.setMinimumHeight(100)
+        log_view.setMaximumHeight(160)
+        log_layout.addWidget(log_view)
+        root.addWidget(log_box)
+        self._live_account_logs.append(log_view)
+
+        self._live_account_tables[account_id] = table
+        self._live_account_status[account_id] = status
+        self._live_account_summaries[account_id] = summary
 
         scroll.setWidget(wrap)
         return scroll
@@ -6549,17 +8063,25 @@ class BacktestDashboard(QMainWindow):
 
         self.live_connect_btn = QPushButton("Connect MT5")
         self.live_connect_btn.setObjectName("secondaryButton")
-        self.live_connect_btn.clicked.connect(self._on_live_connect)
+        self.live_connect_btn.clicked.connect(
+            lambda: self._on_live_connect_account(self._primary_live_account_id)
+        )
         self.live_disconnect_btn = QPushButton("Disconnect")
         self.live_disconnect_btn.setObjectName("secondaryButton")
         self.live_disconnect_btn.clicked.connect(self._on_live_disconnect)
         self.live_start_btn = QPushButton("Start live")
         self.live_start_btn.setObjectName("liveStartButton")
-        self.live_start_btn.clicked.connect(self._on_live_start)
+        self.live_start_btn.setToolTip("Start the selected slot on this Live tab.")
+        self.live_start_btn.clicked.connect(
+            lambda: self._on_live_start_account(self._primary_live_account_id)
+        )
         self.live_stop_btn = QPushButton("Stop live")
         self.live_stop_btn.setObjectName("secondaryButton")
+        self.live_stop_btn.setToolTip("Stop slots on this Live tab. Disconnect drops the MT5 link.")
         self.live_stop_btn.setEnabled(False)
-        self.live_stop_btn.clicked.connect(self._stop_live_trading)
+        self.live_stop_btn.clicked.connect(
+            lambda: self._stop_live_slots_for_account(self._primary_live_account_id)
+        )
 
         self.live_status_label = QLabel("MT5: not connected")
         self.live_status_label.setObjectName("liveStatusBadge")
@@ -6570,7 +8092,7 @@ class BacktestDashboard(QMainWindow):
         self.live_log_view.setMinimumHeight(160)
         self.live_log_view.setPlaceholderText(
             "Connection messages and live loop output… "
-            f"(also saved under {LIVE_JOURNAL_DIR}/)"
+            f"(also saved under {LOGS_DIR}/live/)"
         )
 
         self.live_symbol.textChanged.connect(lambda: self._refresh_live_strategy_summary())
@@ -6602,39 +8124,50 @@ class BacktestDashboard(QMainWindow):
             QMessageBox.information(self, "Direction self-test — OK", body)
 
     def _apply_parameters_to_live(self):
-        if self._live_engine is None or self._live_thread is None or not self._live_thread.isRunning():
+        targets = []
+        selected = self._selected_live_slot()
+        if selected is not None and selected.id in self._live_workers:
+            targets = [(selected, self._live_workers[selected.id]["engine"])]
+        else:
+            for sid, w in self._live_workers.items():
+                slot = self._live_desk.slot_by_id(sid)
+                if slot is not None and w.get("engine"):
+                    targets.append((slot, w["engine"]))
+        if not targets:
             QMessageBox.information(
                 self,
                 "Apply to live",
-                "Start live first, then change Parameters and click Apply to live "
-                "(or Stop live → fix settings → Start live).",
+                "Start a live slot first, then change Parameters (or the slot’s preset) and click Apply to live.",
             )
             return
-        try:
-            pattern, pattern_type, strategy_config, indicator_stack = (
-                self._collect_live_strategy_from_parameters()
-            )
-        except Exception as e:
-            QMessageBox.critical(self, "Apply to live", str(e))
-            return
+        applied = 0
         tf = self._collect_time_filter_kwargs()
-        self._live_engine.update_runtime_strategy(
-            strategy_config, indicator_stack, pattern_type, pattern,
-            sessions_enabled=tf["sessions_enabled"],
-            session_clock=tf["session_clock"],
-            broker_utc_offset_hours=tf["broker_utc_offset_hours"],
-            ist_time_filter_enabled=tf["ist_time_filter_enabled"],
-            ist_time_start=tf["ist_time_start"],
-            ist_time_end=tf["ist_time_end"],
-            telegram_enabled=self.live_telegram_enabled.isChecked(),
-            telegram_bot_token=self.live_telegram_token.text().strip(),
-            telegram_chat_id=self.live_telegram_chat_id.text().strip(),
-        )
+        for slot, eng in targets:
+            try:
+                pattern, pattern_type, strategy_config, indicator_stack = (
+                    self._collect_live_strategy_for_slot(slot)
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Apply to live", f"{slot.name}: {e}")
+                return
+            eng.update_runtime_strategy(
+                strategy_config, indicator_stack, pattern_type, pattern,
+                sessions_enabled=tf["sessions_enabled"],
+                session_clock=tf["session_clock"],
+                broker_utc_offset_hours=tf["broker_utc_offset_hours"],
+                ist_time_filter_enabled=tf["ist_time_filter_enabled"],
+                ist_time_start=tf["ist_time_start"],
+                ist_time_end=tf["ist_time_end"],
+                telegram_enabled=self.live_telegram_enabled.isChecked(),
+                telegram_bot_token=self.live_telegram_token.text().strip(),
+                telegram_chat_id=self.live_telegram_chat_id.text().strip(),
+            )
+            applied += 1
         self._refresh_live_strategy_summary()
-        self._live_log("Dashboard parameters pushed to live loop.")
+        self._live_log(f"Strategy pushed to {applied} live slot(s) (preset per slot when set).")
 
     def _open_live_settings(self):
-        if self._live_thread is not None and self._live_thread.isRunning():
+        if self._live_worker_running():
             QMessageBox.information(
                 self,
                 "Live running",
@@ -6735,10 +8268,14 @@ class BacktestDashboard(QMainWindow):
         for w in self._live_settings_field_widgets():
             w.setParent(host)
 
-    def _open_live_journal_folder(self):
-        path = live_journal_dir(DEFAULT_OUTPUT_DIR)
+    def _open_logs_folder(self):
+        path = LOGS_DIR
+        os.makedirs(path, exist_ok=True)
         self._open_folder(path)
-        self._live_log(f"Opened live journal folder: {path}")
+        self._live_log(f"Opened logs folder: {path}")
+
+    def _open_live_journal_folder(self):
+        self._open_logs_folder()
 
     def _focus_backtest_params_dock(self):
         if hasattr(self, "params_dock"):
@@ -6849,7 +8386,7 @@ class BacktestDashboard(QMainWindow):
         if not enabled:
             lines.append(
                 "⚠ No indicators added (Parameters → Indicators → Add). "
-                "SuperTrend/VWAP will NOT block trades until you add them and restart live."
+                "SuperTrend / VWAP / Rolling VWAP / RSI will NOT block trades until you add them and restart live."
             )
             return lines
         if stack.supertrend.enabled:
@@ -6861,6 +8398,19 @@ class BacktestDashboard(QMainWindow):
         if stack.vwap.enabled:
             filt = "ON" if stack.vwap.apply_trade_filter else "OFF — will NOT block trades"
             lines.append(f"VWAP session filter {filt} on live timeframe only.")
+        if stack.rolling_vwap.enabled:
+            filt = "ON" if stack.rolling_vwap.apply_trade_filter else "OFF — will NOT block trades"
+            lines.append(
+                f"Rolling VWAP filter {filt} (period={stack.rolling_vwap.period} bars) "
+                "on live timeframe only."
+            )
+        if stack.rsi.enabled:
+            filt = "ON" if stack.rsi.apply_trade_filter else "OFF — will NOT block trades"
+            lines.append(
+                f"RSI({stack.rsi.period}) filter {filt} "
+                f"(BUY if > {stack.rsi.buy_above:g}, SELL if < {stack.rsi.sell_below:g}) "
+                "on live timeframe only."
+            )
         if len(enabled) >= 2:
             lines.append(f"Combine mode: {stack.combine_mode.value}")
         lines.append(
@@ -6878,27 +8428,44 @@ class BacktestDashboard(QMainWindow):
         return "market"
 
     def _refresh_live_config_summary(self):
-        if not hasattr(self, "live_config_summary"):
+        if not self._live_account_summaries and not hasattr(self, "live_config_summary"):
             return
         mode_label = self.live_order_mode.currentText() if hasattr(self, "live_order_mode") else "Market"
         dry = "ON" if self._live_dry_run_checked() else "OFF"
-        sym = self.live_symbol.text().strip() if hasattr(self, "live_symbol") else "XAUUSD"
-        tf = self.live_timeframe.currentText() if hasattr(self, "live_timeframe") else "1h"
-        lots = self.live_volume.text().strip() if hasattr(self, "live_volume") else "0.01"
-        login = self.live_login.text().strip() if hasattr(self, "live_login") else ""
-        html = (
-            f"<b>Execution</b> {sym} @ {tf} · lots {lots} · dry run <b>{dry}</b><br>"
-            f"<b>Order</b> {mode_label} · deviation {self.live_deviation.text().strip() if hasattr(self, 'live_deviation') else '20'} pts<br>"
-            f"<b>Safety</b> max {self.live_max_daily_trades.text().strip() if hasattr(self, 'live_max_daily_trades') else '?'} trades/day · "
-            f"max loss ${self.live_max_daily_loss.text().strip() if hasattr(self, 'live_max_daily_loss') else '?'} · "
-            f"spread ≤ {self.live_max_spread.text().strip() if hasattr(self, 'live_max_spread') else '?'} pts<br>"
+        connected_id = self._live_desk.active_account_id if self.mt5_broker.is_connected else ""
+        safety = (
+            f"<b>Order</b> {mode_label} · dry run <b>{dry}</b> · "
+            f"max {self.live_max_daily_trades.text().strip() if hasattr(self, 'live_max_daily_trades') else '?'} trades/day · "
+            f"max loss ${self.live_max_daily_loss.text().strip() if hasattr(self, 'live_max_daily_loss') else '?'}<br>"
+            "<span style='color:#5f6368;'>Settings… is order type and caps — not the MT5 password. "
+            "Parameters / Results are shared across Live tabs.</span>"
         )
-        if login:
-            html += f"<b>MT5 login</b> {login} (use Settings for password/server)<br>"
-        else:
-            html += "<b>MT5</b> not configured — open Settings<br>"
-        html += "<span style='color:#5f6368;'>Click Settings… for connection, limit orders, and all limits.</span>"
-        self.live_config_summary.setText(html)
+        labels = dict(self._live_account_summaries)
+        if hasattr(self, "live_config_summary") and self._primary_live_account_id not in labels:
+            labels[self._primary_live_account_id] = self.live_config_summary
+        for acc_id, label in labels.items():
+            if not _qt_widget_valid(label):
+                continue
+            acc = self._live_desk.account_by_id(acc_id)
+            name = acc.name if acc else "—"
+            login = (acc.login if acc else "") or ""
+            slot = self._selected_live_slot(acc_id)
+            if slot is not None:
+                slot_line = f"{slot.name} · {slot.symbol} @ {slot.timeframe} · lots {slot.volume}"
+            else:
+                slot_line = "no slot selected"
+            conn = "connected on this tab" if connected_id == acc_id else (
+                "this window is on another Live tab — Disconnect to switch" if connected_id else
+                "not connected — Connect MT5 on this tab"
+            )
+            html = (
+                f"<b>This Live tab</b> {name}"
+                f"{' · login ' + login if login else ' · login not set — Edit MT5…'}<br>"
+                f"<b>MT5</b> {conn}<br>"
+                f"<b>Selected slot</b> {slot_line}<br>"
+                f"{safety}"
+            )
+            label.setText(html)
 
     def _refresh_live_telegram_status(self) -> None:
         if not hasattr(self, "live_telegram_status") or not _qt_widget_valid(self.live_telegram_status):
@@ -6969,14 +8536,14 @@ class BacktestDashboard(QMainWindow):
                 except Exception:
                     det = f"Doji {style} · {mode}"
                 detail = det
-            elif pattern == "Hammer with candles":
+            elif hammer_context_logic.is_context_pattern_label(pattern):
                 try:
                     cfg = self._build_hammer_context_strategy_config()
                     detail = hammer_context_logic.describe_hammer_context_rules(cfg)
                     ee = hammer_context_logic.describe_hammer_context_entry_exit(cfg)
                     detail += f"<br><span style='color:#5f6368;'>{ee}</span>"
                 except Exception:
-                    detail = "Hammer with candles — classic green BUY / inverted red SELL + prior N bars"
+                    detail = f"{pattern} — classic green BUY / inverted red SELL + prior N bars"
             elif pattern == "Hammer":
                 cfg = self._build_hammer_strategy_config()
                 detail = logic.describe_hammer_direction_matrix(cfg)
@@ -7010,6 +8577,11 @@ class BacktestDashboard(QMainWindow):
             html += f"{detail}<br>"
         html += f"<b>Chart</b> {sym} @ {tf}"
         self.live_strategy_summary.setText(html)
+        for lab in getattr(self, "_live_strategy_mirrors", []) or []:
+            if _qt_widget_valid(lab):
+                lab.setText(
+                    "Shared strategy (Backtest Parameters):<br>" + html
+                )
 
     def _live_broker_credentials(self) -> BrokerCredentials:
         login_raw = self.live_login.text().strip()
@@ -7123,63 +8695,288 @@ class BacktestDashboard(QMainWindow):
             self.live_dry_run_cb.blockSignals(True)
             self.live_dry_run_cb.setChecked(s.value("live/dry_run", True, type=bool))
             self.live_dry_run_cb.blockSignals(False)
+        self._hydrate_accounts_from_legacy_settings()
+        self._apply_account_to_connect_fields(self._active_live_account())
+        self._refresh_live_desk_tables()
         self._refresh_live_telegram_status()
         self._refresh_live_perf_hint()
 
     def _append_live_log_line(self, line: str):
-        if not hasattr(self, "live_log_view"):
-            return
-        self.live_log_view.appendPlainText(line)
-        bar = self.live_log_view.verticalScrollBar()
-        if bar is not None:
-            bar.setValue(bar.maximum())
+        views = []
+        if hasattr(self, "live_log_view"):
+            views.append(self.live_log_view)
+        views.extend(getattr(self, "_live_account_logs", []) or [])
+        seen = set()
+        for view in views:
+            if view is None or id(view) in seen or not _qt_widget_valid(view):
+                continue
+            seen.add(id(view))
+            view.appendPlainText(line)
+            bar = view.verticalScrollBar()
+            if bar is not None:
+                bar.setValue(bar.maximum())
 
     def _live_log(self, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {message}"
         print(line, flush=True)
         file_line = f"{datetime.now().isoformat(timespec='seconds')} {line}"
-        journal = (self._active_live_journal_dir or "").strip() or LIVE_JOURNAL_DIR
-        append_session_log(journal, file_line)
+        # Always keep a combined live log under logs/live/
+        append_log_file(APP_LIVE_LOG_PATH, file_line)
+        # Per-account log when we know which Live tab is focused
+        acc_id = getattr(self, "_focused_live_account_id", None) or (
+            getattr(self, "_live_desk", None).active_account_id
+            if getattr(self, "_live_desk", None) else ""
+        )
+        if acc_id and getattr(self, "_live_desk", None) is not None:
+            acc = self._live_desk.account_by_id(str(acc_id))
+            if acc is not None:
+                from live_journal import account_log_path
+                append_log_file(account_log_path(APP_DIR, acc.id, acc.name), file_line)
+        # Active slot journal (session.log inside slot folder)
+        journal = (self._active_live_journal_dir or "").strip()
+        if journal:
+            append_session_log(journal, file_line)
         self._live_log_bridge.line_ready.emit(line)
 
-    def _on_live_connect(self):
-        self._save_live_settings()
-        self.live_connect_btn.setEnabled(False)
-        self._live_log("Connecting to MT5…")
-        self._set_app_status("Live: connecting to MT5…")
-        self.live_status_label.setText("MT5: connecting…")
-        QApplication.processEvents()
-        ok, msg = self.mt5_broker.connect(self._live_broker_credentials())
-        self.live_connect_btn.setEnabled(True)
-        self._live_log(msg)
-        if ok:
-            info = self.mt5_broker.account_info_dict()
-            demo = self.mt5_broker.account_is_demo()
-            acct_type = "DEMO" if demo else ("LIVE" if demo is False else "unknown")
-            self.live_status_label.setText(
-                f"MT5: connected ({acct_type}) — {info.get('login', '?')} | "
-                f"Balance {info.get('balance', 0):,.2f} {info.get('currency', '')}"
-            )
-            if demo is False:
-                self._live_log(
-                    "[LIVE ACCOUNT] Real money — Safety panel limits will apply when dry run is off."
-                )
-            elif demo is True:
-                self._live_log("[DEMO ACCOUNT] Connected.")
-            self._set_app_status(f"Live: MT5 connected ({acct_type.lower()})")
+    def _ensure_account_handle(self, account_id: str) -> AccountWorkerHandle:
+        acc = self._live_desk.account_by_id(account_id)
+        name = acc.name if acc else account_id
+        handle = self._account_handles.get(account_id)
+        if handle is None:
+            handle = AccountWorkerHandle(account_id=account_id, account_name=name)
+            self._account_handles[account_id] = handle
         else:
-            self.live_status_label.setText("MT5: connection failed")
-            self._set_app_status("Live: MT5 connection failed")
-            QMessageBox.warning(self, "MT5 Connect", msg)
+            handle.account_name = name
+        if not handle.is_alive():
+            handle.start()
+            self._live_log(
+                f"[multi-account] Started worker process for '{name}' "
+                "(own MT5 connection + slot threads)."
+            )
+        return handle
+
+    def _account_connected(self, account_id: str) -> bool:
+        handle = self._account_handles.get(account_id)
+        if handle is not None and handle.connected:
+            return True
+        return bool(
+            self.mt5_broker.is_connected
+            and self._live_desk.active_account_id == account_id
+        )
+
+    def _any_account_worker_connected(self) -> bool:
+        return any(h.connected for h in self._account_handles.values())
+
+    def _broker_credentials_for_account(self, acc: live_accounts.LiveAccount) -> BrokerCredentials:
+        """Prefer saved account fields; fall back to the Live form for the focused tab."""
+        pw = self._load_account_password(acc)
+        login_raw = (acc.login or "").strip()
+        if not login_raw and acc.id == getattr(self, "_focused_live_account_id", ""):
+            return self._live_broker_credentials()
+        login = int(login_raw) if login_raw.isdigit() else 0
+        path = (acc.terminal_path or "").strip()
+        server = (acc.server or "").strip()
+        if acc.id == getattr(self, "_focused_live_account_id", "") or acc.id == self._live_desk.active_account_id:
+            # UI may have fresher edits
+            if hasattr(self, "live_mt5_path") and _qt_widget_valid(self.live_mt5_path):
+                path = self.live_mt5_path.text().strip() or path
+                server = self.live_server.text().strip() or server
+                login_ui = self.live_login.text().strip()
+                if login_ui.isdigit():
+                    login = int(login_ui)
+                pw = self.live_password.text() or pw
+        return BrokerCredentials(
+            terminal_path=path,
+            login=login,
+            password=pw,
+            server=server,
+        )
+
+    def _poll_account_worker_events(self) -> None:
+        for account_id, handle in list(self._account_handles.items()):
+            if not handle.is_alive() and handle.connected:
+                handle.connected = False
+                self._set_account_status_text(account_id, "MT5: worker exited")
+            for evt in handle.poll_events():
+                apply_worker_event(handle, evt)
+                kind = evt.get("kind") or ""
+                if kind == "log":
+                    self._focused_live_account_id = account_id
+                    self._live_log(str(evt.get("message") or ""))
+                elif kind == "connected":
+                    msg = str(evt.get("message") or "Connected")
+                    info = evt.get("account_info") or {}
+                    demo = None
+                    try:
+                        trade_mode = info.get("trade_mode")
+                        # 0=demo in many builds; fall back to message text
+                        if trade_mode is not None:
+                            demo = int(trade_mode) == 0
+                    except Exception:
+                        demo = None
+                    acct_type = "DEMO" if demo else ("LIVE" if demo is False else "account")
+                    connected_txt = (
+                        f"MT5: connected ({acct_type}) — {info.get('login', '?')} | "
+                        f"Balance {float(info.get('balance') or 0):,.2f} {info.get('currency', '')}"
+                    )
+                    self._set_account_status_text(account_id, connected_txt)
+                    self._set_app_status(f"Live: MT5 connected · {handle.account_name}")
+                    try:
+                        eq = float(info.get("equity") or info.get("balance") or 0)
+                        if eq > 0:
+                            self._account_session_equity_by_id[account_id] = eq
+                    except (TypeError, ValueError):
+                        pass
+                    self._refresh_live_config_summary()
+                elif kind == "disconnected":
+                    self._set_account_status_text(account_id, "MT5: disconnected")
+                    for sid in list(self._live_workers.keys()):
+                        w = self._live_workers.get(sid) or {}
+                        if w.get("account_id") == account_id and w.get("remote"):
+                            self._live_workers.pop(sid, None)
+                    self._refresh_live_desk_tables()
+                    self._update_live_stop_buttons()
+                    self._refresh_live_config_summary()
+                elif kind == "slot_started":
+                    sid = str(evt.get("slot_id") or "")
+                    if sid:
+                        self._live_workers[sid] = {
+                            "account_id": account_id,
+                            "remote": True,
+                        }
+                    self._refresh_live_desk_tables()
+                    self._update_live_stop_buttons()
+                    self._set_app_status(
+                        f"Live: {len(self._live_workers)} slot(s) across "
+                        f"{sum(1 for h in self._account_handles.values() if h.connected)} account(s)"
+                    )
+                elif kind == "slot_stopped":
+                    sid = str(evt.get("slot_id") or "")
+                    if sid:
+                        self._live_workers.pop(sid, None)
+                    self._refresh_live_desk_tables()
+                    self._update_live_stop_buttons()
+                    if not self._live_workers:
+                        self._live_health_timer.stop()
+                        self._set_app_status("Live: idle")
+                elif kind == "slot_crashed":
+                    sid = str(evt.get("slot_id") or "")
+                    self._live_log(f"[CRASH] Slot {sid}: {evt.get('message')}")
+                    if sid:
+                        self._live_workers.pop(sid, None)
+                    self._refresh_live_desk_tables()
+                elif kind == "error":
+                    self._live_log(f"[worker:{handle.account_name}] {evt.get('message')}")
+                self._refresh_account_status_strip(account_id)
+
+    def _on_live_connect_account(self, account_id: str):
+        acc = self._live_desk.account_by_id(account_id) or self._active_live_account()
+        if acc is None:
+            return
+        self._focused_live_account_id = acc.id
+        self._live_desk.active_account_id = acc.id
+        self._apply_account_to_connect_fields(acc)
+        self._save_live_settings()
+        if not acc.login and not acc.password and not acc.terminal_path:
+            self._live_log(
+                f"Connecting '{acc.name}' with whatever is already logged in on the MT5 terminal "
+                "(Edit MT5… to save login). Use a separate terminal path per account for parallel live."
+            )
+        self._set_account_status_text(acc.id, "MT5: connecting…")
+        self._live_log(f"Connecting to MT5 as '{acc.name}' (dedicated worker process)…")
+        self._set_app_status(f"Live: connecting · {acc.name}")
+        QApplication.processEvents()
+        try:
+            handle = self._ensure_account_handle(acc.id)
+            creds = self._broker_credentials_for_account(acc)
+            handle.send(
+                "connect",
+                terminal_path=creds.terminal_path,
+                login=int(creds.login or 0),
+                password=creds.password or "",
+                server=creds.server or "",
+            )
+        except Exception as exc:
+            self._live_log(f"[multi-account] Worker failed — falling back to in-process MT5: {exc}")
+            creds = self._broker_credentials_for_account(acc)
+            # Fallback: single in-process broker (cannot run a second login in parallel)
+            if self.mt5_broker.is_connected and self._live_desk.active_account_id != acc.id:
+                QMessageBox.warning(
+                    self,
+                    "MT5",
+                    "Could not start a parallel account worker, and this window already has "
+                    "another login connected. Disconnect first, or fix worker spawn.",
+                )
+                return
+            ok, msg = self.mt5_broker.connect(creds)
+            self._live_log(msg)
+            if ok:
+                info = self.mt5_broker.account_info_dict() or {}
+                connected_txt = (
+                    f"MT5: connected — {info.get('login', '?')} | "
+                    f"Balance {info.get('balance', 0):,.2f} {info.get('currency', '')}"
+                )
+                self._set_account_status_text(acc.id, connected_txt)
+                self._set_app_status(f"Live: MT5 connected · {acc.name}")
+            else:
+                self._set_account_status_text(acc.id, "MT5: connection failed")
+                QMessageBox.warning(self, "MT5 Connect", msg)
+        self._refresh_live_config_summary()
+
+    def _set_account_status_text(self, acc_id: str, text: str) -> None:
+        label = self._live_account_status.get(acc_id)
+        if label is None and acc_id == self._primary_live_account_id:
+            label = getattr(self, "live_status_label", None)
+        if label is not None and _qt_widget_valid(label):
+            label.setText(text)
+        self._refresh_account_status_strip(str(acc_id))
+
+    def _refresh_mt5_status_labels(self, connected_acc_id: str, connected_txt: str) -> None:
+        for acc_id, label in self._live_account_status.items():
+            if not _qt_widget_valid(label):
+                continue
+            if acc_id == connected_acc_id:
+                label.setText(connected_txt)
+            elif self._account_connected(acc_id):
+                continue
+            else:
+                label.setText("MT5: idle — Connect on this tab (parallel accounts OK)")
+        if hasattr(self, "live_status_label") and self._primary_live_account_id not in self._live_account_status:
+            self.live_status_label.setText(
+                connected_txt if connected_acc_id == self._primary_live_account_id else "MT5: idle"
+            )
+        for acc_id in list(self._live_account_status_chips.keys()):
+            self._refresh_account_status_strip(acc_id)
 
     def _on_live_disconnect(self):
-        self._live_log("Disconnecting from MT5…")
-        self._stop_live_trading()
-        self.mt5_broker.disconnect()
-        self.live_status_label.setText("MT5: disconnected")
-        self._live_log("Disconnected from MT5.")
-        self._set_app_status("Live: MT5 disconnected")
+        acc_id = getattr(self, "_focused_live_account_id", None) or self._live_desk.active_account_id
+        self._on_live_disconnect_account(str(acc_id) if acc_id else "")
+
+    def _on_live_disconnect_account(self, account_id: str) -> None:
+        if not account_id:
+            account_id = self._live_desk.active_account_id
+        acc = self._live_desk.account_by_id(account_id)
+        name = acc.name if acc else account_id
+        self._live_log(f"Disconnecting '{name}'…")
+        self._stop_live_slots_for_account(account_id)
+        handle = self._account_handles.get(account_id)
+        if handle is not None and handle.is_alive():
+            try:
+                handle.send("disconnect")
+            except Exception as exc:
+                self._live_log(f"[WARN] disconnect send failed: {exc}")
+        # Legacy in-process broker
+        if self.mt5_broker.is_connected and self._live_desk.active_account_id == account_id:
+            self.mt5_broker.disconnect()
+        self._set_account_status_text(account_id, "MT5: disconnected")
+        self._live_log(f"Disconnected '{name}'.")
+        n_conn = sum(1 for h in self._account_handles.values() if h.connected)
+        if n_conn or self.mt5_broker.is_connected:
+            self._set_app_status(f"Live: {n_conn} account(s) still connected")
+        else:
+            self._set_app_status("Live: MT5 disconnected")
+        self._refresh_live_config_summary()
 
     def _build_live_run_config(self) -> live_trading.LiveRunConfig:
         def _f(name: str, default: float) -> float:
@@ -7195,7 +8992,7 @@ class BacktestDashboard(QMainWindow):
                 return default
 
         sym = self.live_symbol.text().strip() or "XAUUSD"
-        journal_dir = live_journal_dir(DEFAULT_OUTPUT_DIR)
+        journal_dir = LIVE_JOURNAL_DIR
 
         return live_trading.LiveRunConfig(
             symbol=sym,
@@ -7304,24 +9101,597 @@ class BacktestDashboard(QMainWindow):
         )
         self._live_log(f"[TELEGRAM] Test failed: {detail}")
 
-    def _live_worker_running(self) -> bool:
-        return self._live_thread is not None and self._live_thread.isRunning()
+    def _save_live_desk(self) -> None:
+        try:
+            live_accounts.save_desk(LIVE_DESK_PATH, self._live_desk)
+        except OSError as e:
+            self._live_log(f"[WARN] Could not save live accounts: {e}")
 
-    def _on_live_start(self):
+    def _active_live_account(self) -> Optional[live_accounts.LiveAccount]:
+        desk = self._live_desk
+        desk.ensure_defaults()
+        return desk.account_by_id(desk.active_account_id) or (desk.accounts[0] if desk.accounts else None)
+
+    def _account_password_key(self, acc_id: str) -> str:
+        return f"live/account_pw/{acc_id}"
+
+    def _load_account_password(self, acc: live_accounts.LiveAccount) -> str:
+        return self._settings.value(self._account_password_key(acc.id), "", type=str) or acc.password or ""
+
+    def _store_account_password(self, acc: live_accounts.LiveAccount) -> None:
+        self._settings.setValue(self._account_password_key(acc.id), acc.password or "")
+
+    def _hydrate_accounts_from_legacy_settings(self) -> None:
+        desk = self._live_desk
+        desk.ensure_defaults()
+        for acc in desk.accounts:
+            acc.password = self._load_account_password(acc)
+        acc = self._active_live_account()
+        if acc is None:
+            return
+        if not acc.login and hasattr(self, "live_login"):
+            acc.login = self.live_login.text().strip()
+            acc.server = self.live_server.text().strip()
+            acc.terminal_path = self.live_mt5_path.text().strip()
+            self._save_live_desk()
+
+    def _apply_account_to_connect_fields(self, acc: Optional[live_accounts.LiveAccount]) -> None:
+        if acc is None:
+            return
+        if hasattr(self, "live_login"):
+            self.live_login.setText(acc.login)
+        if hasattr(self, "live_server"):
+            self.live_server.setText(acc.server)
+        if hasattr(self, "live_mt5_path"):
+            self.live_mt5_path.setText(acc.terminal_path)
+        if hasattr(self, "live_password"):
+            self.live_password.setText(acc.password or self._load_account_password(acc))
+
+    def _refresh_live_account_combo(self) -> None:
+        self._refresh_live_account_dock_titles()
+
+    def _refresh_live_account_dock_titles(self) -> None:
+        for acc in self._live_desk.accounts:
+            dock = self._live_account_docks.get(acc.id)
+            if dock is not None:
+                dock.setWindowTitle(self._live_dock_title(acc))
+            if acc.id == self._primary_live_account_id and hasattr(self, "live_primary_account_label"):
+                self.live_primary_account_label.setText(acc.name)
+
+    def _apply_account_dialog_values(self, acc: live_accounts.LiveAccount, vals: dict) -> None:
+        acc.name = vals["name"]
+        acc.login = vals["login"]
+        acc.password = vals["password"]
+        acc.server = vals["server"]
+        acc.terminal_path = vals["terminal_path"]
+        acc.max_daily_loss_usd = vals["max_daily_loss_usd"]
+        acc.flatten_hhmm = str(vals.get("flatten_hhmm") or "")
+        self._store_account_password(acc)
+        self._focused_live_account_id = acc.id
         if not self.mt5_broker.is_connected:
-            QMessageBox.warning(
-                self, "Not connected",
-                "Click Connect MT5 first. Live trading requires Windows + MetaTrader5 package.",
+            self._live_desk.active_account_id = acc.id
+        self._apply_account_to_connect_fields(acc)
+        self._save_live_desk()
+        self._refresh_live_desk_tables()
+        self._refresh_live_config_summary()
+        dock = self._live_account_docks.get(acc.id)
+        if dock is not None:
+            dock.setWindowTitle(self._live_dock_title(acc))
+            dock.show()
+            dock.raise_()
+
+    def _on_edit_live_account(self, account_id: Optional[str] = None) -> None:
+        if isinstance(account_id, bool) or not account_id:
+            account_id = self._focused_live_account_id or self._primary_live_account_id
+        acc = self._live_desk.account_by_id(str(account_id)) or self._active_live_account()
+        if acc is None:
+            return
+        acc.password = self._load_account_password(acc)
+        dlg = LiveAccountDialog(self, account=acc)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        self._apply_account_dialog_values(acc, dlg.values())
+        self._live_log(f"Updated MT5 login for '{acc.name}'. Connect MT5 on this Live tab to use it.")
+
+    def _on_edit_active_live_account(self) -> None:
+        self._on_edit_live_account(self._focused_live_account_id or self._primary_live_account_id)
+
+    def _fill_live_slot_table(self, table: QTableWidget, acc_id: str) -> None:
+        prev = self._selected_live_slot_id(acc_id)
+        slots = self._live_desk.slots_for_account(acc_id)
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for slot in slots:
+            row = table.rowCount()
+            table.insertRow(row)
+            status = "running" if slot.id in self._live_workers else "stopped"
+            values = [
+                slot.name, slot.symbol, slot.timeframe,
+                self._preset_display_name(slot.preset_file),
+                str(slot.magic), str(slot.volume), status,
+            ]
+            for col, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, slot.id)
+                table.setItem(row, col, item)
+        table.blockSignals(False)
+        selected = False
+        if prev:
+            for r in range(table.rowCount()):
+                it = table.item(r, 0)
+                if it is not None and it.data(Qt.UserRole) == prev:
+                    table.selectRow(r)
+                    selected = True
+                    break
+        if not selected and table.rowCount():
+            table.selectRow(0)
+        table.resizeColumnsToContents()
+
+    def _refresh_live_desk_tables(self) -> None:
+        desk = self._live_desk
+        desk.ensure_defaults()
+        self._refresh_live_account_dock_titles()
+        tables = dict(self._live_account_tables)
+        if hasattr(self, "live_desk_table") and self._primary_live_account_id not in tables:
+            tables[self._primary_live_account_id] = self.live_desk_table
+        for acc_id, table in tables.items():
+            if table is None or not _qt_widget_valid(table):
+                continue
+            self._fill_live_slot_table(table, acc_id)
+        focus = self._focused_live_account_id or self._primary_live_account_id
+        self._on_live_desk_selection_changed(focus)
+        self._update_live_stop_buttons()
+        self._refresh_live_config_summary()
+        for acc_id in list(self._live_account_status_chips.keys()):
+            self._refresh_account_status_strip(acc_id)
+        self._refresh_live_manager_if_open()
+
+    def _update_live_stop_buttons(self) -> None:
+        for acc_id, btn in self._live_stop_buttons.items():
+            if not _qt_widget_valid(btn):
+                continue
+            running = any(
+                s.id in self._live_workers
+                for s in self._live_desk.slots_for_account(acc_id)
+            )
+            btn.setEnabled(running)
+        if hasattr(self, "live_stop_btn") and self._primary_live_account_id not in self._live_stop_buttons:
+            running = any(
+                s.id in self._live_workers
+                for s in self._live_desk.slots_for_account(self._primary_live_account_id)
+            )
+            self.live_stop_btn.setEnabled(running)
+
+    def _selected_live_slot_id(self, account_id: Optional[str] = None) -> Optional[str]:
+        acc_id = account_id or self._focused_live_account_id or self._primary_live_account_id
+        table = self._live_account_tables.get(acc_id)
+        if table is None and acc_id == self._primary_live_account_id:
+            table = getattr(self, "live_desk_table", None)
+        if table is None or not _qt_widget_valid(table):
+            return None
+        rows = table.selectionModel().selectedRows() if table.selectionModel() else []
+        if not rows:
+            return None
+        item = table.item(rows[0].row(), 0)
+        if item is None:
+            return None
+        sid = item.data(Qt.UserRole)
+        return str(sid) if sid else None
+
+    def _selected_live_slot(self, account_id: Optional[str] = None) -> Optional[live_accounts.LiveSlot]:
+        sid = self._selected_live_slot_id(account_id)
+        if not sid:
+            return None
+        return self._live_desk.slot_by_id(sid)
+
+    def _on_live_desk_selection_changed(self, account_id: Optional[str] = None) -> None:
+        if isinstance(account_id, bool):
+            account_id = None
+        if account_id:
+            self._focused_live_account_id = str(account_id)
+        slot = self._selected_live_slot(account_id)
+        if slot is None:
+            return
+        if hasattr(self, "live_symbol"):
+            self.live_symbol.setText(slot.symbol)
+        if hasattr(self, "live_timeframe"):
+            idx = self.live_timeframe.findText(slot.timeframe)
+            if idx >= 0:
+                self.live_timeframe.setCurrentIndex(idx)
+        if hasattr(self, "live_magic"):
+            self.live_magic.setText(str(slot.magic))
+        if hasattr(self, "live_volume"):
+            self.live_volume.setText(str(slot.volume))
+        self._refresh_live_config_summary()
+
+    def _on_add_live_account(self) -> None:
+        dlg = LiveAccountDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        acc = live_accounts.LiveAccount.new(vals["name"], self._live_desk.next_account_magic_base())
+        self._live_desk.accounts.append(acc)
+        slot = live_accounts.LiveSlot.new(acc.id, "Slot 1", self._live_desk.next_magic_for_account(acc.id))
+        slot.timeframe = self._live_desk.next_slot_timeframe(acc.id)
+        self._live_desk.slots.append(slot)
+        self._apply_account_dialog_values(acc, vals)
+        if acc.id != self._primary_live_account_id and acc.id not in self._live_account_docks:
+            self._create_extra_live_dock(acc, raise_dock=True)
+        elif acc.id != self._primary_live_account_id and self._live_account_docks.get(acc.id) is self.live_dock:
+            self._create_extra_live_dock(acc, raise_dock=True)
+        self._refresh_live_desk_tables()
+        dock = self._live_account_docks.get(acc.id)
+        if dock is not None:
+            dock.show()
+            dock.raise_()
+        self._live_log(
+            f"Added live account '{acc.name}' as its own Live tab "
+            "(Results and Backtest Parameters stay shared). "
+            "Connect MT5 on that tab — parallel multi-account uses a dedicated worker process per login."
+        )
+
+    def _on_add_live_slot(self, account_id: Optional[str] = None) -> None:
+        if isinstance(account_id, bool) or not account_id:
+            account_id = self._focused_live_account_id or self._primary_live_account_id
+        desk = self._live_desk
+        desk.ensure_defaults()
+        acc = desk.account_by_id(str(account_id)) or self._active_live_account()
+        if acc is None:
+            return
+        self._focused_live_account_id = acc.id
+        draft = live_accounts.LiveSlot.new(
+            acc.id,
+            f"Slot {len(desk.slots_for_account(acc.id)) + 1}",
+            desk.next_magic_for_account(acc.id),
+        )
+        draft.timeframe = desk.next_slot_timeframe(acc.id)
+        if hasattr(self, "live_symbol"):
+            draft.symbol = self.live_symbol.text().strip() or "XAUUSD"
+        if hasattr(self, "live_volume"):
+            draft.volume = self.live_volume.text().strip() or "0.01"
+        dlg = LiveSlotDialog(
+            self, slot=draft, account_name=acc.name,
+            preset_choices=self._list_preset_choices(),
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        used = {int(s.magic) for s in desk.slots}
+        if int(vals["magic"]) in used:
+            vals["magic"] = desk.next_magic_for_account(acc.id)
+            self._live_log(f"Magic was already used — assigned {vals['magic']} instead.")
+        acc_lo, acc_hi = acc.magic_range()
+        try:
+            mag = int(vals["magic"])
+        except (TypeError, ValueError):
+            mag = desk.next_magic_for_account(acc.id)
+        if mag < acc_lo or mag > acc_hi:
+            vals["magic"] = desk.next_magic_for_account(acc.id)
+            self._live_log(f"Magic must stay in this account series {acc_lo}–{acc_hi} — assigned {vals['magic']}.")
+        self._apply_slot_dialog_values(draft, vals)
+        desk.slots.append(draft)
+        self._save_live_desk()
+        self._refresh_live_desk_tables()
+        self._select_live_slot_id(draft.id, acc.id)
+        self._live_log(
+            f"Added slot '{draft.name}' {draft.symbol} {draft.timeframe} magic={draft.magic} on {acc.name}."
+        )
+
+    def _on_edit_live_slot(self, account_id: Optional[str] = None) -> None:
+        if isinstance(account_id, bool) or not account_id:
+            account_id = self._focused_live_account_id or self._primary_live_account_id
+        slot = self._selected_live_slot(str(account_id))
+        if slot is None:
+            return
+        if slot.id in self._live_workers:
+            QMessageBox.information(
+                self, "Slot running",
+                "Stop live before editing this slot, then Start again.",
             )
             return
-        if self._live_worker_running():
-            QMessageBox.information(self, "Live", "Live is already running — Stop live first.")
+        acc = self._live_desk.account_by_id(slot.account_id)
+        dlg = LiveSlotDialog(
+            self, slot=slot, account_name=acc.name if acc else "",
+            preset_choices=self._list_preset_choices(),
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        used = {int(s.magic) for s in self._live_desk.slots if s.id != slot.id}
+        if int(vals["magic"]) in used:
+            QMessageBox.warning(
+                self, "Duplicate magic",
+                f"Magic {vals['magic']} is already used. Pick another number.",
+            )
+            return
+        self._apply_slot_dialog_values(slot, vals)
+        self._save_live_desk()
+        self._refresh_live_desk_tables()
+        self._select_live_slot_id(slot.id, slot.account_id)
+        self._live_log(f"Updated slot '{slot.name}' {slot.symbol} {slot.timeframe} magic={slot.magic}.")
+
+    def _apply_slot_dialog_values(self, slot: live_accounts.LiveSlot, vals: dict) -> None:
+        slot.name = vals["name"]
+        slot.symbol = vals["symbol"]
+        slot.timeframe = vals["timeframe"]
+        slot.volume = vals["volume"]
+        slot.magic = int(vals["magic"])
+        slot.preset_file = str(vals.get("preset_file") or "")
+        if hasattr(self, "live_symbol"):
+            self.live_symbol.setText(slot.symbol)
+        if hasattr(self, "live_timeframe"):
+            idx = self.live_timeframe.findText(slot.timeframe)
+            if idx >= 0:
+                self.live_timeframe.setCurrentIndex(idx)
+        if hasattr(self, "live_magic"):
+            self.live_magic.setText(str(slot.magic))
+        if hasattr(self, "live_volume"):
+            self.live_volume.setText(str(slot.volume))
+
+    def _select_live_slot_id(self, slot_id: str, account_id: Optional[str] = None) -> None:
+        acc_id = account_id or self._focused_live_account_id or self._primary_live_account_id
+        table = self._live_account_tables.get(acc_id)
+        if table is None:
+            table = getattr(self, "live_desk_table", None)
+        if table is None:
+            return
+        for r in range(table.rowCount()):
+            it = table.item(r, 0)
+            if it is not None and it.data(Qt.UserRole) == slot_id:
+                table.selectRow(r)
+                return
+
+    def _on_remove_live_slot(self, account_id: Optional[str] = None) -> None:
+        if isinstance(account_id, bool) or not account_id:
+            account_id = self._focused_live_account_id or self._primary_live_account_id
+        slot = self._selected_live_slot(str(account_id))
+        if slot is None:
+            return
+        self._delete_live_slot_by_id(slot.id, confirm=False)
+
+    def _toggle_live_manager(self) -> None:
+        """Ctrl+M — show/hide Manager without blocking Live or Backtest."""
+        dlg = getattr(self, "_live_manager_dlg", None)
+        if dlg is not None and _qt_widget_valid(dlg):
+            if dlg.isVisible():
+                dlg.hide()
+                return
+            dlg.refresh()
+            dlg.show()
+            dlg.raise_()
+            return
+        dlg = LiveManagerDialog(self)
+        self._live_manager_dlg = dlg
+        dlg.show()
+
+    def _open_live_manager(self) -> None:
+        """Ensure Manager is visible (does not toggle closed)."""
+        dlg = getattr(self, "_live_manager_dlg", None)
+        if dlg is not None and _qt_widget_valid(dlg) and dlg.isVisible():
+            dlg.refresh()
+            dlg.raise_()
+            return
+        self._toggle_live_manager()
+
+    def _open_preset_manager(self) -> None:
+        dlg = getattr(self, "_preset_manager_dlg", None)
+        if dlg is not None and _qt_widget_valid(dlg):
+            dlg.refresh()
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            return
+        dlg = PresetManagerDialog(self)
+        self._preset_manager_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _refresh_live_manager_if_open(self) -> None:
+        dlg = getattr(self, "_live_manager_dlg", None)
+        if dlg is not None and _qt_widget_valid(dlg) and dlg.isVisible():
+            dlg.refresh()
+
+    def _raise_live_account_dock(self, acc_id: str) -> None:
+        dock = self._live_account_docks.get(acc_id)
+        if dock is None and acc_id == self._primary_live_account_id:
+            dock = getattr(self, "live_dock", None)
+        if dock is None:
+            return
+        self._focused_live_account_id = acc_id
+        dock.show()
+        dock.raise_()
+
+    def _destroy_extra_live_dock(self, acc_id: str) -> None:
+        dock = self._live_account_docks.get(acc_id)
+        if dock is None or dock is getattr(self, "live_dock", None):
+            return
+        try:
+            action = dock.toggleViewAction()
+            menu = getattr(self, "_view_menu", None)
+            if menu is not None and action is not None:
+                menu.removeAction(action)
+            if action in getattr(self, "_dock_toggle_actions", []):
+                self._dock_toggle_actions.remove(action)
+        except (RuntimeError, ValueError):
+            pass
+        try:
+            self.removeDockWidget(dock)
+            dock.hide()
+            dock.deleteLater()
+        except RuntimeError:
+            pass
+        self._live_account_docks.pop(acc_id, None)
+        self._live_account_tables.pop(acc_id, None)
+        self._live_account_status.pop(acc_id, None)
+        self._live_account_status_chips.pop(acc_id, None)
+        self._live_account_summaries.pop(acc_id, None)
+        self._live_stop_buttons.pop(acc_id, None)
+
+    def _delete_live_slot_by_id(self, slot_id: str, *, confirm: bool = False) -> None:
+        slot = self._live_desk.slot_by_id(slot_id)
+        if slot is None:
+            return
+        if slot.id in self._live_workers:
+            QMessageBox.warning(self, "Slot running", "Stop this slot before deleting it.")
+            return
+        if len(self._live_desk.slots_for_account(slot.account_id)) <= 1:
+            QMessageBox.information(
+                self, "Slots",
+                "Keep at least one slot on this account. Delete the account in Manager if you want the Live tab gone.",
+            )
+            return
+        if confirm:
+            ans = QMessageBox.question(
+                self, "Delete slot",
+                f"Delete slot '{slot.name}' ({slot.symbol} {slot.timeframe})?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+        if not self._live_desk.remove_slot(slot.id):
+            return
+        self._save_live_desk()
+        self._refresh_live_desk_tables()
+        self._live_log(f"Deleted slot '{slot.name}'.")
+
+    def _delete_live_account(self, acc_id: str) -> None:
+        acc = self._live_desk.account_by_id(acc_id)
+        if acc is None:
+            return
+        if len(self._live_desk.accounts) <= 1:
+            QMessageBox.information(self, "Accounts", "Keep at least one live account.")
+            return
+        running = [
+            s.name for s in self._live_desk.slots_for_account(acc_id) if s.id in self._live_workers
+        ]
+        if running:
+            QMessageBox.warning(
+                self, "Account has running slots",
+                "Stop live on this account before deleting it:\n" + ", ".join(running),
+            )
+            return
+        ans = QMessageBox.question(
+            self, "Delete account",
+            f"Delete account '{acc.name}' and all of its slots? The Live tab for it will close.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+        was_connected = self.mt5_broker.is_connected and self._live_desk.active_account_id == acc_id
+        if acc_id == self._primary_live_account_id:
+            other = next((a for a in self._live_desk.accounts if a.id != acc_id), None)
+            if other is None:
+                return
+            self._destroy_extra_live_dock(other.id)
+            self._live_account_docks.pop(acc_id, None)
+            self._live_account_tables.pop(acc_id, None)
+            self._live_account_status.pop(acc_id, None)
+            self._live_account_summaries.pop(acc_id, None)
+            self._live_stop_buttons.pop(acc_id, None)
+            self._primary_live_account_id = other.id
+            self._focused_live_account_id = other.id
+            self._register_live_account_ui(
+                other.id,
+                dock=self.live_dock,
+                table=self.live_desk_table,
+                status=self.live_status_label,
+                summary=self.live_config_summary,
+            )
+            self._live_stop_buttons[other.id] = self.live_stop_btn
+            self.live_dock.setWindowTitle(self._live_dock_title(other))
+            if hasattr(self, "live_primary_account_label"):
+                self.live_primary_account_label.setText(other.name)
+        else:
+            self._destroy_extra_live_dock(acc_id)
+        if not self._live_desk.remove_account(acc_id):
+            return
+        if was_connected:
+            self._on_live_disconnect()
+        if self._live_desk.active_account_id == acc_id or not self._live_desk.active_account_id:
+            self._live_desk.active_account_id = self._live_desk.accounts[0].id
+        self._save_live_desk()
+        self._refresh_live_desk_tables()
+        self._live_log(f"Deleted live account '{acc.name}'.")
+
+    def _sync_selected_slot_from_widgets(self) -> Optional[live_accounts.LiveSlot]:
+        slot = self._selected_live_slot()
+        if slot is None:
+            self._live_desk.ensure_defaults()
+            slot = self._live_desk.slots[0]
+        slot.symbol = self.live_symbol.text().strip() or slot.symbol
+        slot.timeframe = self.live_timeframe.currentText() or slot.timeframe
+        try:
+            slot.magic = int(self.live_magic.text().strip() or slot.magic)
+        except ValueError:
+            pass
+        slot.volume = self.live_volume.text().strip() or slot.volume
+        self._save_live_desk()
+        return slot
+
+    def _on_live_start_account(self, account_id: str) -> None:
+        acc = self._live_desk.account_by_id(account_id)
+        if acc is None:
+            return
+        self._focused_live_account_id = acc.id
+        self._live_desk.active_account_id = acc.id
+        if not self._account_connected(acc.id):
+            QMessageBox.warning(
+                self,
+                "Not connected",
+                f"Connect MT5 on the '{acc.name}' Live tab first.\n"
+                "Each account uses its own worker process — you can connect several in parallel.",
+            )
+            return
+        self._on_live_desk_selection_changed(acc.id)
+        self._on_live_start()
+
+    def _on_live_start(self):
+        slot = self._sync_selected_slot_from_widgets()
+        if slot is None:
+            return
+        acc = self._live_desk.account_by_id(slot.account_id)
+        if not self._account_connected(slot.account_id):
+            QMessageBox.warning(
+                self, "Not connected",
+                "Click Connect MT5 on this account's Live tab first.\n"
+                "Live trading requires Windows + MetaTrader5. "
+                "Use a separate MT5 terminal path per account for parallel logins.",
+            )
+            return
+        if slot.id in self._live_workers:
+            QMessageBox.information(self, "Live", f"Slot '{slot.name}' is already running.")
+            return
+        running_magics = {
+            int(self._live_desk.slot_by_id(sid).magic)
+            for sid in self._live_workers
+            if self._live_desk.slot_by_id(sid) is not None
+        }
+        if int(slot.magic) in running_magics:
+            QMessageBox.warning(
+                self, "Magic in use",
+                f"Magic {slot.magic} is already used by a running slot. Give this slot a unique magic.",
+            )
+            return
+        if not self._live_desk.magics_unique():
+            QMessageBox.warning(
+                self, "Duplicate magic",
+                "Each slot needs a unique magic number so MT5 positions stay isolated.",
+            )
             return
 
         try:
             live_cfg = self._build_live_run_config()
+            acc = self._live_desk.account_by_id(slot.account_id)
+            if acc is not None:
+                live_cfg = dataclasses.replace(
+                    live_cfg,
+                    max_daily_loss_usd=float(acc.max_daily_loss_usd or 0),
+                )
             pattern, pattern_type, strategy_config, indicator_stack = (
-                self._collect_live_strategy_from_parameters()
+                self._collect_live_strategy_for_slot(slot)
             )
         except Exception as e:
             QMessageBox.critical(self, "Invalid parameters", f"Could not read strategy settings:\n{e}")
@@ -7354,18 +9724,35 @@ class BacktestDashboard(QMainWindow):
             )
             return
 
-        sym_ok, sym_msg, resolved_sym = self.mt5_broker.resolve_and_ensure_symbol(live_cfg.symbol)
-        if not sym_ok:
-            QMessageBox.warning(self, "Symbol not ready", sym_msg)
-            self._live_log(f"[BLOCKED] {sym_msg}")
-            return
+        sym_ok, sym_msg, resolved_sym = True, f"Symbol {live_cfg.symbol}", live_cfg.symbol.strip()
+        handle = self._account_handles.get(slot.account_id)
+        use_remote = handle is not None and handle.connected
+        if not use_remote and self.mt5_broker.is_connected:
+            sym_ok, sym_msg, resolved_sym = self.mt5_broker.resolve_and_ensure_symbol(live_cfg.symbol)
+            if not sym_ok:
+                QMessageBox.warning(self, "Symbol not ready", sym_msg)
+                self._live_log(f"[BLOCKED] {sym_msg}")
+                return
+        elif use_remote:
+            sym_msg = (
+                f"Symbol '{live_cfg.symbol}' will be resolved inside the "
+                f"'{handle.account_name}' worker process."
+            )
         if resolved_sym != live_cfg.symbol.strip():
             live_cfg = dataclasses.replace(live_cfg, symbol=resolved_sym)
             self.live_symbol.setText(resolved_sym)
         self._live_log(sym_msg)
 
         self._refresh_live_strategy_summary()
-        is_demo = self.mt5_broker.account_is_demo()
+        if use_remote:
+            info = handle.account_info or {}
+            # Heuristic: many brokers expose trade_mode 0 = demo
+            try:
+                is_demo = int(info.get("trade_mode")) == 0 if info.get("trade_mode") is not None else None
+            except Exception:
+                is_demo = None
+        else:
+            is_demo = self.mt5_broker.account_is_demo()
         if not live_cfg.sessions_enabled and self._time_filter_mode() == "sessions":
             QMessageBox.warning(
                 self, "No Sessions Selected",
@@ -7416,7 +9803,7 @@ class BacktestDashboard(QMainWindow):
                 "These Direction + Entry/Exit rows are the same objects used in backtest "
                 "(lots/risk caps still come from the Live panel, not Run Settings)."
             )
-        elif pattern_type in ("hammer_with_candles", "hammer_context"):
+        elif hammer_context_logic.is_context_pattern_type(pattern_type):
             preflight.append(f"Rules: {hammer_context_logic.describe_hammer_context_rules(strategy_config)}")
             preflight.append(f"Entry/Exit: {hammer_context_logic.describe_hammer_context_entry_exit(strategy_config)}")
         tf_set = tf_settings.get(live_tf)
@@ -7449,8 +9836,52 @@ class BacktestDashboard(QMainWindow):
                 return
 
         self._save_live_settings()
-        self._active_live_journal_dir = live_cfg.journal_dir or LIVE_JOURNAL_DIR
-        self._live_engine = live_trading.LiveTradingEngine(
+        slot_acc = self._live_desk.account_by_id(slot.account_id)
+        slot_journal = slot_journal_dir(
+            APP_DIR,
+            slot.account_id,
+            slot_acc.name if slot_acc else "",
+            slot.id,
+            slot.name,
+            slot.timeframe,
+        )
+        live_cfg = dataclasses.replace(
+            live_cfg,
+            journal_dir=slot_journal,
+            order_comment=f"H-{slot.name[:10]}-{slot.timeframe}"[:31],
+        )
+        self._active_live_journal_dir = slot_journal
+        handle = self._account_handles.get(slot.account_id)
+        if handle is not None and handle.connected:
+            try:
+                handle.send(
+                    "start_slot",
+                    slot_id=slot.id,
+                    live_config=live_cfg,
+                    pattern_type=pattern_type,
+                    pattern_label=pattern,
+                    strategy_config=strategy_config,
+                    indicator_stack=indicator_stack,
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, "Start live", f"Could not start slot in account worker:\n{exc}")
+                return
+            self._live_workers[slot.id] = {"account_id": slot.account_id, "remote": True}
+            self._live_log(
+                f"Start live sent to worker '{handle.account_name}' "
+                f"(slot '{slot.name}', parallel multi-account OK)."
+            )
+            if not self._live_health_timer.isActive():
+                self._live_health_timer.start()
+            self._update_live_stop_buttons()
+            self._refresh_live_desk_tables()
+            eq0 = self._account_session_equity_by_id.get(slot.account_id)
+            if eq0:
+                self._account_session_equity = eq0
+            return
+
+        # Legacy in-process path (single login in this window)
+        engine = live_trading.LiveTradingEngine(
             broker=self.mt5_broker,
             live_config=live_cfg,
             pattern_type=pattern_type,
@@ -7459,12 +9890,23 @@ class BacktestDashboard(QMainWindow):
             indicator_stack=indicator_stack,
             log=self._live_log,
         )
-        self._live_thread = LiveTradingThread(self._live_engine)
-        self._live_thread.finished_cleanly.connect(self._on_live_worker_finished)
-        self._live_thread.crashed.connect(self._on_live_worker_crashed)
-        self._live_thread.start()
+        thread = LiveTradingThread(engine, slot_id=slot.id)
+        thread.slot_finished.connect(self._on_live_slot_finished)
+        thread.slot_crashed.connect(self._on_live_slot_crashed)
+        self._live_workers[slot.id] = {
+            "engine": engine, "thread": thread, "account_id": slot.account_id,
+        }
+        self._live_engine = engine
+        self._live_thread = thread
+        thread.start()
+        if self._account_session_equity is None:
+            info = self.mt5_broker.account_info_dict() or {}
+            try:
+                self._account_session_equity = float(info.get("equity") or 0)
+            except (TypeError, ValueError):
+                self._account_session_equity = 0.0
         self._live_log(
-            f"Started {pattern} | {live_cfg.symbol} @ {live_cfg.timeframe_label} | "
+            f"Started slot '{slot.name}' | {pattern} | {live_cfg.symbol} @ {live_cfg.timeframe_label} | "
             f"lots={live_cfg.volume} magic={live_cfg.magic}"
         )
         self._live_log(live_trading.summarize_strategy_params(
@@ -7472,21 +9914,50 @@ class BacktestDashboard(QMainWindow):
         ))
 
         self._live_health_timer.start()
-        self.live_start_btn.setEnabled(False)
-        self.live_stop_btn.setEnabled(True)
+        self.live_start_btn.setEnabled(True)
+        self._update_live_stop_buttons()
         dry = "ON (no orders)" if live_cfg.dry_run else "OFF (orders enabled)"
-        self._set_app_status(f"Live: running, dry run {dry}")
+        nrun = len(self._live_workers)
+        self._set_app_status(f"Live: {nrun} slot(s) running, dry run {dry}")
         if live_cfg.telegram_enabled and live_cfg.telegram_bot_token and live_cfg.telegram_chat_id:
             self._live_log("[TELEGRAM] Alerts enabled for all order events.")
         elif live_cfg.telegram_enabled:
             self._live_log("[TELEGRAM] Enabled but token or chat id missing — no alerts will send.")
-        self.live_dock.show()
-        self.live_dock.raise_()
+        self._refresh_live_desk_tables()
+        dock = self._live_account_docks.get(
+            self._focused_live_account_id, self.live_dock
+        )
+        if dock is not None:
+            dock.show()
+            dock.raise_()
 
     def _on_live_worker_finished(self):
         if self._live_thread is not None and not self._live_thread.isRunning():
-            self._live_health_timer.stop()
-            self._finalize_live_worker_stopped()
+            if not self._live_workers:
+                self._live_health_timer.stop()
+                self._finalize_live_worker_stopped()
+
+    def _on_live_slot_finished(self, slot_id: str):
+        self._live_workers.pop(slot_id, None)
+        slot = self._live_desk.slot_by_id(slot_id)
+        name = slot.name if slot else slot_id
+        self._live_log(f"Slot '{name}' stopped.")
+        self._refresh_live_desk_tables()
+        if self._live_workers:
+            first = next(iter(self._live_workers.values()))
+            self._live_engine = first.get("engine")
+            self._live_thread = first.get("thread")
+            self._set_app_status(f"Live: {len(self._live_workers)} slot(s) running")
+            return
+        self._live_health_timer.stop()
+        self._finalize_live_worker_stopped()
+
+    def _on_live_slot_crashed(self, slot_id: str, detail: str):
+        self._live_log(f"[FATAL] Slot {slot_id} crashed:\n{detail}")
+        QMessageBox.critical(
+            self, "Live slot stopped",
+            "A live slot stopped unexpectedly. Check Live — Log.",
+        )
 
     def _on_live_worker_crashed(self, detail: str):
         self._live_log(f"[FATAL] Live worker crashed:\n{detail}")
@@ -7498,43 +9969,217 @@ class BacktestDashboard(QMainWindow):
         self._finalize_live_worker_stopped()
 
     def _finalize_live_worker_stopped(self):
+        self._live_workers.clear()
         self._live_engine = None
         self._live_thread = None
         self._active_live_journal_dir = None
+        self._account_session_equity = None
         if hasattr(self, "live_start_btn"):
             self.live_start_btn.setEnabled(True)
-        if hasattr(self, "live_stop_btn"):
-            self.live_stop_btn.setEnabled(False)
+        self._update_live_stop_buttons()
         self._set_app_status("Live: stopped")
+        self._refresh_live_desk_tables()
 
     def _check_live_worker_health(self):
-        eng = self._live_engine
-        if eng is None:
-            return
         import time as _time
 
-        stale_sec = _time.monotonic() - eng.last_heartbeat_mono
-        if stale_sec > 90:
-            self._live_log(f"[WARN] No live heartbeat for {stale_sec:.0f}s.")
+        for sid, worker in list(self._live_workers.items()):
+            if worker.get("remote"):
+                continue
+            eng = worker.get("engine")
+            if eng is None:
+                continue
+            stale_sec = _time.monotonic() - eng.last_heartbeat_mono
+            if stale_sec > 90:
+                self._live_log(f"[WARN] Slot {sid}: no heartbeat for {stale_sec:.0f}s.")
+        for account_id, handle in list(self._account_handles.items()):
+            if not handle.connected:
+                continue
+            if handle.last_heartbeat and (_time.monotonic() - handle.last_heartbeat) > 90:
+                self._live_log(
+                    f"[WARN] Account worker '{handle.account_name}' heartbeat stale."
+                )
+            # Per-account daily loss using equity from worker heartbeats
+            acc = self._live_desk.account_by_id(account_id)
+            max_loss = float(getattr(acc, "max_daily_loss_usd", 0) or 0) if acc else 0.0
+            if max_loss <= 0:
+                continue
+            start_eq = self._account_session_equity_by_id.get(account_id)
+            try:
+                eq = float((handle.account_info or {}).get("equity") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not start_eq or eq <= 0:
+                if eq > 0:
+                    self._account_session_equity_by_id[account_id] = eq
+                continue
+            dd = start_eq - eq
+            if dd >= max_loss:
+                self._live_log(
+                    f"[SAFETY] '{handle.account_name}' daily loss ${dd:.2f} "
+                    f"reached cap ${max_loss:.2f} — stopping that account's slots."
+                )
+                self._stop_live_slots_for_account(account_id)
+        if not self._live_workers or self._account_session_equity is None:
+            return
+        if not self.mt5_broker.is_connected:
+            return
+        acc = self._live_desk.account_by_id(self._live_desk.active_account_id)
+        max_loss = float(getattr(acc, "max_daily_loss_usd", 0) or 0) if acc else 0.0
+        if max_loss <= 0:
+            return
+        info = self.mt5_broker.account_info_dict() or {}
+        try:
+            eq = float(info.get("equity") or 0)
+        except (TypeError, ValueError):
+            return
+        dd = self._account_session_equity - eq
+        if dd >= max_loss:
+            self._live_log(
+                f"[SAFETY] Account daily loss ${dd:.2f} reached cap ${max_loss:.2f} — stopping all slots."
+            )
+            self._stop_live_trading()
+
+    def _stop_live_slots_for_account(self, account_id: str) -> None:
+        ids = {s.id for s in self._live_desk.slots_for_account(account_id)}
+        targets = [
+            (sid, worker) for sid, worker in list(self._live_workers.items()) if sid in ids
+        ]
+        if not targets:
+            return
+        acc = self._live_desk.account_by_id(account_id)
+        self._live_log(f"Stop live on '{acc.name if acc else account_id}'…")
+        handle = self._account_handles.get(account_id)
+        if handle is not None and handle.is_alive():
+            try:
+                handle.send("stop_all_slots")
+            except Exception as exc:
+                self._live_log(f"[WARN] stop_all_slots: {exc}")
+        for _sid, worker in targets:
+            if worker.get("remote"):
+                continue
+            eng = worker.get("engine")
+            th = worker.get("thread")
+            if eng is not None:
+                eng.request_stop()
+            if th is not None and th.isRunning():
+                th.request_stop()
+                th.wait(8000)
+        for sid, _worker in targets:
+            self._live_workers.pop(sid, None)
+        if self._live_workers:
+            first = next(iter(self._live_workers.values()))
+            self._live_engine = first.get("engine")
+            self._live_thread = first.get("thread")
+            self._update_live_stop_buttons()
+            self._refresh_live_desk_tables()
+            self._set_app_status(f"Live: {len(self._live_workers)} slot(s) running")
+            return
+        self._live_health_timer.stop()
+        self._finalize_live_worker_stopped()
+
+    def _account_magic_list(self, account_id: str) -> List[int]:
+        acc = self._live_desk.account_by_id(account_id)
+        magics = [int(s.magic) for s in self._live_desk.slots_for_account(account_id)]
+        if acc is not None:
+            lo, hi = acc.magic_range()
+            magics.extend(range(lo, hi + 1))
+        return sorted(set(magics))
+
+    def _emergency_flatten_account(self, account_id: str, reason: str = "emergency") -> None:
+        acc = self._live_desk.account_by_id(account_id)
+        name = acc.name if acc else account_id
+        magics = self._account_magic_list(account_id)
+        self._live_log(f"[{reason.upper()}] Flatten '{name}' magics {magics[0] if magics else '?'}…")
+        self._stop_live_slots_for_account(account_id)
+        handle = self._account_handles.get(account_id)
+        if handle is not None and handle.is_alive() and handle.connected:
+            try:
+                handle.send("emergency_close", magics=magics)
+            except Exception as exc:
+                self._live_log(f"[{reason}] worker emergency failed: {exc}")
+            return
+        if not self.mt5_broker.is_connected:
+            self._live_log(f"[{reason}] Slots stopped. Connect MT5 to close open positions.")
+            return
+        closed, failed, detail = self.mt5_broker.close_positions_for_magics(magics)
+        self._live_log(f"[{reason}] '{name}': closed {closed}, failed {failed}. {detail}")
+        if failed:
+            QMessageBox.warning(
+                self, "Flatten incomplete",
+                f"Closed {closed}, failed {failed} on '{name}'.\n{detail}",
+            )
+
+    def _on_flatten_timer_tick(self) -> None:
+        try:
+            self._check_flatten_timers()
+        except Exception as exc:
+            try:
+                self._live_log(f"[flatten] timer error: {exc}")
+            except Exception:
+                pass
+
+    def _check_flatten_timers(self) -> None:
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        hhmm = now.strftime("%H:%M")
+        for acc in list(self._live_desk.accounts):
+            raw = (acc.flatten_hhmm or "").strip()
+            if not raw or ":" not in raw:
+                continue
+            try:
+                h, m = raw.split(":")[:2]
+                target = f"{int(h):02d}:{int(m):02d}"
+            except ValueError:
+                continue
+            if hhmm != target:
+                continue
+            fired_key = f"{today}:{target}"
+            if self._flatten_fired_on.get(acc.id) == fired_key:
+                continue
+            self._flatten_fired_on[acc.id] = fired_key
+            self._emergency_flatten_account(acc.id, reason=f"clock {target}")
 
     def _stop_live_trading(self):
-        if self._live_worker_running():
-            self._live_log("Stop live requested — shutting down…")
+        if self._live_worker_running() or any(
+            h.running_slots for h in self._account_handles.values()
+        ):
+            self._live_log("Stop live requested — shutting down all slots…")
             self._set_app_status("Live: stopping…")
+        for account_id, handle in list(self._account_handles.items()):
+            if handle.is_alive():
+                try:
+                    handle.send("stop_all_slots")
+                except Exception:
+                    pass
+        for worker in list(self._live_workers.values()):
+            if worker.get("remote"):
+                continue
+            eng = worker.get("engine")
+            th = worker.get("thread")
+            if eng is not None:
+                eng.request_stop()
+            if th is not None and th.isRunning():
+                th.request_stop()
+                th.wait(8000)
         if self._live_engine is not None:
             self._live_engine.request_stop()
         if self._live_thread is not None and self._live_thread.isRunning():
             self._live_thread.request_stop()
-            self._live_thread.wait(15000)
+            self._live_thread.wait(8000)
+        self._live_workers.clear()
         self._live_health_timer.stop()
-        self._live_engine = None
-        self._live_thread = None
-        self._active_live_journal_dir = None
-        if hasattr(self, "live_start_btn"):
-            self.live_start_btn.setEnabled(True)
-        if hasattr(self, "live_stop_btn"):
-            self.live_stop_btn.setEnabled(False)
-        self._set_app_status("Live: stopped")
+        self._finalize_live_worker_stopped()
+
+    def _live_worker_running(self) -> bool:
+        if self._live_workers:
+            for w in self._live_workers.values():
+                if w.get("remote"):
+                    return True
+                th = w.get("thread")
+                if th is not None and th.isRunning():
+                    return True
+        return self._live_thread is not None and self._live_thread.isRunning()
 
     def _build_results_panel(self) -> QWidget:
         wrap = QWidget()
@@ -7924,12 +10569,12 @@ class BacktestDashboard(QMainWindow):
         except (ValueError, TypeError):
             return default_val
 
-    def _collect_live_strategy_from_parameters(self):
+    def _collect_live_strategy_from_parameters(self, *, honor_live_pattern_combo: bool = True):
         """
         Build the same strategy + indicator objects as backtest Run, from the current
         Parameters panel (pattern, shape, entry/exit, risk, timeframe RR/SL, indicators).
         """
-        if hasattr(self, "live_pattern_combo") and hasattr(self, "pattern_combo"):
+        if honor_live_pattern_combo and hasattr(self, "live_pattern_combo") and hasattr(self, "pattern_combo"):
             live_pat = self.live_pattern_combo.currentText()
             if live_pat and self.pattern_combo.findText(live_pat) >= 0:
                 if self.pattern_combo.currentText() != live_pat:
@@ -7945,6 +10590,58 @@ class BacktestDashboard(QMainWindow):
         strategy_config = self._build_strategy_config()
         indicator_stack = self._build_indicator_stack()
         return pattern, pattern_type, strategy_config, indicator_stack
+
+    def _list_preset_choices(self) -> list:
+        self._ensure_example_presets()
+        os.makedirs(PRESETS_DIR, exist_ok=True)
+        choices = []
+        try:
+            names = sorted(f for f in os.listdir(PRESETS_DIR) if f.endswith(".json"))
+        except OSError:
+            names = []
+        for name in names:
+            choices.append((self._preset_display_name(name), name))
+        return choices
+
+    def _preset_display_name(self, filename: str) -> str:
+        if not filename:
+            return "Parameters"
+        path = self._preset_path(filename)
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict) and meta.get("display_name"):
+                return str(meta["display_name"])
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return filename[:-5].replace("_", " ") if filename.endswith(".json") else filename
+
+    def _collect_live_strategy_for_slot(self, slot: live_accounts.LiveSlot):
+        """Use the slot’s preset.json when set; otherwise the Parameters panel."""
+        preset = (slot.preset_file or "").strip()
+        if not preset:
+            return self._collect_live_strategy_from_parameters()
+        path = self._preset_path(preset)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Preset '{preset}' for slot '{slot.name}' was not found in presets/. "
+                "Save the strategy as a preset, then Edit slot and pick it."
+            )
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"Preset '{preset}' is not a valid JSON object.")
+        snapshot = self._collect_preset_snapshot()
+        try:
+            self._apply_preset_snapshot(data)
+            result = self._collect_live_strategy_from_parameters(honor_live_pattern_combo=False)
+        finally:
+            self._apply_preset_snapshot(snapshot)
+            self._sync_live_pattern_from_dashboard()
+        self._live_log(
+            f"Slot '{slot.name}' strategy from {preset} @ {slot.timeframe}."
+        )
+        return result
 
     def _build_doji_ratio_config(self) -> doji_logic.DojiRatioConfig:
         defaults = doji_logic.DojiRatioConfig()
@@ -8024,6 +10721,9 @@ class BacktestDashboard(QMainWindow):
             except (ValueError, TypeError):
                 return default
 
+        from indicators.rolling_vwap import coerce_rolling_period
+        from indicators.rsi import coerce_rsi_level, coerce_rsi_period
+
         combine_raw = "ALL"
         w = self.field_widgets.get("indicators_combine_mode")
         if isinstance(w, QComboBox):
@@ -8040,6 +10740,18 @@ class BacktestDashboard(QMainWindow):
             vwap=VWAPConfig(
                 enabled="vwap" in self.added_indicator_ids,
                 apply_trade_filter=_chk("indicators_vwap_apply_filter", True),
+            ),
+            rolling_vwap=RollingVWAPConfig(
+                enabled="rolling_vwap" in self.added_indicator_ids,
+                period=coerce_rolling_period(_txt("indicators_rolling_vwap_period", 20)),
+                apply_trade_filter=_chk("indicators_rolling_vwap_apply_filter", True),
+            ),
+            rsi=RSIConfig(
+                enabled="rsi" in self.added_indicator_ids,
+                period=coerce_rsi_period(_txt("indicators_rsi_period", 14)),
+                buy_above=coerce_rsi_level(_txt("indicators_rsi_buy_above", 50.0), 50.0),
+                sell_below=coerce_rsi_level(_txt("indicators_rsi_sell_below", 60.0), 60.0),
+                apply_trade_filter=_chk("indicators_rsi_apply_filter", True),
             ),
         )
 
@@ -8093,7 +10805,7 @@ class BacktestDashboard(QMainWindow):
         pattern = self.pattern_combo.currentText()
         if pattern == "Doji":
             return self._build_doji_strategy_config()
-        if pattern == "Hammer with candles":
+        if hammer_context_logic.is_context_pattern_label(pattern):
             return self._build_hammer_context_strategy_config()
         return self._build_hammer_strategy_config()
 
@@ -8124,6 +10836,14 @@ class BacktestDashboard(QMainWindow):
             attr = CONTEXT_UI_ATTR_OVERRIDES.get(name, name)
             default_val = getattr(defaults, attr)
             kwargs[attr] = self._read_ui_field(name, default_val, ftype)
+
+        pattern = self.pattern_combo.currentText() if hasattr(self, "pattern_combo") else ""
+        if pattern == hammer_context_logic.PATTERN_LABEL_35:
+            kwargs["entry_pullback_pct"] = self._read_ui_field(
+                "entry_pullback_pct", 35.0, FIELD_TYPE_TEXT,
+            )
+        else:
+            kwargs["entry_pullback_pct"] = 0.0
 
         classic_fields = CLASSIC_ENTRY_EXIT_FIELDS + RISK_CONTROL_FIELDS
         for name, _, ftype, _ in classic_fields:
@@ -8554,6 +11274,7 @@ class BacktestDashboard(QMainWindow):
         if sort_key == "newest" and time_col:
             return view.sort(time_col, descending=True, nulls_last=True)
         if sort_key == "losses_first" and has_outcome:
+            import polars as pl
             ranked = view.with_columns(
                 pl.when(pl.col("outcome") == "LOSS").then(0)
                 .when(pl.col("outcome") == "WIN").then(1)
@@ -8565,6 +11286,7 @@ class BacktestDashboard(QMainWindow):
             ranked = ranked.sort(sort_cols, descending=descending, nulls_last=True)
             return ranked.drop("_sort_rank")
         if sort_key == "wins_first" and has_outcome:
+            import polars as pl
             ranked = view.with_columns(
                 pl.when(pl.col("outcome") == "WIN").then(0)
                 .when(pl.col("outcome") == "LOSS").then(1)
@@ -8608,8 +11330,10 @@ class BacktestDashboard(QMainWindow):
 
         view = df
         if model_filter and "exit_model" in df.columns:
+            import polars as pl
             view = view.filter(pl.col("exit_model") == model_filter)
         if outcome_filter in ("WIN", "LOSS") and "outcome" in view.columns:
+            import polars as pl
             view = view.filter(pl.col("outcome") == outcome_filter)
 
         view = self._apply_trade_ledger_sort(view, sort_key)
@@ -9317,6 +12041,7 @@ class BacktestDashboard(QMainWindow):
         examples = (
             "preset_example_hammer_green_buy_red_sell.json",
             "preset_example_hammer_with_candles.json",
+            "preset_example_hammer_with_candle_35.json",
         )
         for name in examples:
             src = os.path.join(template_dir, name)
@@ -9371,19 +12096,20 @@ class BacktestDashboard(QMainWindow):
                 "red_doji": getattr(cfg.red_direction, "value", "SELL"),
                 "note": "Doji uses doji_direction_mode — not hammer green/red tabs unless mode is CANDLE_COLOR.",
             }
-        if pattern == "Hammer with candles":
+        if hammer_context_logic.is_context_pattern_label(pattern):
             cfg = self._build_hammer_context_strategy_config()
             buy = cfg.buy_hammer_ratios
             sell = cfg.sell_hammer_ratios
             stack = self._build_indicator_stack()
             inds = stack.enabled_indicator_ids()
             return {
-                "pattern": "Hammer with candles",
+                "pattern": pattern,
                 "lookback_candles": cfg.lookback_candles,
                 "enable_buy": cfg.enable_buy,
                 "enable_sell": cfg.enable_sell,
                 "buy_require_wick": cfg.buy_require_wick,
                 "sell_require_wick": cfg.sell_require_wick,
+                "entry_pullback_pct": cfg.entry_pullback_pct,
                 "buy_body_pct": buy.body_pct,
                 "buy_dominant_wick_pct": buy.dominant_wick_pct,
                 "sell_body_pct": sell.body_pct,
@@ -9417,6 +12143,12 @@ class BacktestDashboard(QMainWindow):
             ),
             "vwap_filter": (
                 stack.vwap.apply_trade_filter if "vwap" in inds else None
+            ),
+            "rolling_vwap_filter": (
+                stack.rolling_vwap.apply_trade_filter if "rolling_vwap" in inds else None
+            ),
+            "rsi_filter": (
+                stack.rsi.apply_trade_filter if "rsi" in inds else None
             ),
             "plain_english": (
                 f"{logic.describe_hammer_direction_matrix(cfg)}. "
@@ -9478,6 +12210,18 @@ class BacktestDashboard(QMainWindow):
                     "enabled": "vwap" in self.added_indicator_ids,
                     "apply_trade_filter": fields.get("indicators_vwap_apply_filter", True),
                 },
+                "rolling_vwap": {
+                    "enabled": "rolling_vwap" in self.added_indicator_ids,
+                    "period": fields.get("indicators_rolling_vwap_period", "20"),
+                    "apply_trade_filter": fields.get("indicators_rolling_vwap_apply_filter", True),
+                },
+                "rsi": {
+                    "enabled": "rsi" in self.added_indicator_ids,
+                    "period": fields.get("indicators_rsi_period", "14"),
+                    "buy_above": fields.get("indicators_rsi_buy_above", "50"),
+                    "sell_below": fields.get("indicators_rsi_sell_below", "60"),
+                    "apply_trade_filter": fields.get("indicators_rsi_apply_filter", True),
+                },
             },
         }
 
@@ -9502,7 +12246,7 @@ class BacktestDashboard(QMainWindow):
 
     def _migrate_preset_fields_for_pattern(self, pattern: str, fields: dict) -> dict:
         """Fill Hammer-with-candles BUY/SELL fields from plain hammer fields when missing."""
-        if pattern != "Hammer with candles":
+        if not hammer_context_logic.is_context_pattern_label(pattern):
             return fields
         for side in ("buy", "sell"):
             for name in HAMMER_RATIO_FIELD_NAMES:
@@ -9782,6 +12526,17 @@ class TradeInspectDialog(QDialog):
                 )
             if getattr(stack.vwap, "enabled", False):
                 ind_bits.append("<span style='color:#1A73E8'>- -</span> VWAP")
+            if getattr(stack.rolling_vwap, "enabled", False):
+                ind_bits.append(
+                    f"<span style='color:#9334E6'>··</span> Rolling VWAP "
+                    f"({int(stack.rolling_vwap.period)} bars)"
+                )
+            if getattr(stack.rsi, "enabled", False):
+                ind_bits.append(
+                    f"<span style='color:#E37400'>RSI</span> "
+                    f"({int(stack.rsi.period)}; BUY&gt;{stack.rsi.buy_above:g} "
+                    f"SELL&lt;{stack.rsi.sell_below:g})"
+                )
         legend = QLabel(
             "<span style='color:#188038'>■</span> BUY / green &nbsp; "
             "<span style='color:#D93025'>■</span> SELL / red &nbsp; "
@@ -9792,7 +12547,7 @@ class TradeInspectDialog(QDialog):
             "<span style='color:#D93025'>— SL</span> &nbsp; "
             "<span style='color:#5F6368'>× exit</span>"
             + ((" &nbsp; · &nbsp; " + " &nbsp; ".join(ind_bits)) if ind_bits else
-               " &nbsp; · &nbsp; <i>No indicators — add SuperTrend/VWAP on Indicators tab, then Inspect again</i>")
+               " &nbsp; · &nbsp; <i>No indicators — add SuperTrend / VWAP / Rolling VWAP / RSI on Indicators tab, then Inspect again</i>")
         )
         legend.setTextFormat(Qt.RichText)
         legend.setObjectName("sectionHint")
@@ -9907,7 +12662,7 @@ class TradeInspectDialog(QDialog):
         self._coord_label.setObjectName("sectionHint")
         layout.addWidget(self._coord_label)
 
-        fig = Figure(figsize=(12.2, 6.4), dpi=110)
+        fig = Figure(figsize=(12.2, 7.6), dpi=110)
         canvas = FigureCanvasQTAgg(fig)
         canvas.setFocusPolicy(Qt.StrongFocus)
         self._fig = fig
@@ -10017,6 +12772,15 @@ class TradeInspectDialog(QDialog):
             if getattr(stack.vwap, "enabled", False):
                 filt = "filter ON" if stack.vwap.apply_trade_filter else "filter OFF"
                 parts.append(f"VWAP ({filt})")
+            if getattr(stack.rolling_vwap, "enabled", False):
+                filt = "filter ON" if stack.rolling_vwap.apply_trade_filter else "filter OFF"
+                parts.append(f"Rolling VWAP {int(stack.rolling_vwap.period)} ({filt})")
+            if getattr(stack.rsi, "enabled", False):
+                filt = "filter ON" if stack.rsi.apply_trade_filter else "filter OFF"
+                parts.append(
+                    f"RSI {int(stack.rsi.period)} BUY&gt;{stack.rsi.buy_above:g} "
+                    f"SELL&lt;{stack.rsi.sell_below:g} ({filt})"
+                )
             if parts:
                 ind_note = " · indicators: " + ", ".join(parts)
 
@@ -10037,6 +12801,8 @@ class TradeInspectDialog(QDialog):
         from matplotlib.patches import Rectangle
         from indicators.supertrend import compute_supertrend
         from indicators.vwap import compute_vwap
+        from indicators.rolling_vwap import coerce_rolling_period, compute_rolling_vwap
+        from indicators.rsi import coerce_rsi_period, compute_rsi
 
         ax = fig.add_subplot(111)
         self._ax = ax
@@ -10088,8 +12854,10 @@ class TradeInspectDialog(QDialog):
         stack = self._indicator_stack
         show_st = bool(stack and getattr(stack.supertrend, "enabled", False))
         show_vwap = bool(stack and getattr(stack.vwap, "enabled", False))
-        st_win = dir_win = vwap_win = None
-        if show_st or show_vwap:
+        show_rolling_vwap = bool(stack and getattr(stack.rolling_vwap, "enabled", False))
+        show_rsi = bool(stack and getattr(stack.rsi, "enabled", False))
+        st_win = dir_win = vwap_win = rolling_win = rsi_win = None
+        if show_st or show_vwap or show_rolling_vwap or show_rsi:
             high_all = df["high"].to_numpy()
             low_all = df["low"].to_numpy()
             close_all = df["close"].to_numpy()
@@ -10105,6 +12873,17 @@ class TradeInspectDialog(QDialog):
             if show_vwap:
                 vwap_all = compute_vwap(high_all, low_all, close_all, vol_all, timestamps=times)
                 vwap_win = vwap_all[start:end]
+            if show_rolling_vwap:
+                rolling_all = compute_rolling_vwap(
+                    high_all, low_all, close_all, vol_all,
+                    period=coerce_rolling_period(stack.rolling_vwap.period),
+                )
+                rolling_win = rolling_all[start:end]
+            if show_rsi:
+                rsi_all = compute_rsi(
+                    close_all, period=coerce_rsi_period(stack.rsi.period),
+                )
+                rsi_win = rsi_all[start:end]
 
         w_times = window["datetime"].to_list()
         opens = window["open"].to_list()
@@ -10115,6 +12894,15 @@ class TradeInspectDialog(QDialog):
 
         local_signal = signal_idx - start
         local_entry = entry_idx - start
+
+        ax_rsi = None
+        if show_rsi:
+            fig.clear()
+            gs = fig.add_gridspec(2, 1, height_ratios=[3.2, 1.15], hspace=0.07)
+            ax = fig.add_subplot(gs[0])
+            ax_rsi = fig.add_subplot(gs[1], sharex=ax)
+            self._ax = ax
+            fig.set_size_inches(12.2, 7.8, forward=True)
 
         for i in x:
             o, h, l, c = opens[i], highs[i], lows[i], closes[i]
@@ -10153,12 +12941,24 @@ class TradeInspectDialog(QDialog):
                 ax.plot(x, ys, color="#1A73E8", linewidth=2.0, linestyle="--", zorder=6, label="VWAP")
                 vwap_plotted = True
 
+        rolling_plotted = False
+        if rolling_win is not None and len(rolling_win) == len(x):
+            ys = [float(v) if v == v else np.nan for v in rolling_win]
+            if any(v == v for v in ys):
+                ax.plot(
+                    x, ys, color="#9334E6", linewidth=2.0, linestyle=":",
+                    zorder=6, label="Rolling VWAP",
+                )
+                rolling_plotted = True
+
         # Highlight signal (pattern) bar and entry bar
         y_vals = list(lows) + list(highs)
         if st_win is not None:
             y_vals.extend([float(v) for v in st_win if v == v])
         if vwap_win is not None:
             y_vals.extend([float(v) for v in vwap_win if v == v])
+        if rolling_win is not None:
+            y_vals.extend([float(v) for v in rolling_win if v == v])
         y0, y1 = min(y_vals), max(y_vals)
         pad = (y1 - y0) * 0.04 if y1 > y0 else 1.0
         if 0 <= local_signal < len(x):
@@ -10195,28 +12995,87 @@ class TradeInspectDialog(QDialog):
 
         # Tick labels: sparse timestamps
         step = max(1, len(x) // 8)
-        ax.set_xticks(x[::step])
-        ax.set_xticklabels(
-            [ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts) for ts in w_times[::step]],
-            rotation=25, ha="right", fontsize=8,
-        )
+        tick_x = x[::step]
+        tick_lbl = [
+            ts.strftime("%m-%d %H:%M") if hasattr(ts, "strftime") else str(ts)
+            for ts in w_times[::step]
+        ]
         ax.set_xlim(-1, len(x))
         ax.set_ylim(y0 - pad, y1 + pad * 1.8)
         ax.set_ylabel("Price")
         ax.grid(True, alpha=0.25)
         ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+
+        rsi_plotted = False
+        if ax_rsi is not None and rsi_win is not None and len(rsi_win) == len(x):
+            rsi_ys = [float(v) if v == v else np.nan for v in rsi_win]
+            period = coerce_rsi_period(stack.rsi.period)
+            buy_lv = float(stack.rsi.buy_above)
+            sell_lv = float(stack.rsi.sell_below)
+            ax_rsi.plot(x, rsi_ys, color="#E37400", linewidth=1.8, zorder=4, label=f"RSI {period}")
+            ax_rsi.axhline(
+                buy_lv, color="#188038", linestyle="--", linewidth=1.1, zorder=3,
+                label=f"BUY if > {buy_lv:g}",
+            )
+            ax_rsi.axhline(
+                sell_lv, color="#D93025", linestyle="--", linewidth=1.1, zorder=3,
+                label=f"SELL if < {sell_lv:g}",
+            )
+            ax_rsi.axhline(50.0, color="#9AA0A6", linestyle=":", linewidth=0.8, zorder=2)
+            if 0 <= local_signal < len(x):
+                ax_rsi.axvspan(
+                    local_signal - 0.45, local_signal + 0.45,
+                    color="#FFF2A8", alpha=0.55, zorder=1,
+                )
+                rv = rsi_ys[local_signal]
+                if rv == rv:
+                    ax_rsi.scatter(
+                        [local_signal], [rv], color="#E37400", s=36, zorder=6,
+                    )
+                    ax_rsi.annotate(
+                        f"{rv:.1f}",
+                        (local_signal, rv),
+                        textcoords="offset points", xytext=(6, 6),
+                        fontsize=8, color="#B06000", fontweight="bold",
+                    )
+                    rsi_plotted = True
+            if 0 <= local_entry < len(x):
+                ax_rsi.axvspan(
+                    local_entry - 0.45, local_entry + 0.45,
+                    color="#D2E3FC", alpha=0.45, zorder=1,
+                )
+            ax_rsi.set_ylim(-2, 102)
+            ax_rsi.set_ylabel("RSI")
+            ax_rsi.set_xlim(-1, len(x))
+            ax_rsi.set_yticks([0, 30, 50, 70, 100])
+            ax_rsi.grid(True, alpha=0.25)
+            ax_rsi.legend(loc="upper left", fontsize=7, framealpha=0.9, ncol=3)
+            ax.tick_params(labelbottom=False)
+            ax_rsi.set_xticks(tick_x)
+            ax_rsi.set_xticklabels(tick_lbl, rotation=25, ha="right", fontsize=8)
+        else:
+            ax.set_xticks(tick_x)
+            ax.set_xticklabels(tick_lbl, rotation=25, ha="right", fontsize=8)
+
         direction = trade.get("direction") or ""
         ind_title = []
         if show_st:
             ind_title.append("ST" + ("✓" if st_plotted else "?"))
         if show_vwap:
             ind_title.append("VWAP" + ("✓" if vwap_plotted else "?"))
+        if show_rolling_vwap:
+            ind_title.append("RVWAP" + ("✓" if rolling_plotted else "?"))
+        if show_rsi:
+            ind_title.append("RSI" + ("✓" if rsi_plotted else "?"))
         ind_sfx = (" + " + "/".join(ind_title)) if ind_title else ""
         ax.set_title(
             f"{cfg.symbol} {tf_folder} — {direction} — prior + signal + exit{ind_sfx}",
             fontsize=11,
         )
-        fig.tight_layout()
+        if ax_rsi is None:
+            fig.tight_layout()
+        else:
+            fig.subplots_adjust(left=0.07, right=0.985, top=0.93, bottom=0.11, hspace=0.08)
 
     def _draw_pen_color(self) -> str:
         return getattr(self, "_draw_color", "#F9AB00") or "#F9AB00"

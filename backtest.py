@@ -1000,7 +1000,7 @@ def simulate_timeframe_outcomes(
         all_signals = doji_logic.run_strategy(
             candles, timeframe=logic_label, config=config.strategy_config,
         )
-    elif config.pattern_type in ("hammer_with_candles", "hammer_context"):
+    elif hammer_context_logic.is_context_pattern_type(config.pattern_type):
         all_signals = hammer_context_logic.run_strategy(
             candles, timeframe=logic_label, config=config.strategy_config,
         )
@@ -1060,7 +1060,48 @@ def simulate_timeframe_outcomes(
             )
             continue
 
-        start = entry_idx + 1
+        fill_idx = entry_idx
+        if getattr(sig, "await_limit_fill", False):
+            found = hammer_context_logic.find_limit_fill_index(
+                sig.direction,
+                float(sig.entry_price),
+                float(sig.stop_loss),
+                all_high,
+                all_low,
+                all_open,
+                entry_idx,
+                config.max_forward_candles,
+            )
+            if found is None:
+                # Limit never filled — treat as ignored for this timeframe pass
+                continue
+            fill_idx = found
+            fill_open = float(all_open[fill_idx])
+            limit_px = float(sig.entry_price)
+            sl_px = float(sig.stop_loss)
+            # Gap into the limit: fill at open when it is a better price still above SL.
+            # Keep target fixed (RR from signal entry) — pullback must not move TP.
+            if sig.direction == logic.TradeDirection.BUY:
+                if fill_open <= limit_px and fill_open > sl_px:
+                    sig.entry_price = fill_open
+                sig.risk = float(sig.entry_price) - sl_px
+            else:
+                if fill_open >= limit_px and fill_open < sl_px:
+                    sig.entry_price = fill_open
+                sig.risk = sl_px - float(sig.entry_price)
+            # Align overlap / event timing to the actual fill bar
+            try:
+                sig.entry_candle = logic.Candle(
+                    all_timestamps[fill_idx],
+                    fill_open,
+                    float(all_high[fill_idx]),
+                    float(all_low[fill_idx]),
+                    float(all_close[fill_idx]),
+                )
+            except Exception:
+                pass
+
+        start = fill_idx + 1
         end = min(start + config.max_forward_candles, len(all_high))
 
         raw_outcomes = resolve_all_exit_models_for_trade(
@@ -1614,7 +1655,7 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
         else str(market_setting)
     )
     print(f"Market data: {market_label}")
-    if config.pattern_type in ("hammer_with_candles", "hammer_context"):
+    if hammer_context_logic.is_context_pattern_type(config.pattern_type):
         try:
             print(hammer_context_logic.describe_hammer_context_rules(config.strategy_config))
             print(hammer_context_logic.describe_hammer_context_entry_exit(config.strategy_config))

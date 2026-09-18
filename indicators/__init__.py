@@ -7,7 +7,13 @@ Add new indicators by:
   3. Adding filter rules in filter.py (or indicator-specific filter fn)
 """
 
-from indicators.config import IndicatorStackConfig, SuperTrendConfig, VWAPConfig
+from indicators.config import (
+    IndicatorStackConfig,
+    RollingVWAPConfig,
+    RSIConfig,
+    SuperTrendConfig,
+    VWAPConfig,
+)
 from indicators.filter import apply_indicator_filters
 from indicators.registry import INDICATOR_REGISTRY, list_indicator_ids
 
@@ -15,6 +21,8 @@ __all__ = [
     "IndicatorStackConfig",
     "SuperTrendConfig",
     "VWAPConfig",
+    "RollingVWAPConfig",
+    "RSIConfig",
     "apply_indicator_filters",
     "INDICATOR_REGISTRY",
     "list_indicator_ids",

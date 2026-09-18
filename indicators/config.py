@@ -27,10 +27,28 @@ class VWAPConfig:
 
 
 @dataclass
+class RollingVWAPConfig:
+    enabled: bool = False
+    period: int = 20
+    apply_trade_filter: bool = True
+
+
+@dataclass
+class RSIConfig:
+    enabled: bool = False
+    period: int = 14
+    buy_above: float = 50.0
+    sell_below: float = 60.0
+    apply_trade_filter: bool = True
+
+
+@dataclass
 class IndicatorStackConfig:
     combine_mode: IndicatorCombineMode = IndicatorCombineMode.ALL
     supertrend: SuperTrendConfig = field(default_factory=SuperTrendConfig)
     vwap: VWAPConfig = field(default_factory=VWAPConfig)
+    rolling_vwap: RollingVWAPConfig = field(default_factory=RollingVWAPConfig)
+    rsi: RSIConfig = field(default_factory=RSIConfig)
 
     def enabled_indicator_ids(self) -> List[str]:
         ids = []
@@ -38,4 +56,8 @@ class IndicatorStackConfig:
             ids.append("supertrend")
         if self.vwap.enabled:
             ids.append("vwap")
+        if self.rolling_vwap.enabled:
+            ids.append("rolling_vwap")
+        if self.rsi.enabled:
+            ids.append("rsi")
         return ids

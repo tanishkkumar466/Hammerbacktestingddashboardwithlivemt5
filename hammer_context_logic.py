@@ -29,6 +29,34 @@ from typing import Dict, List, Optional, Tuple
 
 import logic
 
+# Display names in the Pattern dropdown / presets
+PATTERN_LABEL = "Hammer with candles"
+PATTERN_LABEL_35 = "Hammer with candle 35%"
+
+# Internal pattern_type strings (backtest / live / run DB)
+PATTERN_TYPE = "hammer_with_candles"
+PATTERN_TYPE_35 = "hammer_with_candles_35"
+
+# Both labels share this engine today; 35% rules will diverge when specified.
+CONTEXT_PATTERN_LABELS = frozenset({PATTERN_LABEL, PATTERN_LABEL_35})
+CONTEXT_PATTERN_TYPES = frozenset({PATTERN_TYPE, "hammer_context", PATTERN_TYPE_35})
+
+
+def is_context_pattern_label(pattern: str) -> bool:
+    return str(pattern or "") in CONTEXT_PATTERN_LABELS
+
+
+def is_context_pattern_type(pattern_type: str) -> bool:
+    return str(pattern_type or "") in CONTEXT_PATTERN_TYPES
+
+
+def pattern_type_for_label(pattern: str) -> str:
+    if pattern == PATTERN_LABEL_35:
+        return PATTERN_TYPE_35
+    if is_context_pattern_label(pattern):
+        return PATTERN_TYPE
+    return PATTERN_TYPE
+
 
 @dataclass
 class HammerContextConfig:
@@ -41,6 +69,9 @@ class HammerContextConfig:
     # direction uses the previous candle color (red→BUY, green→SELL).
     buy_require_wick: bool = True
     sell_require_wick: bool = True
+    # Wait for price to move this % of |entry−SL| toward the stop before entering.
+    # BUY: entry drops; SELL: entry rises. 0 = enter at the normal entry rule price.
+    entry_pullback_pct: float = 0.0
 
     # BUY — classic green hammer
     entry_rule: logic.EntryRule = logic.EntryRule.NEXT_CANDLE_OPEN
@@ -72,6 +103,14 @@ class HammerContextConfig:
             self.lookback_candles = max(0, int(self.lookback_candles))
         except (TypeError, ValueError):
             self.lookback_candles = 5
+        try:
+            self.entry_pullback_pct = float(self.entry_pullback_pct or 0.0)
+        except (TypeError, ValueError):
+            self.entry_pullback_pct = 0.0
+        if self.entry_pullback_pct < 0:
+            self.entry_pullback_pct = 0.0
+        if self.entry_pullback_pct > 100:
+            self.entry_pullback_pct = 100.0
         self.entry_rule = logic.coerce_entry_rule(self.entry_rule)
         self.inverted_entry_rule = logic.coerce_entry_rule(self.inverted_entry_rule)
         self.sl_mode = logic.coerce_stop_loss_mode(self.sl_mode)
@@ -240,12 +279,94 @@ def _sl_mode_label(mode: logic.StopLossMode, fixed: float, buf: logic.BufferMode
 def describe_hammer_context_entry_exit(config: HammerContextConfig) -> str:
     c_rule = logic.coerce_entry_rule(config.entry_rule)
     s_rule = logic.coerce_entry_rule(config.inverted_entry_rule)
+    pull = float(getattr(config, "entry_pullback_pct", 0.0) or 0.0)
+    pull_note = ""
+    if pull > 0:
+        pull_note = (
+            f" | Pullback entry {pull:g}% of SL distance toward stop "
+            "(BUY waits for a drop; SELL waits for a rise); "
+            "TP still from signal entry × RR (pullback does not move target)"
+        )
     return (
         f"BUY entry={c_rule.value} offset=${config.entry_offset:g} "
         f"SL={_sl_mode_label(config.sl_mode, config.sl_fixed_distance, config.buffer_mode)} | "
         f"SELL entry={s_rule.value} offset=${config.inverted_entry_offset:g} "
         f"SL={_sl_mode_label(config.inverted_sl_mode, config.inverted_sl_fixed_distance, config.inverted_buffer_mode)}"
+        f"{pull_note}"
     )
+
+
+def pullback_entry_price(
+    direction: logic.TradeDirection,
+    base_entry: float,
+    stop_loss: float,
+    pullback_pct: float,
+) -> Tuple[float, float]:
+    """
+    Move entry toward SL by pullback_pct of |base_entry − stop_loss|.
+
+    BUY example: entry 4010, SL 4000, 35% → wait at 4006.5 (drop 3.5).
+    SELL example: entry 4000, SL 4010, 35% → wait at 4003.5 (rise 3.5).
+
+    Returns (adjusted_entry, raw_sl_distance). raw_sl_distance is |base−SL| before pullback.
+    """
+    try:
+        pct = float(pullback_pct or 0.0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    if pct <= 0:
+        dist = abs(float(base_entry) - float(stop_loss))
+        return float(base_entry), dist
+    pct = min(100.0, pct)
+    base = float(base_entry)
+    sl = float(stop_loss)
+    dist = abs(base - sl)
+    shift = dist * (pct / 100.0)
+    if direction == logic.TradeDirection.BUY:
+        # Toward lower SL
+        return base - shift, dist
+    # SELL — toward higher SL
+    return base + shift, dist
+
+
+def find_limit_fill_index(
+    direction: logic.TradeDirection,
+    limit_price: float,
+    stop_loss: float,
+    highs,
+    lows,
+    opens,
+    start_idx: int,
+    max_bars: int,
+) -> Optional[int]:
+    """
+    First bar at/after start_idx where a limit at limit_price would fill.
+    Returns None if the path is abandoned (never touched before max_bars).
+    Same-bar SL after fill is left to the exit resolver.
+    """
+    n = len(highs)
+    end = min(start_idx + max(1, int(max_bars)), n)
+    is_buy = direction == logic.TradeDirection.BUY
+    for i in range(start_idx, end):
+        o = float(opens[i])
+        h = float(highs[i])
+        l = float(lows[i])
+        if is_buy:
+            # Gap through stop without trading the limit zone
+            if o <= stop_loss and o < limit_price:
+                return None
+            if o <= limit_price:
+                return i
+            if l <= limit_price:
+                return i
+        else:
+            if o >= stop_loss and o > limit_price:
+                return None
+            if o >= limit_price:
+                return i
+            if h >= limit_price:
+                return i
+    return None
 
 
 def prior_closes_ok_for_buy(
@@ -368,34 +489,50 @@ def build_context_signal(
     wick_required = config.buy_require_wick if is_buy else config.sell_require_wick
     stored_variant = variant.value if wick_required else "BODY_ONLY"
 
-    entry_price = logic.calculate_entry_price(
+    base_entry = logic.calculate_entry_price(
         signal_candle, next_candle, trade_cfg, variant,
     )
     stop_loss = logic.calculate_stop_loss(
-        signal_candle, direction, trade_cfg, variant, entry_price=entry_price,
+        signal_candle, direction, trade_cfg, variant, entry_price=base_entry,
     )
 
+    # RR / target always use the signal entry vs SL (pullback must not move TP).
+    # Example: base 4010, SL 4000, RR 2 → target 4030 even if fill is 4006.5.
     if direction == logic.TradeDirection.BUY:
-        risk = entry_price - stop_loss
+        signal_risk = base_entry - stop_loss
     else:
-        risk = stop_loss - entry_price
+        signal_risk = stop_loss - base_entry
+
+    pullback_pct = float(getattr(config, "entry_pullback_pct", 0.0) or 0.0)
+    await_limit = False
+    entry_price = base_entry
+    if pullback_pct > 0:
+        entry_price, _raw_dist = pullback_entry_price(
+            direction, base_entry, stop_loss, pullback_pct,
+        )
+        await_limit = True
+
+    if direction == logic.TradeDirection.BUY:
+        fill_risk = entry_price - stop_loss
+    else:
+        fill_risk = stop_loss - entry_price
 
     ignored = False
     ignore_reason = None
-    if config.reject_zero_or_negative_risk and risk <= 0:
+    if config.reject_zero_or_negative_risk and signal_risk <= 0:
         ignored = True
         ignore_reason = "Risk is zero or negative — check entry vs SL."
-    elif config.enable_risk_limit and risk > tf_setting.max_sl_usd:
+    elif config.enable_risk_limit and signal_risk > tf_setting.max_sl_usd:
         ignored = True
         ignore_reason = (
-            f"Risk (${risk:.2f}) exceeds max SL (${tf_setting.max_sl_usd}) for '{timeframe}'."
+            f"Risk (${signal_risk:.2f}) exceeds max SL (${tf_setting.max_sl_usd}) for '{timeframe}'."
         )
 
-    reward = risk * tf_setting.rr_multiple
+    reward = signal_risk * tf_setting.rr_multiple
     if direction == logic.TradeDirection.BUY:
-        target = entry_price + reward
+        target = base_entry + reward
     else:
-        target = entry_price - reward
+        target = base_entry - reward
 
     return logic.TradeSignal(
         direction=direction,
@@ -403,13 +540,14 @@ def build_context_signal(
         entry_candle=next_candle,
         entry_price=entry_price,
         stop_loss=stop_loss,
-        risk=risk,
+        risk=fill_risk if fill_risk > 0 else signal_risk,
         rr_multiple=tf_setting.rr_multiple,
         target=target,
         timeframe=timeframe,
         ignored=ignored,
         ignore_reason=ignore_reason,
         pattern_variant=stored_variant,
+        await_limit_fill=await_limit,
     )
 
 

@@ -2,7 +2,8 @@
 Apply indicator-based filters to logic.py TradeSignal objects after pattern detection.
 
 Dashboard copy of these rules: indicators/registry.py → filter_rules on each entry.
-Edit behavior here (_supertrend_passes, _vwap_passes); keep registry text in sync.
+Edit behavior here (_supertrend_passes, _vwap_passes, _rolling_vwap_passes, _rsi_passes);
+keep registry text in sync.
 """
 
 from datetime import datetime
@@ -13,6 +14,8 @@ import polars as pl
 
 import logic
 from indicators.config import IndicatorCombineMode, IndicatorStackConfig
+from indicators.rolling_vwap import coerce_rolling_period, compute_rolling_vwap
+from indicators.rsi import coerce_rsi_level, coerce_rsi_period, compute_rsi
 from indicators.supertrend import compute_supertrend
 from indicators.vwap import compute_vwap
 
@@ -66,7 +69,10 @@ def _build_series(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
 def _compute_indicator_arrays(
     df: pl.DataFrame,
     stack: IndicatorStackConfig,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], List, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[
+    np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], List,
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+]:
     high, low, close, vol, timestamps = _build_series(df)
     n = len(close)
     if stack.supertrend.enabled:
@@ -82,7 +88,18 @@ def _compute_indicator_arrays(
         vwap = compute_vwap(high, low, close, vol, timestamps=timestamps)
     else:
         vwap = np.full(n, np.nan)
-    return high, low, close, vol, timestamps, st_line, st_dir, vwap
+    if stack.rolling_vwap.enabled:
+        rolling_vwap = compute_rolling_vwap(
+            high, low, close, vol,
+            period=coerce_rolling_period(stack.rolling_vwap.period),
+        )
+    else:
+        rolling_vwap = np.full(n, np.nan)
+    if stack.rsi.enabled:
+        rsi = compute_rsi(close, period=coerce_rsi_period(stack.rsi.period))
+    else:
+        rsi = np.full(n, np.nan)
+    return high, low, close, vol, timestamps, st_line, st_dir, vwap, rolling_vwap, rsi
 
 
 def _supertrend_passes(
@@ -137,19 +154,71 @@ def _supertrend_passes(
     return True, ""
 
 
-def _vwap_passes(direction: logic.TradeDirection, close: float, vwap: float) -> Tuple[bool, str]:
+def _vwap_like_passes(
+    direction: logic.TradeDirection,
+    close: float,
+    line: float,
+    label: str,
+) -> Tuple[bool, str]:
     """
     Direction-based rule, applied to EVERY trade:
-      BUY  -> close must be above VWAP.
-      SELL -> close must be below VWAP.
+      BUY  -> close must be above the line.
+      SELL -> close must be below the line.
     """
-    if np.isnan(vwap):
-        return False, "VWAP filter: VWAP not available on this bar."
+    if np.isnan(line):
+        return False, f"{label} filter: value not available on this bar (warmup or missing data)."
 
-    if direction == logic.TradeDirection.BUY and close <= vwap:
-        return False, f"VWAP filter: BUY requires close above VWAP (VWAP={vwap:.2f}, close={close:.2f})."
-    if direction == logic.TradeDirection.SELL and close >= vwap:
-        return False, f"VWAP filter: SELL requires close below VWAP (VWAP={vwap:.2f}, close={close:.2f})."
+    if direction == logic.TradeDirection.BUY and close <= line:
+        return False, (
+            f"{label} filter: BUY requires close above {label} "
+            f"({label}={line:.2f}, close={close:.2f})."
+        )
+    if direction == logic.TradeDirection.SELL and close >= line:
+        return False, (
+            f"{label} filter: SELL requires close below {label} "
+            f"({label}={line:.2f}, close={close:.2f})."
+        )
+    return True, ""
+
+
+def _vwap_passes(direction: logic.TradeDirection, close: float, vwap: float) -> Tuple[bool, str]:
+    return _vwap_like_passes(direction, close, vwap, "VWAP")
+
+
+def _rolling_vwap_passes(
+    direction: logic.TradeDirection, close: float, rolling_vwap: float,
+) -> Tuple[bool, str]:
+    return _vwap_like_passes(direction, close, rolling_vwap, "Rolling VWAP")
+
+
+def _rsi_passes(
+    direction: logic.TradeDirection,
+    rsi: float,
+    buy_above: float,
+    sell_below: float,
+) -> Tuple[bool, str]:
+    """
+    BUY  -> RSI must be strictly above buy_above.
+    SELL -> RSI must be strictly below sell_below.
+    Levels are independent (e.g. buy > 50 and sell < 60).
+    """
+    if np.isnan(rsi):
+        return False, (
+            "RSI filter: not enough history to compute RSI on this bar "
+            "(increase live history bars or backtest data length)."
+        )
+    buy_lv = coerce_rsi_level(buy_above, 50.0)
+    sell_lv = coerce_rsi_level(sell_below, 60.0)
+    if direction == logic.TradeDirection.BUY and rsi <= buy_lv:
+        return False, (
+            f"RSI filter: BUY requires RSI above {buy_lv:g} "
+            f"(RSI={rsi:.2f})."
+        )
+    if direction == logic.TradeDirection.SELL and rsi >= sell_lv:
+        return False, (
+            f"RSI filter: SELL requires RSI below {sell_lv:g} "
+            f"(RSI={rsi:.2f})."
+        )
     return True, ""
 
 
@@ -160,6 +229,8 @@ def _indicator_checks_at_index(
     st_line: np.ndarray,
     st_dir: np.ndarray,
     vwap: np.ndarray,
+    rolling_vwap: np.ndarray,
+    rsi: np.ndarray,
     stack: IndicatorStackConfig,
 ) -> List[Tuple[bool, str]]:
     checks: List[Tuple[bool, str]] = []
@@ -176,6 +247,19 @@ def _indicator_checks_at_index(
 
     if stack.vwap.enabled and stack.vwap.apply_trade_filter:
         ok, reason = _vwap_passes(direction, c, float(vwap[idx]))
+        checks.append((ok, reason))
+
+    if stack.rolling_vwap.enabled and stack.rolling_vwap.apply_trade_filter:
+        ok, reason = _rolling_vwap_passes(direction, c, float(rolling_vwap[idx]))
+        checks.append((ok, reason))
+
+    if stack.rsi.enabled and stack.rsi.apply_trade_filter:
+        ok, reason = _rsi_passes(
+            direction,
+            float(rsi[idx]),
+            stack.rsi.buy_above,
+            stack.rsi.sell_below,
+        )
         checks.append((ok, reason))
 
     return checks
@@ -207,9 +291,9 @@ def verify_signal_passes_indicators_at_bar(
     if not stack.enabled_indicator_ids():
         return True, ""
 
-    _, _, close, _, _, st_line, st_dir, vwap = _compute_indicator_arrays(df, stack)
+    _, _, close, _, _, st_line, st_dir, vwap, rolling_vwap, rsi = _compute_indicator_arrays(df, stack)
     checks = _indicator_checks_at_index(
-        direction, bar_index, close, st_line, st_dir, vwap, stack,
+        direction, bar_index, close, st_line, st_dir, vwap, rolling_vwap, rsi, stack,
     )
     ok, reason = _combine_checks(stack, checks)
     return ok, reason
@@ -229,6 +313,7 @@ def _mark_ignored(sig: logic.TradeSignal, reason: str) -> logic.TradeSignal:
         ignored=True,
         ignore_reason=reason,
         pattern_variant=getattr(sig, "pattern_variant", None),
+        await_limit_fill=bool(getattr(sig, "await_limit_fill", False)),
     )
 
 
@@ -241,7 +326,9 @@ def apply_indicator_filters(
     if not stack.enabled_indicator_ids():
         return signals
 
-    _, _, close, _, timestamps, st_line, st_dir, vwap = _compute_indicator_arrays(df, stack)
+    _, _, close, _, timestamps, st_line, st_dir, vwap, rolling_vwap, rsi = _compute_indicator_arrays(
+        df, stack,
+    )
     ts_index = _build_timestamp_index(timestamps)
 
     out: List[logic.TradeSignal] = []
@@ -260,7 +347,7 @@ def apply_indicator_filters(
             continue
 
         checks = _indicator_checks_at_index(
-            sig.direction, idx, close, st_line, st_dir, vwap, stack,
+            sig.direction, idx, close, st_line, st_dir, vwap, rolling_vwap, rsi, stack,
         )
         if not checks:
             out.append(sig)

@@ -109,12 +109,15 @@ def _run_dashboard() -> None:
     app.processEvents()
     boot_log("main: splash shown")
 
+    # Keep matplotlib off the GUI path until plots are generated
+    os.environ.setdefault("MPLBACKEND", "Agg")
+
     if getattr(sys, "frozen", False):
         # polars must be the LTS CPU wheel (see requirements.txt). Default polars
         # dies here with Windows 0xC000001D illegal instruction on non-AVX CPUs.
         splash.setText("Loading data engine (polars)…")
         app.processEvents()
-        for mod in ("numpy", "polars", "pyarrow", "matplotlib", "PIL"):
+        for mod in ("numpy", "polars", "pyarrow"):
             try:
                 boot_log(f"main: import {mod} ...")
                 app.processEvents()
@@ -131,6 +134,9 @@ def _run_dashboard() -> None:
         boot_log("main: polars import path finished")
         splash.setText("Loading dashboard…")
         app.processEvents()
+    else:
+        splash.setText("Loading dashboard…")
+        app.processEvents()
 
     boot_log("main: import dashboard ...")
     app.processEvents()
@@ -142,18 +148,25 @@ def _run_dashboard() -> None:
 
 
 def _report_frozen_crash(exc: BaseException) -> None:
-    """Write hammer_crash.log and show a Windows message box when the exe fails to start."""
+    """Write logs/crash.log and show a Windows message box when the exe fails to start."""
     if not getattr(sys, "frozen", False):
         raise exc
-    import traceback
-
-    log_path = os.path.join(_app_dir(), "hammer_crash.log")
     try:
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"Hammer failed to start\n\n")
-            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
-    except OSError:
-        log_path = "(could not write log)"
+        from hammer_boot import crash_log_path, write_crash
+
+        write_crash(exc)
+        log_path = crash_log_path()
+    except Exception:
+        import traceback
+
+        log_path = os.path.join(_app_dir(), "logs", "crash.log")
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("Hammer failed to start\n\n")
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+        except OSError:
+            log_path = "(could not write log)"
 
     if os.name == "nt":
         try:
@@ -229,6 +242,8 @@ def main() -> int:
 
 if __name__ == "__main__":
     try:
+        import multiprocessing as mp
+        mp.freeze_support()
         raise SystemExit(main())
     except Exception as _exc:
         _report_frozen_crash(_exc)

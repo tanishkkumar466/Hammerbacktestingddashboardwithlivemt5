@@ -772,6 +772,8 @@ class TradeSignal:
     ignored: bool = False
     ignore_reason: Optional[str] = None
     pattern_variant: Optional[str] = None  # CLASSIC / INVERTED for hammer (+ indicators)
+    # True when entry_price is a limit toward SL (e.g. hammer-with-candle 35% pullback)
+    await_limit_fill: bool = False
 
 
 # ============================================================================

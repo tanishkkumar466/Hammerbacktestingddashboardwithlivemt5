@@ -1,23 +1,35 @@
 """
-Append-only live trading journal under output/live/ (next to the app / exe).
+Append-only live trading journals under logs/live/ (next to the app / exe).
 
-  live_session.log  — same lines as the Live Activity log (+ console)
-  live_trades.csv   — signals, dry-run marks, and MT5 order outcomes
+Layout (delete the whole logs/ folder anytime to clear clutter — config stays elsewhere):
 
-Paths are created on first write. LiveRunConfig.journal_dir should match the
-dashboard session log folder (live_journal_dir(output_root)).
+  logs/
+    boot.log / crash.log / fault.log     — app start + crashes (hammer_boot)
+    live/
+      app_live.log                       — every Live UI line
+      accounts/
+        <name>_<id>/
+          account.log                    — that account’s activity
+          slots/
+            <slot>_<tf>_<id>/
+              live_session.log
+              live_trades.csv
+
+Paths are created on first write. LiveRunConfig.journal_dir should point at a
+slot folder from slot_journal_dir(...).
 """
-
 from __future__ import annotations
 
 import csv
 import os
+import re
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-LIVE_SUBDIR = "live"
 SESSION_LOG_NAME = "live_session.log"
 TRADES_CSV_NAME = "live_trades.csv"
+APP_LIVE_LOG_NAME = "app_live.log"
+ACCOUNT_LOG_NAME = "account.log"
 
 TRADE_CSV_COLUMNS: List[str] = [
     "logged_at",
@@ -40,8 +52,77 @@ TRADE_CSV_COLUMNS: List[str] = [
 ]
 
 
-def live_journal_dir(output_root: str) -> str:
-    path = os.path.join(output_root, LIVE_SUBDIR)
+def _safe_name(text: str, fallback: str = "item") -> str:
+    raw = (text or "").strip() or fallback
+    cleaned = re.sub(r"[^\w.\-]+", "_", raw, flags=re.UNICODE)
+    cleaned = cleaned.strip("._") or fallback
+    return cleaned[:48]
+
+
+def app_logs_dir(app_root: str) -> str:
+    path = os.path.join(app_root, "logs")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def live_logs_dir(app_root: str) -> str:
+    path = os.path.join(app_logs_dir(app_root), "live")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def live_journal_dir(output_root_or_app_root: str) -> str:
+    """
+    Root for live session files.
+
+    Prefer app_root/logs/live. If a legacy output/ path is passed and already
+    contains live data, still return logs/live under the app (caller should
+    pass APP_DIR). Kept for older call sites that passed DEFAULT_OUTPUT_DIR.
+    """
+    # If caller passed .../output, use sibling logs/live next to app root.
+    base = output_root_or_app_root
+    if os.path.basename(base.rstrip(os.sep)) == "output":
+        base = os.path.dirname(base)
+    return live_logs_dir(base)
+
+
+def app_live_log_path(app_root: str) -> str:
+    return os.path.join(live_logs_dir(app_root), APP_LIVE_LOG_NAME)
+
+
+def account_log_dir(
+    app_root: str,
+    account_id: str,
+    account_name: str = "",
+) -> str:
+    label = _safe_name(account_name, "account")
+    aid = _safe_name(account_id, "id")
+    path = os.path.join(live_logs_dir(app_root), "accounts", f"{label}_{aid}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def account_log_path(
+    app_root: str,
+    account_id: str,
+    account_name: str = "",
+) -> str:
+    return os.path.join(account_log_dir(app_root, account_id, account_name), ACCOUNT_LOG_NAME)
+
+
+def slot_journal_dir(
+    app_root: str,
+    account_id: str,
+    account_name: str,
+    slot_id: str,
+    slot_name: str = "",
+    timeframe: str = "",
+) -> str:
+    acc_dir = account_log_dir(app_root, account_id, account_name)
+    slot_label = _safe_name(slot_name or "slot", "slot")
+    tf = _safe_name(timeframe or "tf", "tf")
+    sid = _safe_name(slot_id, "slotid")
+    path = os.path.join(acc_dir, "slots", f"{slot_label}_{tf}_{sid}")
     os.makedirs(path, exist_ok=True)
     return path
 
@@ -59,7 +140,29 @@ def append_session_log(journal_dir: str, line: str) -> None:
         return
     try:
         os.makedirs(journal_dir, exist_ok=True)
-        with open(session_log_path(journal_dir), "a", encoding="utf-8") as f:
+        # If journal_dir is a file path ending with .log, append there directly
+        if journal_dir.lower().endswith(".log"):
+            path = journal_dir
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        else:
+            path = session_log_path(journal_dir)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line.rstrip() + "\n")
+            f.flush()
+    except OSError:
+        pass
+
+
+def append_log_file(path: str, line: str) -> None:
+    if not (path or "").strip():
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line.rstrip() + "\n")
             f.flush()
     except OSError:

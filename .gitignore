@@ -26,6 +26,7 @@ run_history.db
 hammer_boot.log
 hammer_crash.log
 _hammer_update.log
+logs/
 
 # PyInstaller / build artifacts (large binaries)
 build/

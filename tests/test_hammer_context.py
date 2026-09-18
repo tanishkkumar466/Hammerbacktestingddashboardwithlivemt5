@@ -350,6 +350,79 @@ def test_backtest_ledger_keeps_body_only_variant():
     assert "pattern_variant" in df.columns
 
 
+def test_pullback_entry_buy_and_sell():
+    buy_e, dist = hc.pullback_entry_price(TradeDirection.BUY, 4010.0, 4000.0, 35.0)
+    assert dist == 10.0
+    assert abs(buy_e - 4006.5) < 1e-9
+    sell_e, dist2 = hc.pullback_entry_price(TradeDirection.SELL, 4000.0, 4010.0, 35.0)
+    assert dist2 == 10.0
+    assert abs(sell_e - 4003.5) < 1e-9
+    same, _ = hc.pullback_entry_price(TradeDirection.BUY, 4010.0, 4000.0, 0.0)
+    assert same == 4010.0
+
+
+def test_signal_applies_pullback_and_awaits_limit():
+    import logic
+    cfg = hc.HammerContextConfig(
+        lookback_candles=1,
+        enable_sell=False,
+        entry_pullback_pct=35.0,
+        buffer_mode=logic.BufferMode.NONE,
+        sl_buffer_pct=0.0,
+        timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
+        enable_risk_limit=False,
+    )
+    # classic green: O=100 C=102 H=103.5 L=90 → next open 102 as entry base
+    signal = _classic_green("s")
+    nxt = Candle("n", 102.0, 103.0, 100.0, 102.5)
+    candles = [_pad("p0", 95.0), signal, nxt]
+    assert hc.detect_buy_setup(candles, 1, cfg) is None
+    sig = hc.build_context_signal(TradeDirection.BUY, signal, nxt, "3m", cfg)
+    assert sig is not None and not sig.ignored
+    assert sig.await_limit_fill is True
+    # base entry 102, SL at low 90 (no buffer), dist 12, 35% → fill 97.8
+    # TP from signal entry: 102 + 2*12 = 126 (pullback must not move target)
+    assert abs(sig.entry_price - 97.8) < 1e-9
+    assert abs(sig.stop_loss - 90.0) < 1e-9
+    assert abs(sig.target - 126.0) < 1e-9
+    assert abs(sig.risk - (97.8 - 90.0)) < 1e-9
+
+
+def test_pullback_keeps_signal_rr_target():
+    """User rule: entry 4010, SL 4000, RR 2 → TP 4030 even after 35% pullback fill."""
+    import logic
+    cfg = hc.HammerContextConfig(
+        lookback_candles=1,
+        enable_sell=False,
+        entry_pullback_pct=35.0,
+        buffer_mode=logic.BufferMode.NONE,
+        sl_buffer_pct=0.0,
+        timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
+        enable_risk_limit=False,
+    )
+    # Craft signal low=4000, next open=4010
+    signal = Candle("s", 4005.0, 4012.0, 4000.0, 4008.0)
+    nxt = Candle("n", 4010.0, 4015.0, 4007.0, 4012.0)
+    candles = [_pad("p0", 4006.0), signal, nxt]
+    # May fail classic hammer shape — force via build_context_signal directly
+    sig = hc.build_context_signal(TradeDirection.BUY, signal, nxt, "3m", cfg)
+    assert sig is not None and not sig.ignored
+    assert abs(sig.stop_loss - 4000.0) < 1e-9
+    assert abs(sig.entry_price - 4006.5) < 1e-9  # 4010 - 0.35*10
+    assert abs(sig.target - 4030.0) < 1e-9
+
+
+def test_find_limit_fill_index_buy():
+    import numpy as np
+    highs = np.array([103.0, 102.0, 101.0])
+    lows = np.array([101.0, 100.0, 97.0])
+    opens = np.array([102.0, 101.5, 100.5])
+    idx = hc.find_limit_fill_index(
+        TradeDirection.BUY, 100.0, 90.0, highs, lows, opens, 0, 10,
+    )
+    assert idx == 1  # low 100 touches limit
+
+
 if __name__ == "__main__":
     test_buy_requires_prior_closes_not_below_hammer_low()
     test_sell_requires_prior_closes_not_above_hammer_high()
@@ -365,4 +438,9 @@ if __name__ == "__main__":
     test_extreme_lower_wick_fails_hammer_but_passes_body_only()
     test_body_only_zero_pct_cap_is_not_replaced_with_ten()
     test_backtest_ledger_keeps_body_only_variant()
+    test_pullback_entry_buy_and_sell()
+    test_signal_applies_pullback_and_awaits_limit()
+    test_pullback_keeps_signal_rr_target()
+    test_find_limit_fill_index_buy()
     print("ok  hammer context tests passed")
+

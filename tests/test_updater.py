@@ -28,6 +28,8 @@ def test_skip_user_data_paths():
     assert updater._should_skip_path(".hammer_github_token")
     assert not updater._should_skip_path("dashboard.py")
     assert not updater._should_skip_path("indicators/supertrend.py")
+    assert not updater._should_skip_path("indicators/rolling_vwap.py")
+    assert not updater._should_skip_path("indicators/rsi.py")
 
 
 def test_pick_zip_for_source_mode(monkeypatch):

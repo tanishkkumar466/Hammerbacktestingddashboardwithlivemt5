@@ -66,7 +66,7 @@ def summarize_strategy_params(strategy_config, timeframe_label: str, pattern_typ
     if pattern_type == "doji":
         parts.append(doji_logic.describe_doji_detection(strategy_config))
         parts.append(doji_logic.describe_doji_entry_exit(strategy_config))
-    elif pattern_type in ("hammer_with_candles", "hammer_context"):
+    elif hammer_context_logic.is_context_pattern_type(pattern_type):
         parts.append(hammer_context_logic.describe_hammer_context_rules(strategy_config))
         parts.append(hammer_context_logic.describe_hammer_context_entry_exit(strategy_config))
     else:
@@ -122,7 +122,14 @@ def reanchor_sl_tp_to_fill(
     sig: logic.TradeSignal,
     fill_price: float,
 ) -> Tuple[float, float]:
-    """Keep the same $ risk/reward distances as the signal, anchored to the actual fill price."""
+    """
+    Keep the same $ risk/reward distances as the signal, anchored to the actual fill price.
+
+    Pullback-limit signals (await_limit_fill): SL and TP stay absolute — TP was set from
+    the signal entry × RR and must not move when we fill closer to the stop.
+    """
+    if getattr(sig, "await_limit_fill", False):
+        return float(sig.stop_loss), float(sig.target)
     delta = float(fill_price) - float(sig.entry_price)
     return float(sig.stop_loss) + delta, float(sig.target) + delta
 
@@ -188,6 +195,8 @@ def indicator_snapshot_text(
 
         from indicators.supertrend import compute_supertrend
         from indicators.vwap import compute_vwap
+        from indicators.rolling_vwap import coerce_rolling_period, compute_rolling_vwap
+        from indicators.rsi import coerce_rsi_period, compute_rsi
 
         df = _candles_to_polars(closed, forming)
         high = df["high"].to_numpy()
@@ -226,6 +235,29 @@ def indicator_snapshot_text(
             if not np.isnan(v):
                 parts.append(f"VWAP={v:.2f} close={'above' if c > v else 'below'}")
 
+        rv_cfg = indicator_stack.rolling_vwap
+        if rv_cfg.enabled:
+            period = coerce_rolling_period(rv_cfg.period)
+            rv = float(compute_rolling_vwap(high, low, close, vol, period=period)[idx])
+            if np.isnan(rv):
+                parts.append(f"RollingVWAP({period}): warmup (not enough bars)")
+            else:
+                parts.append(
+                    f"RollingVWAP({period})={rv:.2f} close={'above' if c > rv else 'below'}"
+                )
+
+        rsi_cfg = indicator_stack.rsi
+        if rsi_cfg.enabled:
+            period = coerce_rsi_period(rsi_cfg.period)
+            r = float(compute_rsi(close, period=period)[idx])
+            if np.isnan(r):
+                parts.append(f"RSI({period}): warmup (not enough bars)")
+            else:
+                parts.append(
+                    f"RSI({period})={r:.2f} (BUY if > {rsi_cfg.buy_above:g}, "
+                    f"SELL if < {rsi_cfg.sell_below:g})"
+                )
+
         return " | ".join(parts)
     except Exception:
         return ""
@@ -253,7 +285,7 @@ def find_bar_signal_outcome(
     Returns (actionable_signal, ignored_on_this_bar).
     ignored_on_this_bar is set when a pattern matched the last closed bar but was filtered.
     """
-    if pattern_type in ("hammer_with_candles", "hammer_context"):
+    if hammer_context_logic.is_context_pattern_type(pattern_type):
         try:
             lookback = max(0, int(getattr(strategy_config, "lookback_candles", 5)))
         except (TypeError, ValueError):
@@ -268,7 +300,7 @@ def find_bar_signal_outcome(
         signals = doji_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
-    elif pattern_type in ("hammer_with_candles", "hammer_context"):
+    elif hammer_context_logic.is_context_pattern_type(pattern_type):
         signals = hammer_context_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
@@ -303,7 +335,7 @@ def find_bar_signal_outcome(
         if sig.ignored:
             ignored_match = sig
             continue
-        if pattern_type != "doji" and pattern_type not in ("hammer_with_candles", "hammer_context"):
+        if pattern_type != "doji" and not hammer_context_logic.is_context_pattern_type(pattern_type):
             ok, vmsg = logic.verify_hammer_trade_signal(sig, strategy_config)
             if not ok:
                 sig = logic.TradeSignal(
@@ -387,7 +419,7 @@ class LiveTradingEngine:
         self._calendar_day: Optional[date] = None
         self._session_start_equity: Optional[float] = None
         self._last_order_time: float = 0.0
-        self._broker_lock = threading.RLock()
+        self._broker_lock = getattr(broker, "api_lock", None) or threading.RLock()
         self._strategy_lock = threading.RLock()
         self._consecutive_errors = 0
         self.last_heartbeat_mono: float = time.monotonic()
@@ -669,7 +701,7 @@ class LiveTradingEngine:
         inds = ", ".join(enabled_inds) or "none"
         if not enabled_inds:
             self.log(
-                "[WARN] No indicator filters active — SuperTrend/VWAP will NOT gate trades. "
+                "[WARN] No indicator filters active — SuperTrend / VWAP / Rolling VWAP / RSI will NOT gate trades. "
                 "To use them: Backtest Parameters → Indicators → Add, then Stop and Start live again."
             )
         if self.indicator_stack.supertrend.enabled and not self.indicator_stack.supertrend.apply_trade_filter:
@@ -680,6 +712,16 @@ class LiveTradingEngine:
         if self.indicator_stack.vwap.enabled and not self.indicator_stack.vwap.apply_trade_filter:
             self.log(
                 "[WARN] VWAP is added but 'Apply trade filter' is UNCHECKED — "
+                "it will NOT block any trades. Check the box in Indicators and restart live."
+            )
+        if self.indicator_stack.rolling_vwap.enabled and not self.indicator_stack.rolling_vwap.apply_trade_filter:
+            self.log(
+                "[WARN] Rolling VWAP is added but 'Apply trade filter' is UNCHECKED — "
+                "it will NOT block any trades. Check the box in Indicators and restart live."
+            )
+        if self.indicator_stack.rsi.enabled and not self.indicator_stack.rsi.apply_trade_filter:
+            self.log(
+                "[WARN] RSI is added but 'Apply trade filter' is UNCHECKED — "
                 "it will NOT block any trades. Check the box in Indicators and restart live."
             )
         if self._journal_dir:
@@ -710,7 +752,7 @@ class LiveTradingEngine:
                 f"(signal bar shape+color; entry is next bar). "
                 f"Change Parameters then use 'Apply to live' or Stop/Start live."
             )
-        elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
+        elif hammer_context_logic.is_context_pattern_type(self.pattern_type):
             self.log(
                 f"[LIVE] Context rules: "
                 f"{hammer_context_logic.describe_hammer_context_rules(self.strategy_config)}"
@@ -829,7 +871,10 @@ class LiveTradingEngine:
     ) -> Optional[Tuple[str, Optional[float], float, float]]:
         """
         Returns (order_mode, limit_price_or_none, sl, tp) for MT5.
-        Re-anchors SL/TP to the actual fill/limit price; uses market when strategy entry is far from tick.
+
+        Pullback signals (await_limit_fill): always place a limit at sig.entry_price
+        (toward SL). Never force market on max-deviation, and never use limit_offset
+        from market — that would skip the wait backtest simulates.
         """
         cfg = self.live_config
         with self._broker_lock:
@@ -844,6 +889,18 @@ class LiveTradingEngine:
         strat_entry = float(sig.entry_price)
         pt = point or 0.01
         dev_pts = abs(strat_entry - market) / pt
+
+        # ---- Hammer with candle 35% (and any await_limit_fill signal) ----
+        if getattr(sig, "await_limit_fill", False):
+            sl, tp = reanchor_sl_tp_to_fill(sig, strat_entry)
+            side = "ask" if is_buy else "bid"
+            self.log(
+                f"[LIVE] Pullback limit @ {strat_entry:.2f} "
+                f"(toward SL {float(sig.stop_loss):.2f}; TP fixed @ {tp:.2f}). "
+                f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill "
+                f"(not forcing market)."
+            )
+            return "limit_entry", strat_entry, sl, tp
 
         order_mode = (cfg.order_mode or "market").strip().lower()
         effective_mode = order_mode
@@ -1049,7 +1106,7 @@ class LiveTradingEngine:
                                 f"[LIVE] {hr.hammer_variant.value} {hr.color.value} matched shape "
                                 f"but Direction tab is NO — no order."
                             )
-                elif self.pattern_type in ("hammer_with_candles", "hammer_context") and len(closed) >= 2:
+                elif hammer_context_logic.is_context_pattern_type(self.pattern_type) and len(closed) >= 2:
                     ctx_cfg = self.strategy_config
                     idx = len(closed) - 1
                     signal_bar = closed[idx]
@@ -1110,7 +1167,7 @@ class LiveTradingEngine:
                 f"[SIGNAL] Entry/SL from {'inverted' if variant == 'INVERTED' else 'classic'} "
                 f"row: {logic.entry_rule_label_for_variant(self.strategy_config, variant)}"
             )
-        elif self.pattern_type in ("hammer_with_candles", "hammer_context"):
+        elif hammer_context_logic.is_context_pattern_type(self.pattern_type):
             ctx_cfg = self.strategy_config
             n = getattr(ctx_cfg, "lookback_candles", "?")
             body_pct = hammer_context_logic.body_pct_of_candle(
@@ -1212,6 +1269,7 @@ class LiveTradingEngine:
         elif (
             order_mode != "market"
             and cfg.fallback_to_market_on_limit_fail
+            and not getattr(sig, "await_limit_fill", False)
         ):
             self.log(f"[ORDER FAIL] {msg}")
             self.log("[ORDER] Limit failed — trying one market fallback…")

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import threading
 
 import logic
 
@@ -116,6 +117,8 @@ class MT5Broker:
     def __init__(self):
         self._mt5: Any = None
         self._connected = False
+        # Shared by every live slot on this broker — MT5 Python is process-global.
+        self.api_lock = threading.RLock()
 
     @property
     def is_connected(self) -> bool:
@@ -444,6 +447,73 @@ class MT5Broker:
         if positions is None:
             return 0
         return sum(1 for p in positions if int(p.magic) == int(magic))
+
+    def close_positions_for_magics(
+        self, magics: List[int], deviation: int = 30,
+    ) -> Tuple[int, int, str]:
+        """Market-close open positions whose magic is in magics. Returns (closed, failed, detail)."""
+        if not self.is_connected:
+            return 0, 0, "Not connected."
+        wanted = {int(m) for m in magics}
+        if not wanted:
+            return 0, 0, "No magics."
+        with self.api_lock:
+            positions = self._mt5.positions_get()
+            if positions is None:
+                return 0, 0, f"positions_get failed: {self._mt5.last_error()}"
+            closed = 0
+            failed = 0
+            notes: List[str] = []
+            for p in list(positions):
+                if int(getattr(p, "magic", 0) or 0) not in wanted:
+                    continue
+                symbol = str(p.symbol)
+                ticket = int(p.ticket)
+                volume = float(p.volume)
+                pos_type = int(p.type)
+                tick = self._mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    failed += 1
+                    notes.append(f"#{ticket} no tick")
+                    continue
+                if pos_type == getattr(self._mt5, "POSITION_TYPE_BUY", 0):
+                    order_type = self._mt5.ORDER_TYPE_SELL
+                    price = float(tick.bid)
+                else:
+                    order_type = self._mt5.ORDER_TYPE_BUY
+                    price = float(tick.ask)
+                last_err = "close failed"
+                filling_modes = self._filling_modes_for_symbol(self._mt5.symbol_info(symbol))
+                ok = False
+                for type_filling in filling_modes or [getattr(self._mt5, "ORDER_FILLING_IOC", 1)]:
+                    request = {
+                        "action": self._mt5.TRADE_ACTION_DEAL,
+                        "symbol": symbol,
+                        "volume": volume,
+                        "type": order_type,
+                        "position": ticket,
+                        "price": price,
+                        "deviation": int(deviation),
+                        "magic": int(p.magic),
+                        "comment": "HammerFlatten"[:31],
+                        "type_time": self._mt5.ORDER_TIME_GTC,
+                        "type_filling": type_filling,
+                    }
+                    result = self._mt5.order_send(request)
+                    if result is not None and result.retcode == self._mt5.TRADE_RETCODE_DONE:
+                        ok = True
+                        break
+                    last_err = (
+                        f"#{ticket} {result.retcode if result else self._mt5.last_error()}"
+                    )
+                if ok:
+                    closed += 1
+                    notes.append(f"closed #{ticket} {symbol}")
+                else:
+                    failed += 1
+                    notes.append(last_err)
+            detail = "; ".join(notes) if notes else "No matching open positions."
+            return closed, failed, detail
 
     def _filling_modes_for_symbol(self, sym_info) -> List[int]:
         """Broker-supported order filling modes, most preferred first."""
