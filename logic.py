@@ -311,6 +311,34 @@ DEFAULT_TIMEFRAME_SETTINGS: Dict[str, TimeframeSetting] = {
 }
 
 
+def resolve_timeframe_setting(
+    timeframe_settings: Optional[Dict[str, TimeframeSetting]],
+    timeframe: str,
+) -> TimeframeSetting:
+    """
+    Look up RR / max-SL for a logic label (e.g. "3m", "4m").
+
+    Custom resampled folders map to labels like "4m" that may be missing from
+    presets; fall back to a template instead of crashing the backtest.
+    """
+    settings = dict(timeframe_settings or {})
+    hit = settings.get(timeframe)
+    if hit is not None:
+        return hit
+    template = (
+        settings.get("3m")
+        or settings.get("5m")
+        or settings.get("1m")
+        or (next(iter(settings.values())) if settings else None)
+        or DEFAULT_TIMEFRAME_SETTINGS.get("3m")
+        or TimeframeSetting(rr_multiple=2.4, max_sl_usd=8.0)
+    )
+    return TimeframeSetting(
+        rr_multiple=float(template.rr_multiple),
+        max_sl_usd=float(template.max_sl_usd),
+    )
+
+
 def coerce_trade_action(value, default: "TradeAction" = None) -> "TradeAction":
     """Accept TradeAction, TradeDirection, or BUY/SELL/NO strings."""
     if default is None:
@@ -1120,13 +1148,7 @@ def build_trade_signal(
                 pattern_variant=variant.value,
             )
 
-    if timeframe not in config.timeframe_settings:
-        raise ValueError(
-            f"Unknown timeframe '{timeframe}'. "
-            f"Available: {list(config.timeframe_settings.keys())}"
-        )
-
-    tf_setting = config.timeframe_settings[timeframe]
+    tf_setting = resolve_timeframe_setting(config.timeframe_settings, timeframe)
     hammer_candle = hammer_result.candle
     direction = hammer_result.direction
 

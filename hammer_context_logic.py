@@ -477,12 +477,7 @@ def build_context_signal(
     timeframe: str,
     config: HammerContextConfig,
 ) -> Optional[logic.TradeSignal]:
-    if timeframe not in config.timeframe_settings:
-        raise ValueError(
-            f"Unknown timeframe '{timeframe}'. "
-            f"Available: {list(config.timeframe_settings.keys())}"
-        )
-    tf_setting = config.timeframe_settings[timeframe]
+    tf_setting = logic.resolve_timeframe_setting(config.timeframe_settings, timeframe)
     is_buy = direction == logic.TradeDirection.BUY
     trade_cfg = config.to_buy_trade_config() if is_buy else config.to_sell_trade_config()
     variant = logic.HammerVariant.CLASSIC if is_buy else logic.HammerVariant.INVERTED

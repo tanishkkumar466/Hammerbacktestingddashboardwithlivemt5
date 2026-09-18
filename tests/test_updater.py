@@ -194,3 +194,21 @@ def test_windows_update_bat_is_bounded_and_uses_ping(tmp_path, monkeypatch):
     assert "taskkill" not in text
     assert "sidecar" in text.lower() or "-updated.exe" in text
 
+
+def test_install_stub_package_accepts_positional_args():
+    """Regression: *,_stub typo made all params keyword-only (TypeError on zip install)."""
+    import inspect
+
+    sig = inspect.signature(updater._install_stub_package)
+    params = list(sig.parameters.values())
+    assert [p.name for p in params] == ["next_stub", "next_runtime", "status_cb"]
+    assert all(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+    # Positional call must not raise TypeError about argument count
+    try:
+        updater._install_stub_package("/no/stub.exe", "/no/runtime.exe", lambda _s: None)
+    except TypeError as exc:
+        raise AssertionError(f"positional call rejected: {exc}") from exc
+    except Exception:
+        # Missing files / not frozen — expected; only TypeError is a regression
+        pass
+

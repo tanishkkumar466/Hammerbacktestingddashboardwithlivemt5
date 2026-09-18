@@ -423,6 +423,45 @@ def test_find_limit_fill_index_buy():
     assert idx == 1  # low 100 touches limit
 
 
+def test_pullback_same_bar_sl_counted_as_loss():
+    """Fill bar must be scanned for SL after a pullback limit fill."""
+    import numpy as np
+    from backtest import (
+        ExitModel,
+        TradeOutcome,
+        resolve_all_exit_models_for_trade,
+    )
+
+    limit, sl, tp = 100.0, 90.0, 120.0
+    # Bar 0 never touches. Bar 1: open above limit, low tags limit + SL.
+    highs = np.array([103.0, 101.0, 125.0])
+    lows = np.array([101.0, 89.0, 110.0])
+    opens = np.array([102.0, 101.0, 112.0])
+    closes = np.array([102.5, 95.0, 124.0])
+    fill_idx = hc.find_limit_fill_index(
+        TradeDirection.BUY, limit, sl, highs, lows, opens, 0, 10,
+    )
+    assert fill_idx == 1
+
+    # Bug path: skip fill bar → next bar hits TP → false WIN
+    skipped = resolve_all_exit_models_for_trade(
+        direction=TradeDirection.BUY, sl=sl, target=tp,
+        future_high=highs[fill_idx + 1 :], future_low=lows[fill_idx + 1 :],
+        future_open=opens[fill_idx + 1 :], future_close=closes[fill_idx + 1 :],
+        future_timestamps=["t2"], max_scan=10,
+    )
+    assert skipped[ExitModel.WORST_CASE][0] == TradeOutcome.WIN
+
+    # Fixed path: include fill bar → LOSS
+    fixed = resolve_all_exit_models_for_trade(
+        direction=TradeDirection.BUY, sl=sl, target=tp,
+        future_high=highs[fill_idx:], future_low=lows[fill_idx:],
+        future_open=opens[fill_idx:], future_close=closes[fill_idx:],
+        future_timestamps=["t1", "t2"], max_scan=10,
+    )
+    assert fixed[ExitModel.WORST_CASE][0] == TradeOutcome.LOSS
+
+
 if __name__ == "__main__":
     test_buy_requires_prior_closes_not_below_hammer_low()
     test_sell_requires_prior_closes_not_above_hammer_high()
@@ -442,5 +481,6 @@ if __name__ == "__main__":
     test_signal_applies_pullback_and_awaits_limit()
     test_pullback_keeps_signal_rr_target()
     test_find_limit_fill_index_buy()
+    test_pullback_same_bar_sl_counted_as_loss()
     print("ok  hammer context tests passed")
 

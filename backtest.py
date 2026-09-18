@@ -1085,7 +1085,10 @@ def simulate_timeframe_outcomes(
                 config.max_forward_candles,
             )
             if found is None:
-                # Limit never filled — treat as ignored for this timeframe pass
+                # Limit never filled — keep in ignored export (not a silent drop)
+                sig.ignored = True
+                sig.ignore_reason = "Limit not filled within scan window"
+                ignored_signals.append(sig)
                 continue
             fill_idx = found
             fill_open = float(all_open[fill_idx])
@@ -1113,7 +1116,10 @@ def simulate_timeframe_outcomes(
             except Exception:
                 pass
 
-        start = fill_idx + 1
+        # Scan from the entry/fill bar: default entry is NEXT_CANDLE_OPEN (or a
+        # pullback limit fill during that bar), so same-bar SL/TP after entry
+        # must count. find_limit_fill_index relies on this for pullbacks.
+        start = fill_idx
         end = min(start + config.max_forward_candles, len(all_high))
 
         raw_outcomes = resolve_all_exit_models_for_trade(
@@ -1130,6 +1136,7 @@ def simulate_timeframe_outcomes(
     filtered_outcomes: Dict[ExitModel, List[Tuple["logic.TradeSignal", TradeOutcome, Optional[float], Optional[datetime], Optional[int]]]] = {
         m: [] for m in ALL_EXIT_MODELS
     }
+    data_end = all_timestamps[-1] if all_timestamps else None
     for sig, raw_outcomes in raw_results:
         for exit_model in ALL_EXIT_MODELS:
             if not config.allow_overlapping_trades:
@@ -1142,8 +1149,12 @@ def simulate_timeframe_outcomes(
             outcome, exit_price, exit_time, bars_held = raw_outcomes[exit_model]
             filtered_outcomes[exit_model].append((sig, outcome, exit_price, exit_time, bars_held))
 
-            if not config.allow_overlapping_trades and exit_time is not None:
-                open_until[exit_model] = exit_time
+            if not config.allow_overlapping_trades:
+                if exit_time is not None:
+                    open_until[exit_model] = exit_time
+                elif outcome == TradeOutcome.STILL_OPEN and data_end is not None:
+                    # Unresolved trades still occupy the slot until data ends
+                    open_until[exit_model] = data_end
 
     return filtered_outcomes, ignored_signals
 

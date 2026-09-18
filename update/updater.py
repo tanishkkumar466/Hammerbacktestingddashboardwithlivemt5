@@ -710,7 +710,7 @@ def _stage_runtime_pending(downloaded_runtime: str, status_cb: Callable[[str], N
 
 
 def _install_stub_package(
-    *,_stub: Optional[str],
+    next_stub: Optional[str],
     next_runtime: str,
     status_cb: Callable[[str], None],
 ) -> str:
@@ -1334,7 +1334,11 @@ def _install_from_zip(
             runtime_in_tree = _find_runtime_exe_in_tree(source_root)
             stub_in_tree = _find_stub_exe_in_tree(source_root)
             if runtime_in_tree:
-                return _install_stub_package(stub_in_tree, runtime_in_tree, status_cb)
+                return _install_stub_package(
+                    next_stub=stub_in_tree,
+                    next_runtime=runtime_in_tree,
+                    status_cb=status_cb,
+                )
             exe_in_tree = _find_hammer_exe_in_tree(source_root)
             if exe_in_tree:
                 payload_root = os.path.dirname(exe_in_tree)
