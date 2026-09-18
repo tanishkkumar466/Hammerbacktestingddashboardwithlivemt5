@@ -27,18 +27,29 @@ def boot_log_path() -> str:
     return os.path.join(logs_dir(), "boot.log")
 
 
+def legacy_boot_log_path() -> str:
+    """Next to the exe — CI smoke tests and older diagnostics still look here."""
+    return os.path.join(exe_dir(), "hammer_boot.log")
+
+
 def crash_log_path() -> str:
     return os.path.join(logs_dir(), "crash.log")
 
 
+def legacy_crash_log_path() -> str:
+    return os.path.join(exe_dir(), "hammer_crash.log")
+
+
 def boot_log(msg: str) -> None:
-    try:
-        ts = datetime.now().isoformat(timespec="seconds")
-        with open(boot_log_path(), "a", encoding="utf-8") as f:
-            f.write(f"{ts} {msg}\n")
-            f.flush()
-    except OSError:
-        pass
+    ts = datetime.now().isoformat(timespec="seconds")
+    line = f"{ts} {msg}\n"
+    for path in (boot_log_path(), legacy_boot_log_path()):
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+        except OSError:
+            pass
 
 
 def enable_faulthandler() -> None:
@@ -53,10 +64,13 @@ def enable_faulthandler() -> None:
 
 
 def write_crash(exc: BaseException) -> None:
-    try:
-        with open(crash_log_path(), "w", encoding="utf-8") as f:
-            f.write("Hammer failed to start\n\n")
-            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
-            f.flush()
-    except OSError:
-        pass
+    body = "Hammer failed to start\n\n" + "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)
+    )
+    for path in (crash_log_path(), legacy_crash_log_path()):
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+                f.flush()
+        except OSError:
+            pass

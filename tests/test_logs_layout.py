@@ -15,8 +15,13 @@ def test_logs_dir_created(tmp_path, monkeypatch):
     assert os.path.isdir(path)
     hammer_boot.boot_log("hello")
     assert (tmp_path / "logs" / "boot.log").is_file()
+    # CI / frozen smoke still reads hammer_boot.log next to the exe
+    legacy = tmp_path / "hammer_boot.log"
+    assert legacy.is_file()
+    assert "hello" in legacy.read_text(encoding="utf-8")
     hammer_boot.write_crash(RuntimeError("boom"))
     assert (tmp_path / "logs" / "crash.log").is_file()
+    assert (tmp_path / "hammer_crash.log").is_file()
 
 
 def test_live_account_and_slot_dirs(tmp_path):

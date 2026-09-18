@@ -100,28 +100,39 @@ jobs:
           $deadline = (Get-Date).AddSeconds(90)
           $boot = ""
           $crash = ""
+          function Read-BootLog {
+            $chunks = @()
+            if (Test-Path "logs\boot.log") { $chunks += Get-Content "logs\boot.log" -Raw -ErrorAction SilentlyContinue }
+            if (Test-Path "hammer_boot.log") { $chunks += Get-Content "hammer_boot.log" -Raw -ErrorAction SilentlyContinue }
+            return ($chunks -join "`n")
+          }
+          function Read-CrashLog {
+            if (Test-Path "logs\crash.log") { return Get-Content "logs\crash.log" -Raw -ErrorAction SilentlyContinue }
+            if (Test-Path "hammer_crash.log") { return Get-Content "hammer_crash.log" -Raw -ErrorAction SilentlyContinue }
+            return ""
+          }
           while ((Get-Date) -lt $deadline) {
-            if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw -ErrorAction SilentlyContinue }
+            $boot = Read-BootLog
+            $crash = Read-CrashLog
             if ($boot -match "QApplication OK") { break }
             if ($crash -and $crash.Trim().Length -gt 0) { break }
             if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
             Start-Sleep -Seconds 2
           }
           if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-          if (Test-Path "hammer_boot.log") { $boot = Get-Content "hammer_boot.log" -Raw }
-          if (Test-Path "hammer_crash.log") { $crash = Get-Content "hammer_crash.log" -Raw }
-          Write-Host "==== hammer_boot.log ===="
+          $boot = Read-BootLog
+          $crash = Read-CrashLog
+          Write-Host "==== boot log (logs/boot.log + hammer_boot.log) ===="
           if ($boot) { Write-Host $boot } else { Write-Host "(missing)" }
-          Write-Host "==== hammer_crash.log ===="
+          Write-Host "==== crash log ===="
           if ($crash) { Write-Host $crash } else { Write-Host "(none)" }
           Pop-Location
-          if ($crash -and $crash.Trim().Length -gt 0) { throw "EXE wrote hammer_crash.log — will not open on user PCs:`n$crash" }
+          if ($crash -and $crash.Trim().Length -gt 0) { throw "EXE wrote crash log — will not open on user PCs:`n$crash" }
           if (-not $boot) {
-            throw "EXE never wrote hammer_boot.log — bootloader died before Python (DLL/OpenSSL)."
+            throw "EXE never wrote boot log — bootloader died before Python (DLL/OpenSSL)."
           }
           if ($boot -notmatch "QApplication OK") {
-            throw "hammer_boot.log missing QApplication OK — real qwindows path failed:`n$boot"
+            throw "boot log missing QApplication OK — real qwindows path failed:`n$boot"
           }
           Write-Host "Smoke OK — real qwindows platform + QApplication works (minimal PATH)."
 
