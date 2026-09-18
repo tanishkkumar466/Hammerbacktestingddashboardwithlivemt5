@@ -13,6 +13,18 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+# Windows CI consoles are often cp1252 — keep prints ASCII-safe and force UTF-8 when possible
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -23,7 +35,7 @@ def _fail(msg: str) -> None:
 
 
 def check_stub_imports_are_light() -> None:
-    # Import paths the way the stub does — must not load PySide6
+    # Import paths the way the stub does - must not load PySide6
     before = {k for k in sys.modules if k.startswith("PySide6") or k == "PySide6"}
     import update.paths  # noqa: F401
     import update.stub  # noqa: F401
@@ -41,7 +53,7 @@ def check_install_root() -> None:
     root = Path(install_root())
     if root.resolve() != ROOT.resolve():
         _fail(f"install_root()={root} expected repo root {ROOT}")
-    print("OK install_root → repo root")
+    print("OK install_root -> repo root")
 
 
 def check_asset_pick() -> None:
