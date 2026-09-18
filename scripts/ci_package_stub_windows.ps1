@@ -6,28 +6,31 @@
 #   dist/HammerPackage/...
 #   dist/Hammer-windows.zip
 #   dist/release-assets/...  (optional bridge copies)
+#
+# IMPORTANT: keep this file ASCII-only. Windows PowerShell 5.x mis-parses
+# UTF-8 em-dashes/arrows in .ps1 scripts (shows as aEURoe / ParserError).
 
 $ErrorActionPreference = "Stop"
 
 $runtime = "dist/HammerRuntime.exe"
 $stub = "dist/HammerCandleBacktestDashboard.exe"
-if (-not (Test-Path $runtime)) { throw "Missing $runtime — build HammerCandleBacktestDashboard.spec first" }
-if (-not (Test-Path $stub)) { throw "Missing $stub — build HammerStub.spec first" }
+if (-not (Test-Path $runtime)) { throw "Missing $runtime - build HammerCandleBacktestDashboard.spec first" }
+if (-not (Test-Path $stub)) { throw "Missing $stub - build HammerStub.spec first" }
 
 $rtSize = (Get-Item $runtime).Length
 $stubSize = (Get-Item $stub).Length
 Write-Host "Runtime $([math]::Round($rtSize/1MB,1)) MB; stub $([math]::Round($stubSize/1MB,1)) MB ($stubSize bytes)"
 
 if ($rtSize -lt 400MB) {
-  throw "Runtime too small ($([math]::Round($rtSize/1MB,1)) MB) — expected ~420-450 MB"
+  throw "Runtime too small ($([math]::Round($rtSize/1MB,1)) MB) - expected ~420-450 MB"
 }
 if ($rtSize -lt 420MB) {
   Write-Warning "Runtime is $([math]::Round($rtSize/1MB,1)) MB (target ~430 MB)"
 }
-# PyInstaller one-file stub is usually ~5–25 MB, never hundreds
-if ($stubSize -lt 2MB) { throw "Stub too small ($stubSize bytes) — build likely failed" }
+# PyInstaller one-file stub is usually ~5-25 MB, never hundreds
+if ($stubSize -lt 2MB) { throw "Stub too small ($stubSize bytes) - build likely failed" }
 if ($stubSize -ge 80MB) {
-  throw "Stub looks like full app ($([math]::Round($stubSize/1MB,1)) MB) — expected tiny launcher. Check build order / names."
+  throw "Stub looks like full app ($([math]::Round($stubSize/1MB,1)) MB) - expected tiny launcher. Check build order / names."
 }
 
 $pkg = "dist/HammerPackage"
@@ -37,7 +40,7 @@ Copy-Item -LiteralPath $stub -Destination "$pkg/HammerCandleBacktestDashboard.ex
 Copy-Item -LiteralPath $runtime -Destination "$pkg/app/HammerRuntime.exe" -Force
 
 @"
-Hammer (Windows) — stub launcher layout
+Hammer (Windows) - stub launcher layout
 
 1. Keep this folder together (launcher exe + app\HammerRuntime.exe).
 2. Double-click HammerCandleBacktestDashboard.exe (the launcher).
@@ -47,7 +50,7 @@ Check for Updates stages a new runtime under app\ and restarts via the launcher.
 
 Old one-file installs: Check for Updates downloads the large bridge EXE once;
 on first open it auto-converts to this stub + app\ layout.
-"@ | Set-Content -Encoding UTF8 "$pkg/README.txt"
+"@ | Set-Content -Encoding ascii "$pkg/README.txt"
 
 $zip = "dist/Hammer-windows.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
@@ -72,4 +75,4 @@ Copy-Item -LiteralPath $runtime -Destination "$assets/HammerRuntime.exe" -Force
 # Older clients (pre-stub updater) only accept this exact large filename
 Copy-Item -LiteralPath $runtime -Destination "$assets/HammerCandleBacktestDashboard.exe" -Force
 
-Write-Host "Package OK → dist/HammerPackage + dist/Hammer-windows.zip + dist/release-assets/"
+Write-Host "Package OK -> dist/HammerPackage + dist/Hammer-windows.zip + dist/release-assets/"

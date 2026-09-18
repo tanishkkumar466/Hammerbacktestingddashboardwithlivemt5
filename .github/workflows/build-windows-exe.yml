@@ -88,7 +88,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/_stash" | Out-Null
           Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/_stash/HammerCandleBacktestDashboard.exe" -Force
           $sz = (Get-Item "dist/_stash/HammerCandleBacktestDashboard.exe").Length
-          if ($sz -ge 80MB) { throw "Stashed stub is too large — wrong binary" }
+          if ($sz -ge 80MB) { throw "Stashed stub is too large - wrong binary" }
 
       - name: Build runtime (HammerRuntime.exe)
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
@@ -99,7 +99,7 @@ jobs:
           Copy-Item "dist/_stash/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard.exe" -Force
           if (-not (Test-Path "dist/HammerRuntime.exe")) { throw "Runtime build missing" }
           if (-not (Test-Path "dist/_stash/stub_embedded.ok")) {
-            throw "Runtime build did not embed stub (missing dist/_stash/stub_embedded.ok) — one-hop migration would fail for old clients"
+            throw "Runtime build did not embed stub (missing dist/_stash/stub_embedded.ok) - one-hop migration would fail for old clients"
           }
           Write-Host "Stub embed marker OK"
 

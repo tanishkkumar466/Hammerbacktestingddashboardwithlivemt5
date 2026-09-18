@@ -1,4 +1,6 @@
 # Shared smoke test: stub launches runtime; wait for QApplication OK in boot logs.
+# IMPORTANT: keep this file ASCII-only (Windows PowerShell 5.x + UTF-8 without BOM).
+
 $ErrorActionPreference = "Stop"
 
 $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
@@ -66,18 +68,18 @@ try {
   if ($crash) { Write-Host $crash } else { Write-Host "(none)" }
 
   if ($crash -and $crash.Trim().Length -gt 0) {
-    throw "EXE wrote crash log — will not open on user PCs:`n$crash"
+    throw "EXE wrote crash log - will not open on user PCs:`n$crash"
   }
   if (-not $boot) {
-    throw "EXE never wrote boot log — stub/runtime died before Python (DLL/OpenSSL)."
+    throw "EXE never wrote boot log - stub/runtime died before Python (DLL/OpenSSL)."
   }
   if ($boot -notmatch "stub:") {
-    Write-Warning "stub.log markers missing — stub may not have run (direct runtime?)"
+    Write-Warning "stub.log markers missing - stub may not have run (direct runtime?)"
   }
   if ($boot -notmatch "QApplication OK") {
-    throw "boot log missing QApplication OK — stub/runtime failed:`n$boot"
+    throw "boot log missing QApplication OK - stub/runtime failed:`n$boot"
   }
-  Write-Host "Smoke OK — stub launched runtime; QApplication works."
+  Write-Host "Smoke OK - stub launched runtime; QApplication works."
 }
 finally {
   Pop-Location

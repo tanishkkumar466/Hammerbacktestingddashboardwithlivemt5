@@ -24,7 +24,7 @@ def main() -> int:
         for line in errors:
             print(f"  {line}", file=sys.stderr)
         return 1
-    print(f"OK — all Python files under {ROOT.name}/ parse cleanly.")
+    print(f"OK - all Python files under {ROOT.name}/ parse cleanly.")
     return 0
 
 
