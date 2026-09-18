@@ -976,7 +976,14 @@ def simulate_timeframe_outcomes(
     Load candles, generate signals, resolve SL/TP under all exit models,
     and apply per-timeframe overlap. Does not size positions.
     """
-    logic_label = config.timeframe_folder_to_logic_label.get(timeframe_folder, timeframe_folder)
+    logic_label = config.timeframe_folder_to_logic_label.get(timeframe_folder)
+    if not logic_label:
+        try:
+            from candle_resample import logic_label_for_folder
+
+            logic_label = logic_label_for_folder(timeframe_folder)
+        except Exception:
+            logic_label = timeframe_folder
     preferred = market_preferred_for_config(config)
 
     df = load_candles_df(
@@ -1575,10 +1582,16 @@ def compute_metrics_grouped(
 
     result = result.select(final_cols).sort(["exit_model", "group"])
     if group_cols == ["timeframe"] and "group" in result.columns:
-        mapping = {
-            "1min": "1m", "3min": "3m", "5min": "5m", "10min": "10m",
-            "15min": "15m", "30min": "30m", "1hour": "1h",
-        }
+        try:
+            from candle_resample import logic_label_for_folder
+
+            folders = result["group"].unique().to_list()
+            mapping = {f: logic_label_for_folder(str(f)) for f in folders if f is not None}
+        except Exception:
+            mapping = {
+                "1min": "1m", "3min": "3m", "5min": "5m", "10min": "10m",
+                "15min": "15m", "30min": "30m", "1hour": "1h",
+            }
         result = result.with_columns(
             pl.col("group").replace(mapping).alias("group")
         )

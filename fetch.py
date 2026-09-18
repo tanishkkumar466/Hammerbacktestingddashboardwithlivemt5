@@ -8,6 +8,7 @@ import time
 import argparse
 import random
 import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 
@@ -17,6 +18,16 @@ try:
     from broker import ensure_mt5_symbol_visible
 except ImportError:
     ensure_mt5_symbol_visible = None  # type: ignore
+
+
+@contextmanager
+def _hold_mt5_lock(lock):
+    """Serialize MT5 API calls when sharing a Live broker connection."""
+    if lock is None:
+        yield
+    else:
+        with lock:
+            yield
 
 
 # ============================================================================
@@ -443,67 +454,70 @@ def iter_fetch_subchunks(chunk_start: datetime, chunk_end: datetime, timeframe_l
         cur = piece_end + timedelta(seconds=1)
 
 
-def verify_symbol(mt5, symbol: str, log=None) -> Tuple[bool, str]:
+def verify_symbol(mt5, symbol: str, log=None, api_lock=None) -> Tuple[bool, str]:
     """
     Confirm symbol exists, resolve broker aliases (XAUUSD → XAUUSDm), enable
     in Market Watch. Returns (ok, resolved_symbol).
     """
     _log = log or (lambda msg: print(msg))
-    if ensure_mt5_symbol_visible is not None:
-        ok, resolved_or_msg = ensure_mt5_symbol_visible(mt5, symbol)
-        if not ok:
-            _log(f"[FAIL] {resolved_or_msg}")
-            return False, symbol
-        if resolved_or_msg != symbol:
-            _log(f"[INFO] Symbol resolved: {symbol} → {resolved_or_msg}")
-        else:
-            _log(f"[OK] Symbol ready: {resolved_or_msg}")
-        return True, resolved_or_msg
+    with _hold_mt5_lock(api_lock):
+        if ensure_mt5_symbol_visible is not None:
+            ok, resolved_or_msg = ensure_mt5_symbol_visible(mt5, symbol)
+            if not ok:
+                _log(f"[FAIL] {resolved_or_msg}")
+                return False, symbol
+            if resolved_or_msg != symbol:
+                _log(f"[INFO] Symbol resolved: {symbol} → {resolved_or_msg}")
+            else:
+                _log(f"[OK] Symbol ready: {resolved_or_msg}")
+            return True, resolved_or_msg
 
-    info = mt5.symbol_info(symbol)
-    if info is None:
-        _log(
-            f"[FAIL] Symbol '{symbol}' not found on this broker. "
-            f"Check the exact symbol name in MT5's Market Watch panel "
-            f"(some brokers use 'XAUUSD.m', 'GOLD', etc.)."
-        )
-        return False, symbol
-
-    if not info.visible:
-        _log(f"[INFO] Symbol '{symbol}' not visible in Market Watch, enabling it...")
-        if not mt5.symbol_select(symbol, True):
-            _log(f"[FAIL] Could not enable symbol '{symbol}'.")
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            _log(
+                f"[FAIL] Symbol '{symbol}' not found on this broker. "
+                f"Check the exact symbol name in MT5's Market Watch panel "
+                f"(some brokers use 'XAUUSD.m', 'GOLD', etc.)."
+            )
             return False, symbol
 
-    return True, symbol
+        if not info.visible:
+            _log(f"[INFO] Symbol '{symbol}' not visible in Market Watch, enabling it...")
+            if not mt5.symbol_select(symbol, True):
+                _log(f"[FAIL] Could not enable symbol '{symbol}'.")
+                return False, symbol
+
+        return True, symbol
 
 
-def warmup_mt5_history(mt5, symbol: str, mt5_timeframe_name: str, log=None) -> None:
+def warmup_mt5_history(mt5, symbol: str, mt5_timeframe_name: str, log=None, api_lock=None) -> None:
     """
     Nudge MT5 to download history for symbol/timeframe before copy_rates_range.
     Empty [] results are common on Windows when the terminal never loaded that chart.
     """
     _log = log or (lambda msg: print(msg))
     try:
-        tf = getattr(mt5, mt5_timeframe_name)
-        mt5.symbol_select(symbol, True)
-        try:
-            seed = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
-        except Exception as exc:
-            _log(f"[WARN] History warm-up failed for {symbol}: {exc}")
-            return
-        if seed is not None and len(seed) > 0:
-            _log(f"[OK] MT5 history warm-up: {len(seed)} recent bar(s) for {symbol} [{mt5_timeframe_name}]")
-        else:
-            _log(
-                f"[WARN] MT5 returned no recent bars for {symbol} [{mt5_timeframe_name}]. "
-                "Open that symbol on a chart in MT5, wait for history to load, then retry."
-            )
+        with _hold_mt5_lock(api_lock):
+            tf = getattr(mt5, mt5_timeframe_name)
+            mt5.symbol_select(symbol, True)
+            try:
+                seed = mt5.copy_rates_from_pos(symbol, tf, 0, 200)
+            except Exception as exc:
+                _log(f"[WARN] History warm-up failed for {symbol}: {exc}")
+                return
+            if seed is not None and len(seed) > 0:
+                _log(f"[OK] MT5 history warm-up: {len(seed)} recent bar(s) for {symbol} [{mt5_timeframe_name}]")
+            else:
+                _log(
+                    f"[WARN] MT5 returned no recent bars for {symbol} [{mt5_timeframe_name}]. "
+                    "Open that symbol on a chart in MT5, wait for history to load, then retry."
+                )
     except Exception as exc:
         _log(f"[WARN] History warm-up failed for {symbol}: {exc}")
 
 
-def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, end: datetime):
+def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, end: datetime,
+                 api_lock=None):
     """
     Pulls one chunk of candles using the ALREADY-OPEN mt5 connection
     (passed in, not re-initialized here). Retries on failure instead of
@@ -519,7 +533,8 @@ def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, e
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
+            with _hold_mt5_lock(api_lock):
+                rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
         except Exception as exc:
             last_error = exc
             rates = None
@@ -528,8 +543,9 @@ def fetch_from_mt5(mt5, symbol: str, mt5_timeframe_name: str, start: datetime, e
             if len(rates) == 0 and attempt == 1:
                 # Terminal may not have synced history yet — trigger download once
                 try:
-                    mt5.copy_rates_from(symbol, timeframe_const, _as_utc(end), 500)
-                    rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
+                    with _hold_mt5_lock(api_lock):
+                        mt5.copy_rates_from(symbol, timeframe_const, _as_utc(end), 500)
+                        rates = _copy_rates_range_safe(mt5, symbol, timeframe_const, start, end)
                 except Exception:
                     pass
 
@@ -902,7 +918,8 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
                     output_root: Optional[str] = None,
                     update_existing: bool = False,
                     log=None,
-                    history_warmed: bool = False) -> dict:
+                    history_warmed: bool = False,
+                    api_lock=None) -> dict:
     """
     Fetches + saves one symbol+timeframe across the date range.
 
@@ -916,7 +933,7 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
     QUALITY_SAMPLE_MAX = 8000
 
     if not use_mock and mt5 is not None and not history_warmed:
-        warmup_mt5_history(mt5, symbol, mt5_timeframe_name, log=_log)
+        warmup_mt5_history(mt5, symbol, mt5_timeframe_name, log=_log, api_lock=api_lock)
 
     full_path = full_history_csv_path(symbol, timeframe_label, output_root=output_root)
 
@@ -949,7 +966,7 @@ def fetch_and_save(mt5, symbol: str, timeframe_label: str, mt5_timeframe_name: s
             for sub_start, sub_end in iter_fetch_subchunks(
                 chunk_start, chunk_end, timeframe_label,
             ):
-                part = fetch_from_mt5(mt5, symbol, mt5_timeframe_name, sub_start, sub_end)
+                part = fetch_from_mt5(mt5, symbol, mt5_timeframe_name, sub_start, sub_end, api_lock=api_lock)
                 if part is None:
                     sub_failed = True
                     continue
@@ -1099,6 +1116,7 @@ def run_fetch_job(
     auto_detect_market: bool = True,
     mt5_module=None,
     own_connection: Optional[bool] = None,
+    api_lock=None,
     log=None,
     should_stop=None,
 ) -> dict:
@@ -1115,9 +1133,11 @@ def run_fetch_job(
     Connection safety (critical):
       - Pass mt5_module= from an already-connected Live MT5Broker and set
         own_connection=False so Fetch never initialize()/shutdown() a second
-        terminal and never kills Live.
+        terminal and never kills Live. Pass api_lock=broker.api_lock so Live
+        and Fetch serialize MT5 calls and can run at the same time.
       - Otherwise Fetch opens ONE connection with the same path/login/server
-        as Live Settings and shuts it down when done.
+        as Live Settings and shuts it down when done (safe alongside remote
+        Live workers in other processes).
     """
     _log = log or (lambda msg: print(msg))
     stop = should_stop or (lambda: False)
@@ -1195,7 +1215,7 @@ def run_fetch_job(
                 break
             mt5_symbol = symbol
             if not use_mock:
-                ok, mt5_symbol = verify_symbol(mt5, symbol, log=_log)
+                ok, mt5_symbol = verify_symbol(mt5, symbol, log=_log, api_lock=api_lock)
                 if not ok:
                     _log(f"[SKIP] Symbol '{symbol}' not found on this broker.")
                     continue
@@ -1285,6 +1305,7 @@ def run_fetch_job(
                     update_existing=updating or update_existing,
                     log=_log,
                     history_warmed=history_warmed,
+                    api_lock=api_lock,
                 )
                 history_warmed = True
                 result["market_type"] = sym_market

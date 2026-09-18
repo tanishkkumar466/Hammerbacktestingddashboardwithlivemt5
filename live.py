@@ -15,7 +15,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import polars as pl
 
@@ -112,10 +112,18 @@ class LiveRunConfig:
     ist_time_filter_enabled: bool = False
     ist_time_start: str = "00:00"
     ist_time_end: str = "23:59"
-    # Telegram alerts (single chat — bot token + chat id from @BotFather / @userinfobot)
+    # Telegram alerts (legacy single chat — still supported)
     telegram_enabled: bool = False
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    # Multi-bot Notification Manager snapshot (preferred when non-empty)
+    notification_bots: Optional[List[dict]] = None
+    account_id: str = ""
+    account_name: str = ""
+    # When False, Telegram alerts are skipped for this slot (Notification Manager)
+    notify_enabled: bool = True
+    slot_id: str = ""
+    slot_name: str = ""
 
 
 def reanchor_sl_tp_to_fill(
@@ -425,13 +433,21 @@ class LiveTradingEngine:
         self.last_heartbeat_mono: float = time.monotonic()
         self._poll_ticks: int = 0
         self._last_watch_log_mono: float = 0.0
+        # ticket -> snapshot used for EXIT Telegram alerts when position disappears
+        self._tracked_positions: Dict[int, Dict[str, Any]] = {}
         self._executor: Optional[ThreadPoolExecutor] = None
         self._ray_remote = None
         if live_config.use_thread_pool_signal_cpu:
             self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="live-signal")
         if live_config.use_ray_if_available:
             self._try_init_ray()
-        self._telegram = telegram_notify.TelegramNotifier.from_live_config(live_config, log)
+        bots = getattr(live_config, "notification_bots", None) or []
+        if bots:
+            from notification.manager import NotificationManager
+
+            self._telegram = NotificationManager.from_snapshot(bots, log=log)
+        else:
+            self._telegram = telegram_notify.TelegramNotifier.from_live_config(live_config, log)
 
     def _try_init_ray(self):
         if _is_frozen_build():
@@ -497,6 +513,7 @@ class LiveTradingEngine:
         telegram_enabled: Optional[bool] = None,
         telegram_bot_token: Optional[str] = None,
         telegram_chat_id: Optional[str] = None,
+        notification_bots: Optional[List[dict]] = None,
     ) -> None:
         """Call from the UI thread after parameter changes — no need to Stop/Start live."""
         with self._strategy_lock:
@@ -522,11 +539,29 @@ class LiveTradingEngine:
                 self.live_config.telegram_bot_token = str(telegram_bot_token)
             if telegram_chat_id is not None:
                 self.live_config.telegram_chat_id = str(telegram_chat_id)
-            self._telegram.update(
-                enabled=self.live_config.telegram_enabled,
-                bot_token=self.live_config.telegram_bot_token,
-                chat_id=self.live_config.telegram_chat_id,
-            )
+            if notification_bots is not None:
+                self.live_config.notification_bots = list(notification_bots)
+                from notification.manager import NotificationManager
+
+                self._telegram = NotificationManager.from_snapshot(
+                    self.live_config.notification_bots, log=self.log,
+                )
+            elif self.live_config.notification_bots:
+                # Already on multi-bot Notification Manager — do not inject
+                # legacy-default from stale QSettings token/chat fields.
+                pass
+            elif hasattr(self._telegram, "update"):
+                self._telegram.update(
+                    enabled=self.live_config.telegram_enabled,
+                    bot_token=self.live_config.telegram_bot_token,
+                    chat_id=self.live_config.telegram_chat_id,
+                )
+            elif hasattr(self._telegram, "update_from_legacy_single"):
+                self._telegram.update_from_legacy_single(
+                    enabled=self.live_config.telegram_enabled,
+                    bot_token=self.live_config.telegram_bot_token,
+                    chat_id=self.live_config.telegram_chat_id,
+                )
         extra = ""
         try:
             if hasattr(strategy_config, "lookback_candles"):
@@ -558,18 +593,57 @@ class LiveTradingEngine:
         enabled: bool,
         bot_token: str,
         chat_id: str,
+        notification_bots: Optional[List[dict]] = None,
     ) -> None:
-        """Lightweight Telegram-only refresh — safe from the notifications dialog."""
+        """Lightweight Telegram refresh — safe from the notifications dialog."""
         self.live_config.telegram_enabled = bool(enabled)
         self.live_config.telegram_bot_token = str(bot_token or "")
         self.live_config.telegram_chat_id = str(chat_id or "")
-        self._telegram.update(
-            enabled=self.live_config.telegram_enabled,
-            bot_token=self.live_config.telegram_bot_token,
-            chat_id=self.live_config.telegram_chat_id,
-        )
-        state = "on" if self._telegram.enabled else "off"
-        self.log(f"[TELEGRAM] Alerts {state}.")
+        if notification_bots is not None:
+            self.live_config.notification_bots = list(notification_bots)
+            from notification.manager import NotificationManager
+
+            self._telegram = NotificationManager.from_snapshot(
+                self.live_config.notification_bots, log=self.log,
+            )
+            n = len(self._telegram.list_bots())
+            self.log(f"[TELEGRAM] Notification manager updated ({n} bot(s)).")
+            return
+        # Prefer keeping an existing multi-bot manager over legacy single-chat update
+        try:
+            from notification.manager import NotificationManager as _NM
+            if isinstance(self._telegram, _NM):
+                self.log("[TELEGRAM] Keeping multi-bot manager (legacy fields ignored).")
+                return
+        except Exception:
+            pass
+        if self.live_config.notification_bots:
+            self.log("[TELEGRAM] Keeping multi-bot snapshot (legacy fields ignored).")
+            return
+        if hasattr(self._telegram, "update"):
+            self._telegram.update(
+                enabled=self.live_config.telegram_enabled,
+                bot_token=self.live_config.telegram_bot_token,
+                chat_id=self.live_config.telegram_chat_id,
+            )
+            state = "on" if getattr(self._telegram, "enabled", False) else "off"
+            self.log(f"[TELEGRAM] Alerts {state}.")
+        elif hasattr(self._telegram, "update_from_legacy_single"):
+            self._telegram.update_from_legacy_single(
+                enabled=self.live_config.telegram_enabled,
+                bot_token=self.live_config.telegram_bot_token,
+                chat_id=self.live_config.telegram_chat_id,
+            )
+            self.log("[TELEGRAM] Legacy bot settings applied to manager.")
+
+    def set_notify_enabled(self, enabled: bool) -> None:
+        """Hot-reload per-slot Telegram Alert toggle from Notification Manager."""
+        prev = bool(getattr(self.live_config, "notify_enabled", True))
+        self.live_config.notify_enabled = bool(enabled)
+        if prev != self.live_config.notify_enabled:
+            state = "on" if self.live_config.notify_enabled else "off"
+            label = getattr(self.live_config, "slot_name", "") or "slot"
+            self.log(f"[TELEGRAM] Slot '{label}' alerts {state}.")
 
     def _record_trade_event(
         self,
@@ -581,7 +655,14 @@ class LiveTradingEngine:
         mt5_order_id: Optional[int] = None,
         mt5_message: str = "",
         order_mode: str = "",
+        exit_price: Optional[float] = None,
+        profit: Optional[float] = None,
+        profit_currency: str = "",
+        close_reason: str = "",
     ) -> None:
+        variant = str(getattr(sig, "pattern_variant", "") or "")
+        signal_bar = str(getattr(getattr(sig, "hammer_candle", None), "timestamp", "") or "")
+        entry_bar = str(getattr(getattr(sig, "entry_candle", None), "timestamp", "") or "")
         append_trade_row(
             self._journal_dir,
             {
@@ -590,20 +671,32 @@ class LiveTradingEngine:
                 "symbol": self._active_symbol or self.live_config.symbol,
                 "timeframe": self.live_config.timeframe_label,
                 "pattern": self.pattern_label,
+                "pattern_variant": variant,
                 "direction": sig.direction.value,
                 "volume": volume,
                 "entry_price": round(sig.entry_price, 5),
                 "stop_loss": round(sig.stop_loss, 5),
                 "target": round(sig.target, 5),
                 "risk": round(sig.risk, 5),
+                "rr_multiple": round(float(getattr(sig, "rr_multiple", 0) or 0), 4),
                 "dry_run": "yes" if dry_run else "no",
                 "order_mode": order_mode or self.live_config.order_mode,
+                "magic": self.live_config.magic,
                 "mt5_order_id": mt5_order_id or "",
                 "mt5_message": mt5_message,
-                "signal_bar_time": str(sig.hammer_candle.timestamp),
-                "entry_bar_time": str(sig.entry_candle.timestamp),
+                "signal_bar_time": signal_bar,
+                "entry_bar_time": entry_bar,
+                "exit_price": exit_price if exit_price is not None else "",
+                "profit": profit if profit is not None else "",
+                "close_reason": close_reason,
+                "slot": getattr(self.live_config, "slot_name", "") or "",
             },
         )
+        # Per-slot Notification Manager toggle — journal still records
+        if not bool(getattr(self.live_config, "notify_enabled", True)):
+            if event == "ORDER" and not dry_run:
+                self._refresh_tracked_from_broker(sig, volume=volume)
+            return
         self._telegram.notify_order_event(
             event,
             symbol=self._active_symbol or self.live_config.symbol,
@@ -618,7 +711,172 @@ class LiveTradingEngine:
             order_mode=order_mode or self.live_config.order_mode,
             mt5_order_id=mt5_order_id,
             mt5_message=mt5_message,
+            account_id=getattr(self.live_config, "account_id", "") or "",
+            account_name=getattr(self.live_config, "account_name", "") or "",
+            risk=float(getattr(sig, "risk", 0) or 0),
+            rr_multiple=float(getattr(sig, "rr_multiple", 0) or 0),
+            magic=int(self.live_config.magic),
+            pattern_variant=variant,
+            signal_bar_time=signal_bar,
+            entry_bar_time=entry_bar,
+            exit_price=exit_price,
+            profit=profit,
+            profit_currency=profit_currency,
+            close_reason=close_reason,
         )
+        if event == "ORDER" and not dry_run:
+            self._refresh_tracked_from_broker(sig, volume=volume)
+
+    def _track_open_position(
+        self,
+        sig: logic.TradeSignal,
+        *,
+        volume: float,
+        ticket: int,
+    ) -> None:
+        if not ticket:
+            return
+        self._tracked_positions[int(ticket)] = {
+            "ticket": int(ticket),
+            "symbol": self._active_symbol or self.live_config.symbol,
+            "timeframe": self.live_config.timeframe_label,
+            "pattern": self.pattern_label,
+            "pattern_variant": str(getattr(sig, "pattern_variant", "") or ""),
+            "direction": sig.direction.value,
+            "volume": float(volume),
+            "entry_price": float(sig.entry_price),
+            "stop_loss": float(sig.stop_loss),
+            "target": float(sig.target),
+            "risk": float(getattr(sig, "risk", 0) or 0),
+            "rr_multiple": float(getattr(sig, "rr_multiple", 0) or 0),
+            "magic": int(self.live_config.magic),
+            "signal_bar_time": str(getattr(getattr(sig, "hammer_candle", None), "timestamp", "") or ""),
+            "entry_bar_time": str(getattr(getattr(sig, "entry_candle", None), "timestamp", "") or ""),
+            "dry_run": False,
+        }
+
+    def _refresh_tracked_from_broker(
+        self,
+        sig: Optional[logic.TradeSignal] = None,
+        *,
+        volume: float = 0.0,
+    ) -> None:
+        """Attach strategy snapshot to any open magic tickets (order id ≠ position id)."""
+        cfg = self.live_config
+        if cfg.dry_run:
+            return
+        sym = self._active_symbol or cfg.symbol
+        try:
+            with self._broker_lock:
+                open_rows = self.broker.list_open_positions_for_magic(sym, cfg.magic)
+        except Exception:
+            return
+        for row in open_rows:
+            ticket = int(row.get("ticket") or 0)
+            if not ticket:
+                continue
+            if ticket in self._tracked_positions:
+                continue
+            if sig is not None:
+                self._track_open_position(sig, volume=volume or float(row.get("volume") or 0), ticket=ticket)
+            else:
+                self._tracked_positions[ticket] = {
+                    "ticket": ticket,
+                    "symbol": row.get("symbol") or sym,
+                    "timeframe": cfg.timeframe_label,
+                    "pattern": self.pattern_label,
+                    "pattern_variant": "",
+                    "direction": row.get("direction") or "",
+                    "volume": float(row.get("volume") or 0),
+                    "entry_price": float(row.get("price_open") or 0),
+                    "stop_loss": float(row.get("sl") or 0),
+                    "target": float(row.get("tp") or 0),
+                    "risk": 0.0,
+                    "rr_multiple": 0.0,
+                    "magic": int(cfg.magic),
+                    "signal_bar_time": "",
+                    "entry_bar_time": "",
+                    "dry_run": False,
+                }
+
+    def _sync_tracked_positions_from_broker(self) -> None:
+        """Seed tracker with any already-open magic positions (restart-safe)."""
+        self._refresh_tracked_from_broker(None)
+
+    def _check_position_exits(self) -> None:
+        """EXIT alerts only for real Live positions — never in Dry-run."""
+        cfg = self.live_config
+        # Dry-run never places trades → entry alert only, no close monitoring
+        if cfg.dry_run:
+            return
+        # Pick up limit fills / new tickets before comparing
+        self._refresh_tracked_from_broker(None)
+        if not self._tracked_positions:
+            return
+        sym = self._active_symbol or cfg.symbol
+        try:
+            with self._broker_lock:
+                open_rows = self.broker.list_open_positions_for_magic(sym, cfg.magic)
+        except Exception as e:
+            self.log(f"[WARN] Exit check skipped: {e}")
+            return
+        open_tickets = {int(r["ticket"]) for r in open_rows if r.get("ticket")}
+        closed_tickets = [
+            t for t, snap in self._tracked_positions.items()
+            if snap.get("symbol") == sym and t not in open_tickets
+        ]
+        if not closed_tickets:
+            return
+
+        currency = ""
+        try:
+            with self._broker_lock:
+                info = self.broker.account_info_dict()
+            currency = str(info.get("currency") or "")
+        except Exception:
+            currency = ""
+
+        for ticket in closed_tickets:
+            snap = self._tracked_positions.pop(ticket, None)
+            if not snap:
+                continue
+            deal = None
+            try:
+                with self._broker_lock:
+                    deal = self.broker.lookup_closed_deal_for_position(ticket)
+            except Exception:
+                deal = None
+            exit_price = float(deal["price"]) if deal and deal.get("price") else None
+            profit = float(deal["profit"]) if deal and deal.get("profit") is not None else None
+            reason = str((deal or {}).get("reason") or "Position closed")
+
+            class _ExitSig:
+                direction = type("D", (), {"value": snap.get("direction") or ""})()
+                entry_price = float(snap.get("entry_price") or 0)
+                stop_loss = float(snap.get("stop_loss") or 0)
+                target = float(snap.get("target") or 0)
+                risk = float(snap.get("risk") or 0)
+                rr_multiple = float(snap.get("rr_multiple") or 0)
+                pattern_variant = snap.get("pattern_variant") or ""
+                hammer_candle = type("C", (), {"timestamp": snap.get("signal_bar_time") or ""})()
+                entry_candle = type("C", (), {"timestamp": snap.get("entry_bar_time") or ""})()
+
+            self.log(
+                f"[EXIT] Position #{ticket} closed ({reason})"
+                + (f" P/L={profit:.2f}{(' ' + currency) if currency else ''}" if profit is not None else "")
+            )
+            self._record_trade_event(
+                "EXIT",
+                _ExitSig(),  # type: ignore[arg-type]
+                volume=float(snap.get("volume") or 0),
+                dry_run=False,
+                mt5_order_id=ticket,
+                mt5_message=reason,
+                exit_price=exit_price,
+                profit=profit,
+                profit_currency=currency,
+                close_reason=reason,
+            )
 
     def touch_heartbeat(self):
         self.last_heartbeat_mono = time.monotonic()
@@ -760,6 +1018,7 @@ class LiveTradingEngine:
         self.log(summarize_strategy_params(
             self.strategy_config, cfg.timeframe_label, self.pattern_type,
         ))
+        self._sync_tracked_positions_from_broker()
 
         while not self._stop:
             self.touch_heartbeat()
@@ -986,6 +1245,9 @@ class LiveTradingEngine:
         if not self.broker.is_connected:
             self.log("[WARN] MT5 disconnected — poll skipped. Reconnect and Start live again.")
             return
+        # Exit alerts must run every poll (not only on new bars)
+        self._check_position_exits()
+
         sym = self._active_symbol or cfg.symbol
         closed, forming, err, rate_meta = self._fetch_rates_for_live(
             sym, cfg.timeframe_label, cfg.history_bars,

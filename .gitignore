@@ -54,6 +54,8 @@ env/
 *.key
 credentials.json
 secrets.json
+# Telegram bot tokens / chat ids
+notification/bots.json
 .hammer_github_token
 .github_token
 

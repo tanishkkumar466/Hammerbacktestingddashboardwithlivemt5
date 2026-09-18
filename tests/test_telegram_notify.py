@@ -20,11 +20,21 @@ def test_format_order_alert_order():
         order_mode="market",
         mt5_order_id=12345,
         mt5_message="Order placed #12345",
+        risk=6.2,
+        rr_multiple=1.66,
+        magic=24001,
+        pattern_variant="CLASSIC",
+        account_name="Demo",
+        signal_bar_time="2026-03-18 10:00:00",
     )
-    assert "ORDER PLACED" in text
+    assert "ENTRY — ORDER PLACED" in text
     assert "XAUUSD" in text
     assert "BUY" in text
     assert "12345" in text
+    assert "Hammer (CLASSIC)" in text
+    assert "Magic 24001" in text
+    assert "RR 1:1.66" in text
+    assert "Demo" in text
 
 
 def test_format_order_alert_dry_run():
@@ -42,10 +52,57 @@ def test_format_order_alert_dry_run():
         mt5_message="dry_run",
     )
     assert "DRY RUN" in text
+    assert "[DRY RUN]" in text
     assert "SELL" in text
+    assert "ENTRY SIGNAL — DRY RUN" in text
+    assert "entry conditions only" in text
+    assert "No order sent" in text
 
 
-@patch("telegram_notify.urllib.request.urlopen")
+def test_format_order_alert_live_lane():
+    text = tg.format_order_alert(
+        "ORDER",
+        symbol="XAUUSD",
+        timeframe="1h",
+        pattern="Hammer",
+        direction="BUY",
+        volume=0.01,
+        entry_price=1.0,
+        stop_loss=0.9,
+        target=1.2,
+        dry_run=False,
+        account_name="IC Markets",
+    )
+    assert "[LIVE]" in text
+    assert "IC Markets" in text
+
+
+def test_format_order_alert_exit():
+    text = tg.format_order_alert(
+        "EXIT",
+        symbol="XAUUSD",
+        timeframe="1h",
+        pattern="Hammer",
+        direction="BUY",
+        volume=0.01,
+        entry_price=2650.0,
+        stop_loss=2640.0,
+        target=2670.0,
+        exit_price=2670.0,
+        profit=20.0,
+        profit_currency="USD",
+        close_reason="Take profit",
+        magic=99,
+        mt5_order_id=555,
+    )
+    assert "EXIT — POSITION CLOSED" in text
+    assert "Exit:" in text
+    assert "+20.00 USD" in text
+    assert "Take profit" in text
+    assert "Ticket #555" in text
+
+
+@patch("notification.telegram.urllib.request.urlopen")
 def test_send_message_success(mock_urlopen):
     resp = MagicMock()
     resp.read.return_value = json.dumps({"ok": True, "result": {"message_id": 1}}).encode()
@@ -58,8 +115,8 @@ def test_send_message_success(mock_urlopen):
     assert detail == "sent"
 
 
-@patch("telegram_notify.time.sleep")
-@patch("telegram_notify.urllib.request.urlopen")
+@patch("notification.telegram.time.sleep")
+@patch("notification.telegram.urllib.request.urlopen")
 def test_send_message_retries_then_succeeds(mock_urlopen, mock_sleep):
     fail_resp = MagicMock()
     fail_resp.read.return_value = json.dumps({"ok": False, "description": "temporary"}).encode()

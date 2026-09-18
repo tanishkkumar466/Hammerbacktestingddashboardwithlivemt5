@@ -58,6 +58,8 @@ class LiveSlot:
     enabled: bool = True
     # Saved strategy file under presets/ — empty means use the Parameters panel
     preset_file: str = ""
+    # Telegram: when False, this slot does not send alerts (manager toggle)
+    notify_enabled: bool = True
 
     @staticmethod
     def new(account_id: str, name: str, magic: int) -> "LiveSlot":
@@ -248,6 +250,7 @@ def desk_from_dict(raw: Optional[Dict[str, Any]]) -> LiveDesk:
             volume=str(row.get("volume") or "0.01"),
             enabled=bool(row.get("enabled", True)),
             preset_file=str(row.get("preset_file") or ""),
+            notify_enabled=bool(row.get("notify_enabled", True)),
         ))
     desk.ensure_defaults()
     if desk.slots and not desk.slots[0].account_id and desk.accounts:

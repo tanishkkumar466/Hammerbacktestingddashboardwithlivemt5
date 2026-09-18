@@ -188,6 +188,35 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
                 _stop_all_slots()
             elif cmd == "emergency_close":
                 _on_emergency(msg)
+            elif cmd == "update_telegram":
+                bots = msg.get("notification_bots")
+                enabled = bool(msg.get("enabled", True))
+                token = str(msg.get("bot_token") or "")
+                chat_id = str(msg.get("chat_id") or "")
+                for entry in slots.values():
+                    eng = entry.get("engine")
+                    if eng is None or not hasattr(eng, "update_telegram_settings"):
+                        continue
+                    try:
+                        eng.update_telegram_settings(
+                            enabled=enabled,
+                            bot_token=token,
+                            chat_id=chat_id,
+                            notification_bots=bots,
+                        )
+                    except Exception as exc:
+                        log(f"[TELEGRAM] update failed: {exc}")
+            elif cmd == "set_notify_enabled":
+                sid = str(msg.get("slot_id") or "")
+                entry = slots.get(sid)
+                eng = entry.get("engine") if entry else None
+                if eng is not None and hasattr(eng, "set_notify_enabled"):
+                    try:
+                        eng.set_notify_enabled(bool(msg.get("notify_enabled", True)))
+                    except Exception as exc:
+                        log(f"[TELEGRAM] set_notify_enabled failed: {exc}")
+                elif eng is not None and hasattr(eng, "live_config"):
+                    eng.live_config.notify_enabled = bool(msg.get("notify_enabled", True))
             elif cmd == "ping":
                 emit("pong")
             elif cmd == "shutdown":

@@ -448,6 +448,101 @@ class MT5Broker:
             return 0
         return sum(1 for p in positions if int(p.magic) == int(magic))
 
+    def list_open_positions_for_magic(
+        self, symbol: str, magic: int,
+    ) -> List[Dict[str, Any]]:
+        """Open positions matching symbol+magic (for exit alerts)."""
+        if not self.is_connected:
+            return []
+        ok, _, resolved = self.resolve_and_ensure_symbol(symbol)
+        if not ok:
+            return []
+        with self.api_lock:
+            positions = self._mt5.positions_get(symbol=resolved)
+        if positions is None:
+            return []
+        buy_type = int(getattr(self._mt5, "POSITION_TYPE_BUY", 0))
+        out: List[Dict[str, Any]] = []
+        for p in positions:
+            if int(getattr(p, "magic", 0) or 0) != int(magic):
+                continue
+            pos_type = int(getattr(p, "type", 0) or 0)
+            out.append({
+                "ticket": int(getattr(p, "ticket", 0) or 0),
+                "symbol": str(getattr(p, "symbol", resolved) or resolved),
+                "magic": int(getattr(p, "magic", 0) or 0),
+                "volume": float(getattr(p, "volume", 0) or 0),
+                "price_open": float(getattr(p, "price_open", 0) or 0),
+                "sl": float(getattr(p, "sl", 0) or 0),
+                "tp": float(getattr(p, "tp", 0) or 0),
+                "profit": float(getattr(p, "profit", 0) or 0),
+                "direction": "BUY" if pos_type == buy_type else "SELL",
+            })
+        return out
+
+    def lookup_closed_deal_for_position(
+        self,
+        position_ticket: int,
+        *,
+        lookback_hours: float = 48.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the closing deal for a position ticket via history_deals_get.
+        Returns exit price, profit, and a short reason when available.
+        """
+        if not self.is_connected or not position_ticket:
+            return None
+        mt5 = self._mt5
+        try:
+            from datetime import timedelta
+
+            now = datetime.now()
+            start = now - timedelta(hours=max(1.0, float(lookback_hours)))
+            with self.api_lock:
+                deals = None
+                selected_by_position = False
+                if hasattr(mt5, "history_deals_get"):
+                    try:
+                        deals = mt5.history_deals_get(position=int(position_ticket))
+                        selected_by_position = deals is not None
+                    except TypeError:
+                        deals = None
+                    if deals is None:
+                        mt5.history_select(start, now)
+                        deals = mt5.history_deals_get(start, now)
+            if not deals:
+                return None
+            entry_out = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+            entry_inout = int(getattr(mt5, "DEAL_ENTRY_INOUT", 2))
+            reason_map = {
+                int(getattr(mt5, "DEAL_REASON_SL", -1)): "Stop loss",
+                int(getattr(mt5, "DEAL_REASON_TP", -1)): "Take profit",
+                int(getattr(mt5, "DEAL_REASON_SO", -1)): "Stop out",
+                int(getattr(mt5, "DEAL_REASON_CLIENT", -1)): "Manual / client",
+                int(getattr(mt5, "DEAL_REASON_EXPERT", -1)): "Expert advisor",
+            }
+            best = None
+            for d in deals:
+                pos_id = int(getattr(d, "position_id", 0) or 0)
+                if not selected_by_position and pos_id and pos_id != int(position_ticket):
+                    continue
+                entry = int(getattr(d, "entry", -1))
+                if entry not in (entry_out, entry_inout) and entry != 1:
+                    continue
+                reason_code = int(getattr(d, "reason", -1))
+                best = {
+                    "ticket": int(getattr(d, "ticket", 0) or 0),
+                    "price": float(getattr(d, "price", 0) or 0),
+                    "profit": float(getattr(d, "profit", 0) or 0),
+                    "volume": float(getattr(d, "volume", 0) or 0),
+                    "symbol": str(getattr(d, "symbol", "") or ""),
+                    "reason": reason_map.get(reason_code, "Closed"),
+                    "time": str(getattr(d, "time", "") or ""),
+                }
+            return best
+        except Exception:
+            return None
+
     def close_positions_for_magics(
         self, magics: List[int], deviation: int = 30,
     ) -> Tuple[int, int, str]:

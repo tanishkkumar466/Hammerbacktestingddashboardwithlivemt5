@@ -78,6 +78,72 @@ def test_run_database_schema_migration_and_breakdown():
         sid2, dup2, _ = db.save_run(bt, tables, os.path.join(tmp, "out2"), os.path.join(tmp, "plots2"))
         assert dup2 is True
 
+        # New columns for custom / multi-TF runs
+        cols = {r[1] for r in db._connect().execute("PRAGMA table_info(Strategies_Master)").fetchall()}
+        assert "TimeframeSettingsJson" in cols
+        assert "TfListMode" in cols
+        lookup_tfs = {
+            r[0]
+            for r in db._connect().execute(
+                "SELECT DISTINCT Timeframe FROM Lookup_Lists WHERE Timeframe IS NOT NULL"
+            )
+        }
+        assert "M4" in lookup_tfs
+        assert "4min" in lookup_tfs
+
+
+def test_run_database_saves_custom_timeframe_settings():
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "test_custom_tf.db")
+        db = RunDatabase(db_path)
+
+        ratios = logic.HammerRatioConfig(body_pct=20.0, body_tol=25.0)
+        tfset = {
+            "4m": logic.TimeframeSetting(2.0, 12.0),
+            "12m": logic.TimeframeSetting(2.0, 14.0),
+        }
+        cfg = hc.HammerContextConfig(
+            buy_hammer_ratios=ratios,
+            sell_hammer_ratios=ratios,
+            buy_require_wick=False,
+            sell_require_wick=False,
+            lookback_candles=2,
+            timeframe_settings=tfset,
+        )
+        bt = BacktestConfig(
+            strategy_config=cfg,
+            pattern_type="hammer_with_candles",
+            symbol="XAUUSD",
+            data_root="data",
+            start_date=datetime(2026, 1, 1),
+            allow_overlapping_trades=False,
+            timeframes_to_test=["4min", "12min"],
+            position_sizing_mode=PositionSizingMode.FIXED_RISK_USD,
+            fixed_risk_usd=100.0,
+            starting_capital=10000.0,
+        )
+        # Minimal empty tables — save_run still writes Strategies_Master
+        empty = {
+            "overall": None,
+            "by_session": None,
+            "by_timeframe": None,
+            "by_direction": None,
+            "by_year": None,
+            "by_month": None,
+        }
+        sid, dup, _ = db.save_run(bt, empty, os.path.join(tmp, "out"), os.path.join(tmp, "plots"))
+        assert dup is False
+        row = db._connect().execute(
+            "SELECT Timeframe, TimeframesTested, TfListMode, TimeframeSettingsJson, RiskRewardRatio "
+            "FROM Strategies_Master WHERE StrategyID = ?",
+            (sid,),
+        ).fetchone()
+        assert row[0] == "4m"
+        assert row[1] == "4min,12min"
+        assert row[2] == "custom"
+        assert "4m" in (row[3] or "")
+        assert row[4] == 2.0
+
 
 def test_metrics_from_row_maps_extended_fields():
     row = {

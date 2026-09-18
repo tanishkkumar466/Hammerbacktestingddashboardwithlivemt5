@@ -78,6 +78,7 @@ from PySide6.QtWidgets import (
     QDockWidget, QInputDialog, QPlainTextEdit, QFormLayout,
     QAbstractItemView, QDialogButtonBox, QButtonGroup, QColorDialog, QRadioButton,
     QFileDialog, QTimeEdit, QTextBrowser, QToolButton, QToolTip,
+    QStackedWidget, QSpinBox,
 )
 
 import logic
@@ -98,6 +99,14 @@ from indicators.registry import INDICATOR_REGISTRY, INDICATOR_COMBINE_HELP, INDI
 import live as live_trading
 import telegram_notify
 from telegram_workers import TelegramTestWorker
+from notification.manager import NotificationManager
+from notification.store import (
+    default_bots_path,
+    load_bots,
+    migrate_legacy_single_bot,
+    save_bots,
+    bot_from_dict,
+)
 
 try:
     from shiboken6 import isValid as _qt_widget_valid
@@ -164,6 +173,7 @@ LOGS_DIR = app_logs_dir(APP_DIR)
 LIVE_JOURNAL_DIR = live_journal_dir(APP_DIR)
 # Account desk config stays under output/ so clearing logs does not wipe accounts
 LIVE_DESK_PATH = os.path.join(DEFAULT_OUTPUT_DIR, "live", "live_desk.json")
+NOTIFICATION_BOTS_PATH = default_bots_path(APP_DIR)
 APP_LIVE_LOG_PATH = app_live_log_path(APP_DIR)
 
 LIVE_ORDER_MODES = (
@@ -326,6 +336,9 @@ METRICS_BREAKDOWN_SOURCES = (
     ("by_year", "year"),
     ("by_month", "month"),
 )
+
+# Custom N-minute bars built by resampling on-disk 1min CSVs (Fetch → Convert).
+CUSTOM_TIMEFRAME_MINUTES = [2, 4, 6, 8, 12, 20]
 
 
 class RunDatabase:
@@ -522,6 +535,9 @@ class RunDatabase:
                 "DateRangeStart": "TEXT",
                 "DateRangeEnd": "TEXT",
                 "MarketData": "TEXT",
+                # Custom / multi-TF backtests: full RR-SL map + which list was used
+                "TimeframeSettingsJson": "TEXT",
+                "TfListMode": "TEXT",
             })
             _migrate_table_columns(conn, "Backtest_Results", {
                 col: "REAL" if col not in ("Verdict",) else "TEXT"
@@ -533,6 +549,7 @@ class RunDatabase:
                 )
             })
             self._seed_lookup_lists(conn)
+            self._ensure_custom_timeframe_lookups(conn)
 
     def _seed_lookup_lists(self, conn):
         """Populates Lookup_Lists with the client's own reference values,
@@ -555,6 +572,33 @@ class RunDatabase:
             "INSERT INTO Lookup_Lists VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows
         )
 
+    def _ensure_custom_timeframe_lookups(self, conn):
+        """Add custom N-minute labels (M2, M4, …) into Lookup_Lists.Timeframe."""
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT Timeframe FROM Lookup_Lists WHERE Timeframe IS NOT NULL"
+            ).fetchall()
+        }
+        extras = []
+        for mins in CUSTOM_TIMEFRAME_MINUTES:
+            label = f"M{mins}"
+            if label not in existing:
+                extras.append(
+                    (None, label, None, None, None, None, None, None, None, None, None)
+                )
+        # Also accept folder-style names used by this app (4min, 12min, …)
+        for mins in CUSTOM_TIMEFRAME_MINUTES:
+            folder = f"{mins}min"
+            if folder not in existing:
+                extras.append(
+                    (None, folder, None, None, None, None, None, None, None, None, None)
+                )
+        if extras:
+            conn.executemany(
+                "INSERT INTO Lookup_Lists VALUES (?,?,?,?,?,?,?,?,?,?,?)", extras
+            )
+
     def save_run(self, backtest_config, tables: dict, output_dir: str, plots_dir: str):
         """
         Saves this run unless an identical parameter set (ParamHash) has
@@ -569,10 +613,40 @@ class RunDatabase:
         pattern_type = config_dict.get("pattern_type", "hammer")
         hammer = strategy.get("hammer_ratios") or {}
         doji = strategy.get("doji_ratios") or {}
-        timeframes = config_dict.get("timeframes_to_test") or []
+        timeframes = list(config_dict.get("timeframes_to_test") or [])
         primary_tf = timeframes[0] if timeframes else None
         timeframe_settings = strategy.get("timeframe_settings") or {}
-        primary_tf_settings = timeframe_settings.get(primary_tf) or {}
+        # Folder names (4min) vs strategy keys (4m) — resolve both.
+        primary_logic = primary_tf
+        if primary_tf:
+            try:
+                from candle_resample import logic_label_for_folder
+
+                primary_logic = logic_label_for_folder(str(primary_tf))
+            except Exception:
+                primary_logic = primary_tf
+        raw_primary_settings = (
+            timeframe_settings.get(primary_logic)
+            or timeframe_settings.get(primary_tf)
+            or {}
+        )
+        if hasattr(raw_primary_settings, "rr_multiple"):
+            primary_rr = raw_primary_settings.rr_multiple
+        elif isinstance(raw_primary_settings, dict):
+            primary_rr = raw_primary_settings.get("rr_multiple")
+        else:
+            primary_rr = None
+
+        standard_folders = set(data_fetcher.TIMEFRAMES.keys())
+        tf_list_mode = (
+            "custom"
+            if timeframes and any(str(tf) not in standard_folders for tf in timeframes)
+            else "standard"
+        )
+        try:
+            tf_settings_json = json.dumps(timeframe_settings, sort_keys=True, default=str)
+        except Exception:
+            tf_settings_json = "{}"
 
         symbol = config_dict.get("symbol")
         buffer_mode = str(strategy.get("buffer_mode") or "")
@@ -691,16 +765,17 @@ class RunDatabase:
                         WickSide, BodyTolerance, DominantWickTolerance, SmallWickTolerance,
                         TimeframesTested, PatternType, SlMode, SlFixedDistance, LookbackCandles,
                         AllowOverlappingTrades, FixedRiskUsd, DateRangeStart, DateRangeEnd,
-                        MarketData, CreatedAt
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        MarketData, TimeframeSettingsJson, TfListMode, CreatedAt
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        f"{pattern_label}_{symbol}_{primary_tf}", "Candlestick Pattern", symbol, primary_tf,
+                        f"{pattern_label}_{symbol}_{primary_logic or primary_tf}",
+                        "Candlestick Pattern", symbol, primary_logic or primary_tf,
                         None, None, None, None, None, entry_signal,
                         None, None, None,
                         strategy.get("entry_rule"), None,
                         trade_direction,
                         stop_loss_mode_col, stop_loss_value, "Risk-Reward", None,
-                        primary_tf_settings.get("rr_multiple"),
+                        primary_rr,
                         "No", None, None, None,
                         config_dict.get("position_sizing_mode"), config_dict.get("risk_pct_of_equity"),
                         config_dict.get("position_size"),
@@ -710,8 +785,9 @@ class RunDatabase:
                         body_pct, dominant_wick_pct, small_wick_pct,
                         wick_side, body_tol,
                         dominant_wick_tol, small_wick_tol,
-                        ",".join(timeframes), pattern_type, sl_mode, sl_fixed, lookback,
-                        allow_overlap, fixed_risk, date_start, date_end, market_data, now,
+                        ",".join(str(t) for t in timeframes), pattern_type, sl_mode, sl_fixed, lookback,
+                        allow_overlap, fixed_risk, date_start, date_end, market_data,
+                        tf_settings_json, tf_list_mode, now,
                     ),
                 )
                 strategy_id = cur.lastrowid
@@ -723,7 +799,7 @@ class RunDatabase:
                         OptimizationEnabled, VisualMode, ExecutionDelayMs
                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        strategy_id, symbol, ",".join(timeframes),
+                        strategy_id, symbol, ",".join(str(t) for t in timeframes),
                         str(config_dict.get("start_date") or ""), str(config_dict.get("end_date") or ""),
                         None, None, None,
                         config_dict.get("starting_capital"), None, None,
@@ -1261,6 +1337,28 @@ TIMEFRAME_TO_FOLDER = {
     "1m": "1min",
 }
 
+
+def _folder_for_logic_label(tf: str) -> str:
+    if tf in TIMEFRAME_TO_FOLDER:
+        return TIMEFRAME_TO_FOLDER[tf]
+    try:
+        from candle_resample import folder_for_logic_label
+
+        return folder_for_logic_label(tf)
+    except Exception:
+        return tf
+
+
+def _default_custom_tf_setting(minutes: int) -> logic.TimeframeSetting:
+    m = int(minutes)
+    if m >= 20:
+        return logic.TimeframeSetting(rr_multiple=2.0, max_sl_usd=15)
+    if m >= 10:
+        return logic.TimeframeSetting(rr_multiple=2.0, max_sl_usd=12)
+    if m >= 6:
+        return logic.TimeframeSetting(rr_multiple=2.2, max_sl_usd=10)
+    return logic.TimeframeSetting(rr_multiple=2.4, max_sl_usd=8)
+
 # Real price action gets choppier as the timeframe shortens -- used by
 # PatternContextChart so the illustrative chart on each timeframe tab
 # looks like a distinct, plausible chart instead of an identical shape
@@ -1681,6 +1779,34 @@ QPushButton#previewSideToggle:checked {
     border-color: #188038;
     color: #188038;
     font-weight: bold;
+}
+QPushButton#tfModeToggle {
+    background-color: #FFFFFF;
+    color: #5F6368;
+    border: 1px solid #DADCE0;
+    padding: 8px 22px;
+    font-size: 13px;
+    font-weight: 600;
+}
+QPushButton#tfModeToggle[side="left"] {
+    border-top-left-radius: 18px;
+    border-bottom-left-radius: 18px;
+    border-top-right-radius: 0px;
+    border-bottom-right-radius: 0px;
+    margin-right: -1px;
+}
+QPushButton#tfModeToggle[side="right"] {
+    border-top-right-radius: 18px;
+    border-bottom-right-radius: 18px;
+    border-top-left-radius: 0px;
+    border-bottom-left-radius: 0px;
+}
+QPushButton#tfModeToggle:hover { background-color: #F1F3F4; }
+QPushButton#tfModeToggle:checked {
+    background-color: #188038;
+    border-color: #188038;
+    color: #FFFFFF;
+    font-weight: 700;
 }
 QPushButton#secondaryButton {
     background-color: #FFFFFF; color: #188038; border: 1.5px solid #34A853;
@@ -2707,6 +2833,7 @@ class FetchDataWorker(QThread):
                 auto_detect_market=bool(self._job.get("auto_detect_market", True)),
                 mt5_module=self._job.get("mt5_module"),
                 own_connection=self._job.get("own_connection"),
+                api_lock=self._job.get("api_lock"),
                 log=lambda msg: self.log_line.emit(str(msg)),
                 should_stop=lambda: self._stop,
             )
@@ -2718,6 +2845,33 @@ class FetchDataWorker(QThread):
             self.failed.emit(f"Fetch aborted: {e}")
 
 
+class ConvertCustomTFWorker(QThread):
+    """Resample on-disk 1min CSVs into custom N-minute folders."""
+
+    log_line = Signal(str)
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, job: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self._job = job
+
+    def run(self):
+        try:
+            import candle_resample as cr
+
+            results = cr.convert_1min_to_custom_timeframes(
+                self._job["data_root"],
+                self._job["symbol"],
+                self._job["minutes"],
+                market_type=self._job.get("market_type"),
+                log=lambda msg: self.log_line.emit(str(msg)),
+            )
+            self.finished_ok.emit(results)
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+
 class FetchDataDialog(QDialog):
     """Fetch / update historical CSVs via fetch.py (menu bar → Fetch)."""
 
@@ -2725,29 +2879,37 @@ class FetchDataDialog(QDialog):
         super().__init__(dashboard)
         self._dash = dashboard
         self._worker: Optional[FetchDataWorker] = None
+        self._convert_worker: Optional[ConvertCustomTFWorker] = None
         self.setWindowTitle("Fetch market data")
-        self.setMinimumSize(640, 520)
-        self.resize(720, 580)
+        self.setMinimumSize(560, 480)
+        self.resize(620, 540)
 
         root = QVBoxLayout(self)
-        intro = QLabel(
-            "Pulls candles from the <b>same MT5 terminal as Live</b> "
-            "(Live Settings path / login / server — never a second connection). "
-            "Tip: <b>Live → Connect MT5</b> first, or open the symbol on a chart in MT5 "
-            "so history is loaded. "
-            "<b>Spot</b> and <b>futures</b> are stored separately "
-            "(<code>data/spot/…</code> and <code>data/futures/…</code>). "
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        tip = QLabel(
+            "Same MT5 as Live · works while Live is running · Spot/futures under "
+            "<code>data/spot</code> & <code>data/futures</code>"
+        )
+        tip.setWordWrap(True)
+        tip.setTextFormat(Qt.RichText)
+        tip.setObjectName("sectionHint")
+        tip.setToolTip(
+            "Uses Live Settings path/login/server. If Live is connected in this window, "
+            "Fetch reuses that connection (with a lock) so you do not need to stop Live. "
             "Update mode only downloads newer bars and merges them."
         )
-        intro.setWordWrap(True)
-        intro.setTextFormat(Qt.RichText)
-        intro.setObjectName("sectionHint")
-        root.addWidget(intro)
+        root.addWidget(tip)
 
         form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         path_row = QHBoxLayout()
+        path_row.setSpacing(6)
         self.data_root_edit = QLineEdit(self._detected_data_root())
         browse = QPushButton("Browse…")
         browse.setObjectName("secondaryButton")
@@ -2756,24 +2918,23 @@ class FetchDataDialog(QDialog):
         path_row.addWidget(browse)
         form.addRow("Data folder", path_row)
 
+        sym_market = QHBoxLayout()
+        sym_market.setSpacing(8)
         self.symbol_edit = QLineEdit(self._detected_symbol())
+        self.symbol_edit.setMaximumWidth(140)
         self.symbol_edit.editingFinished.connect(self._on_symbol_or_market_changed)
-        form.addRow("Symbol", self.symbol_edit)
-
+        sym_market.addWidget(self.symbol_edit)
+        self.market_auto = QRadioButton("Auto")
         self.market_spot = QRadioButton("Spot")
         self.market_futures = QRadioButton("Futures")
-        self.market_auto = QRadioButton("Auto-detect (MT5 / name)")
         self.market_auto.setChecked(True)
         self.market_group = QButtonGroup(self)
-        self.market_group.addButton(self.market_spot)
-        self.market_group.addButton(self.market_futures)
-        self.market_group.addButton(self.market_auto)
-        market_row = QHBoxLayout()
-        market_row.addWidget(self.market_auto)
-        market_row.addWidget(self.market_spot)
-        market_row.addWidget(self.market_futures)
-        market_row.addStretch()
-        form.addRow("Market type", market_row)
+        for btn in (self.market_auto, self.market_spot, self.market_futures):
+            self.market_group.addButton(btn)
+            sym_market.addWidget(btn)
+        sym_market.addStretch()
+        form.addRow("Symbol / market", sym_market)
+
         self.market_guess_label = QLabel("")
         self.market_guess_label.setObjectName("sectionHint")
         form.addRow("", self.market_guess_label)
@@ -2782,59 +2943,125 @@ class FetchDataDialog(QDialog):
         self.market_auto.toggled.connect(self._on_symbol_or_market_changed)
 
         self.mt5_conn_label = QLabel("")
-        self.mt5_conn_label.setWordWrap(True)
         self.mt5_conn_label.setObjectName("sectionHint")
         self.mt5_conn_label.setTextFormat(Qt.RichText)
-        form.addRow("MT5 connection", self.mt5_conn_label)
+        form.addRow("MT5", self.mt5_conn_label)
 
-        self.mode_update = QRadioButton("Update existing (recommended)")
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        self.mode_update = QRadioButton("Update existing")
         self.mode_update.setChecked(True)
-        self.mode_update.setToolTip(
-            "Detect the latest bar on disk per timeframe and only fetch newer data."
-        )
-        self.mode_full = QRadioButton("Full re-fetch from start year")
-        self.mode_full.setToolTip("Overwrite monthly files from the start year through today.")
-        mode_box = QVBoxLayout()
-        mode_box.addWidget(self.mode_update)
-        mode_box.addWidget(self.mode_full)
-        form.addRow("Mode", mode_box)
-
+        self.mode_update.setToolTip("Only download bars newer than what is already on disk.")
+        self.mode_full = QRadioButton("Full re-fetch")
+        self.mode_full.setToolTip("Overwrite from start year through today.")
         self.start_year_edit = QLineEdit("2020")
-        self.start_year_edit.setMaximumWidth(80)
-        self.start_year_edit.setToolTip("Used when no local data exists, or for full re-fetch.")
-        form.addRow("Start year", self.start_year_edit)
-
+        self.start_year_edit.setMaximumWidth(64)
+        self.start_year_edit.setToolTip("Start year for full re-fetch / empty folders.")
+        mode_row.addWidget(self.mode_update)
+        mode_row.addWidget(self.mode_full)
+        mode_row.addWidget(QLabel("from"))
+        mode_row.addWidget(self.start_year_edit)
+        mode_row.addStretch()
+        form.addRow("Mode", mode_row)
         root.addLayout(form)
 
-        tf_box = QGroupBox("Timeframes")
-        tf_layout = QHBoxLayout(tf_box)
+        # ---- Standard / Custom timeframe pages ----
+        tf_header = QHBoxLayout()
+        tf_header.setSpacing(6)
+        tf_header.addWidget(QLabel("Timeframes"))
+        self.fetch_tf_standard_btn = QPushButton("Standard")
+        self.fetch_tf_custom_btn = QPushButton("Custom")
+        for btn, side in (
+            (self.fetch_tf_standard_btn, "left"),
+            (self.fetch_tf_custom_btn, "right"),
+        ):
+            btn.setCheckable(True)
+            btn.setObjectName("tfModeToggle")
+            btn.setProperty("side", side)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self.fetch_tf_standard_btn.setChecked(True)
+        self.fetch_tf_standard_btn.clicked.connect(lambda: self._set_fetch_tf_mode("standard"))
+        self.fetch_tf_custom_btn.clicked.connect(lambda: self._set_fetch_tf_mode("custom"))
+        tf_header.addWidget(self.fetch_tf_standard_btn)
+        tf_header.addWidget(self.fetch_tf_custom_btn)
+        tf_header.addStretch()
+        root.addLayout(tf_header)
+
+        self.fetch_tf_stack = QStackedWidget()
+
+        std_page = QWidget()
+        std_layout = QVBoxLayout(std_page)
+        std_layout.setContentsMargins(0, 4, 0, 0)
+        std_layout.setSpacing(4)
+        std_grid = QGridLayout()
+        std_grid.setHorizontalSpacing(12)
+        std_grid.setVerticalSpacing(4)
         self.tf_checks: Dict[str, QCheckBox] = {}
-        for folder in data_fetcher.TIMEFRAMES.keys():
+        for i, folder in enumerate(data_fetcher.TIMEFRAMES.keys()):
             cb = QCheckBox(folder)
             cb.setChecked(True)
             self.tf_checks[folder] = cb
-            tf_layout.addWidget(cb)
-        tf_layout.addStretch()
-        root.addWidget(tf_box)
+            std_grid.addWidget(cb, i // 4, i % 4)
+        std_layout.addLayout(std_grid)
+        self.fetch_tf_stack.addWidget(std_page)
+
+        custom_page = QWidget()
+        custom_layout = QVBoxLayout(custom_page)
+        custom_layout.setContentsMargins(0, 4, 0, 0)
+        custom_layout.setSpacing(6)
+        custom_hint = QLabel("Build N-minute folders from on-disk <b>1min</b> (saved next to existing TFs).")
+        custom_hint.setWordWrap(True)
+        custom_hint.setTextFormat(Qt.RichText)
+        custom_hint.setObjectName("sectionHint")
+        custom_layout.addWidget(custom_hint)
+        custom_grid = QGridLayout()
+        custom_grid.setHorizontalSpacing(12)
+        custom_grid.setVerticalSpacing(4)
+        self.custom_tf_checks: Dict[int, QCheckBox] = {}
+        for i, mins in enumerate(CUSTOM_TIMEFRAME_MINUTES):
+            cb = QCheckBox(f"{mins}min")
+            cb.setChecked(mins in (4, 12))
+            self.custom_tf_checks[mins] = cb
+            custom_grid.addWidget(cb, i // 4, i % 4)
+        custom_layout.addLayout(custom_grid)
+        convert_row = QHBoxLayout()
+        self.convert_btn = QPushButton("Convert from 1min → save folders")
+        self.convert_btn.setObjectName("secondaryButton")
+        self.convert_btn.setToolTip(
+            "Reads existing 1min CSVs and writes e.g. 4min/12min under the same symbol."
+        )
+        self.convert_btn.clicked.connect(self._start_convert_custom)
+        convert_row.addWidget(self.convert_btn)
+        convert_row.addStretch()
+        custom_layout.addLayout(convert_row)
+        self.fetch_tf_stack.addWidget(custom_page)
+        root.addWidget(self.fetch_tf_stack)
 
         detect_row = QHBoxLayout()
+        detect_row.setSpacing(8)
+        detect_btn = QPushButton("Scan")
+        detect_btn.setObjectName("secondaryButton")
+        detect_btn.setFixedWidth(72)
+        detect_btn.clicked.connect(self._refresh_detect_summary)
+        detect_row.addWidget(detect_btn, 0, Qt.AlignTop)
         self.detect_label = QLabel("")
         self.detect_label.setObjectName("sectionHint")
         self.detect_label.setWordWrap(True)
-        detect_btn = QPushButton("Scan data folder")
-        detect_btn.setObjectName("secondaryButton")
-        detect_btn.clicked.connect(self._refresh_detect_summary)
-        detect_row.addWidget(detect_btn)
+        self.detect_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         detect_row.addWidget(self.detect_label, 1)
         root.addLayout(detect_row)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setObjectName("liveLogConsole")
-        self.log_view.setMinimumHeight(180)
+        self.log_view.setMinimumHeight(90)
+        self.log_view.setMaximumHeight(140)
+        self.log_view.setPlaceholderText("Fetch / convert log…")
         root.addWidget(self.log_view, 1)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self.start_btn = QPushButton("Start fetch")
         self.start_btn.setObjectName("primaryButton")
         self.start_btn.clicked.connect(self._start_fetch)
@@ -2842,7 +3069,7 @@ class FetchDataDialog(QDialog):
         self.stop_btn.setObjectName("secondaryButton")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop_fetch)
-        open_folder = QPushButton("Open data folder")
+        open_folder = QPushButton("Open folder")
         open_folder.setObjectName("secondaryButton")
         open_folder.clicked.connect(self._open_data_folder)
         close_btn = QPushButton("Close")
@@ -2855,8 +3082,18 @@ class FetchDataDialog(QDialog):
         btn_row.addWidget(close_btn)
         root.addLayout(btn_row)
 
+        self._set_fetch_tf_mode("standard")
         self._on_symbol_or_market_changed()
         self._refresh_mt5_connection_label()
+
+    def _set_fetch_tf_mode(self, mode: str):
+        custom = mode == "custom"
+        self.fetch_tf_standard_btn.setChecked(not custom)
+        self.fetch_tf_custom_btn.setChecked(custom)
+        self.fetch_tf_stack.setCurrentIndex(1 if custom else 0)
+        self.start_btn.setVisible(not custom)
+        self.stop_btn.setVisible(not custom)
+        self.convert_btn.setVisible(custom)
 
     def _detected_data_root(self) -> str:
         d = self._dash
@@ -2888,17 +3125,10 @@ class FetchDataDialog(QDialog):
         guessed = data_fetcher.classify_market_type(sym)
         selected = self._selected_market_type()
         if selected is None:
-            self.market_guess_label.setText(
-                f"Name guess for <b>{sym}</b>: <b>{guessed.upper()}</b> "
-                f"(MT5 will refine this when connected)."
-            )
+            self.market_guess_label.setText(f"Auto → <b>{guessed}</b> for {sym}")
         else:
-            note = ""
-            if guessed != selected:
-                note = f" — name looks like <b>{guessed}</b>, but will save as <b>{selected}</b>"
-            self.market_guess_label.setText(
-                f"Saving <b>{sym}</b> under <b>{selected.upper()}</b>{note}."
-            )
+            note = f" (name looks like {guessed})" if guessed != selected else ""
+            self.market_guess_label.setText(f"Save as <b>{selected}</b>{note}")
         self.market_guess_label.setTextFormat(Qt.RichText)
         self._refresh_detect_summary()
 
@@ -2927,21 +3157,24 @@ class FetchDataDialog(QDialog):
         self.data_root_edit.setText(root)
         sym = self.symbol_edit.text().strip() or "XAUUSD"
         if not os.path.isdir(root):
-            self.detect_label.setText(f"Folder does not exist yet — will be created: {root}")
+            self.detect_label.setText(f"Will create: {root}")
             return
         inv = data_fetcher.detect_market_inventory(root)
-        bits = [
-            f"spot: {', '.join(inv['spot']) or '—'} | "
-            f"futures: {', '.join(inv['futures']) or '—'} | "
+        lines = [
+            f"spot: {', '.join(inv['spot']) or '—'} · "
+            f"futures: {', '.join(inv['futures']) or '—'} · "
             f"legacy: {', '.join(inv['legacy_spot']) or '—'}"
         ]
         mt = self._selected_market_type() or data_fetcher.classify_market_type(sym)
         write_root = data_fetcher.resolve_write_root(root, sym, mt)
-        for tf in ("1hour", "15min", "1min"):
+        latest_bits = []
+        for tf in ("1hour", "15min", "1min", "4min", "12min"):
             latest = data_fetcher.detect_latest_bar(sym, tf, output_root=write_root)
             if latest is not None:
-                bits.append(f"{mt}/{sym}/{tf} → {latest}")
-        self.detect_label.setText(" · ".join(bits[:6]) + (" …" if len(bits) > 6 else ""))
+                latest_bits.append(f"{tf}→{latest:%Y-%m-%d %H:%M}")
+        if latest_bits:
+            lines.append(f"{mt}/{sym}: " + " · ".join(latest_bits[:5]))
+        self.detect_label.setText("\n".join(lines))
 
     def _append_log(self, line: str):
         self.log_view.appendPlainText(line)
@@ -2952,39 +3185,32 @@ class FetchDataDialog(QDialog):
     def _refresh_mt5_connection_label(self) -> None:
         d = self._dash
         creds = d._live_broker_credentials() if hasattr(d, "_live_broker_credentials") else None
-        path = (creds.terminal_path if creds else "") or "(nearest running MT5)"
+        path = (creds.terminal_path if creds else "") or "nearest MT5"
         login = creds.login if creds else 0
         server = (creds.server if creds else "") or "—"
         broker = getattr(d, "mt5_broker", None)
+        live_on = hasattr(d, "_live_worker_running") and d._live_worker_running()
         if broker is not None and broker.is_connected:
             info = broker.account_info_dict()
+            share = " · shares with Live (no stop needed)" if live_on else ""
             self.mt5_conn_label.setText(
-                f"<b>Reusing Live connection</b> — account {info.get('login', '?')} "
-                f"@ {info.get('server', '?')}<br>"
-                f"Terminal setting: {path} · will <b>not</b> shut down after fetch"
+                f"<b>Live connected</b> · {info.get('login', '?')} @ "
+                f"{info.get('server', '?')}{share}"
+            )
+        elif live_on:
+            self.mt5_conn_label.setText(
+                "<b>Live running</b> (worker) · Fetch opens its own attach — Live keeps trading"
             )
         else:
-            login_txt = str(login) if login else "(already logged in)"
+            login_txt = str(login) if login else "already logged in"
             self.mt5_conn_label.setText(
-                f"Will connect with <b>Live Settings</b> "
-                f"(same as Connect MT5)<br>"
-                f"Terminal: {path} · Login: {login_txt} · Server: {server}"
+                f"Live Settings · login {login_txt} · {server} · {path}"
             )
 
     def _start_fetch(self):
         if self._worker is not None and self._worker.isRunning():
             return
         d = self._dash
-        # Never fight Live for the process-global MetaTrader5 connection
-        if hasattr(d, "_live_worker_running") and d._live_worker_running():
-            QMessageBox.warning(
-                self,
-                "Live is running",
-                "Stop live trading before fetching history.\n\n"
-                "MT5 allows only one Python connection — Fetch and Live must "
-                "not compete for the same terminal.",
-            )
-            return
 
         root = self.data_root_edit.text().strip() or DEFAULT_DATA_DIR
         root = backtest.resolve_data_root(root, anchor_dir=APP_DIR)
@@ -3005,12 +3231,24 @@ class FetchDataDialog(QDialog):
         market = self._selected_market_type()
         creds = d._live_broker_credentials()
 
+        # Prefer the Live MT5 connection when available so Fetch never
+        # initialize()/shutdown() a second terminal while Live is trading.
         shared_mt5 = None
         own_connection = True
+        api_lock = None
         broker = getattr(d, "mt5_broker", None)
         if broker is not None and broker.is_connected and broker.raw_mt5 is not None:
             shared_mt5 = broker.raw_mt5
             own_connection = False
+            api_lock = getattr(broker, "api_lock", None)
+        elif hasattr(d, "_live_worker_running") and d._live_worker_running():
+            # Live may be in a dedicated worker process (separate MT5 attach).
+            # Opening our own connection in this process is fine; we still
+            # never shut down anything Live owns.
+            self._append_log(
+                "[INFO] Live is running in a worker process — Fetch will open "
+                "its own MT5 attach in this window (will not stop Live)."
+            )
 
         job = {
             "output_root": root,
@@ -3027,11 +3265,16 @@ class FetchDataDialog(QDialog):
             "auto_detect_market": True,
             "mt5_module": shared_mt5,
             "own_connection": own_connection,
+            "api_lock": api_lock,
         }
         self.log_view.clear()
         mt_label = market or "auto-detect"
+        live_on = hasattr(d, "_live_worker_running") and d._live_worker_running()
         if shared_mt5 is not None:
-            self._append_log(f"Starting fetch ({mt_label}) via shared Live MT5 connection…")
+            note = " (Live stays running)" if live_on else ""
+            self._append_log(
+                f"Starting fetch ({mt_label}) via shared Live MT5 connection{note}…"
+            )
         else:
             self._append_log(
                 f"Starting fetch ({mt_label}) using Live Settings credentials "
@@ -3039,6 +3282,8 @@ class FetchDataDialog(QDialog):
             )
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        if hasattr(self, "convert_btn"):
+            self.convert_btn.setEnabled(False)
         self._worker = FetchDataWorker(job, self)
         self._worker.log_line.connect(self._append_log)
         self._worker.finished_ok.connect(self._on_fetch_ok)
@@ -3100,98 +3345,532 @@ class FetchDataDialog(QDialog):
     def _on_fetch_thread_finished(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.convert_btn.setEnabled(True)
         self._worker = None
+
+    def _start_convert_custom(self):
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.warning(self, "Busy", "Wait for the current fetch to finish.")
+            return
+        if self._convert_worker is not None and self._convert_worker.isRunning():
+            return
+        mins = [m for m, cb in self.custom_tf_checks.items() if cb.isChecked()]
+        if not mins:
+            QMessageBox.warning(self, "Convert", "Select at least one custom timeframe.")
+            return
+        root = self.data_root_edit.text().strip() or DEFAULT_DATA_DIR
+        root = backtest.resolve_data_root(root, anchor_dir=APP_DIR)
+        if os.path.basename(root).lower() in data_fetcher.MARKET_TYPES:
+            root = os.path.dirname(root) or root
+        symbol = self.symbol_edit.text().strip() or "XAUUSD"
+        market = self._selected_market_type()
+        job = {
+            "data_root": root,
+            "symbol": symbol,
+            "minutes": mins,
+            "market_type": market,
+        }
+        self._append_log(
+            f"Converting 1min → {[f'{m}min' for m in mins]} for {symbol}…"
+        )
+        self.convert_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self._convert_worker = ConvertCustomTFWorker(job, self)
+        self._convert_worker.log_line.connect(self._append_log)
+        self._convert_worker.finished_ok.connect(self._on_convert_ok)
+        self._convert_worker.failed.connect(self._on_convert_failed)
+        self._convert_worker.finished.connect(self._on_convert_thread_finished)
+        self._convert_worker.start()
+
+    def _on_convert_ok(self, results: dict):
+        parts = [f"{folder}: {count} bars" for folder, count in sorted(results.items())]
+        summary = ", ".join(parts) if parts else "(nothing written)"
+        self._append_log(f"Convert finished — {summary}")
+        self._refresh_detect_summary()
+        QMessageBox.information(
+            self,
+            "Custom timeframes ready",
+            "Wrote custom folders from 1min data:\n\n"
+            + "\n".join(parts or ["(no bars)"])
+            + "\n\nUse Backtest Parameters → Timeframes → Custom to include them.",
+        )
+
+    def _on_convert_failed(self, detail: str):
+        self._append_log(detail)
+        QMessageBox.critical(
+            self,
+            "Convert failed",
+            "Could not build custom timeframes from 1min data.\n\n"
+            "Fetch 1min first, then try again.\n\n"
+            f"{detail[:800]}",
+        )
+
+    def _on_convert_thread_finished(self):
+        self.convert_btn.setEnabled(True)
+        self.start_btn.setEnabled(True)
+        self._convert_worker = None
 
     def closeEvent(self, event):
         if self._worker is not None and self._worker.isRunning():
             self._worker.request_stop()
             self._worker.wait(3000)
+        if self._convert_worker is not None and self._convert_worker.isRunning():
+            self._convert_worker.wait(3000)
         super().closeEvent(event)
 
 
 class LiveNotificationsDialog(QDialog):
-    """Telegram alerts — opened from menu bar Notifications."""
+    """
+    Full Notification Manager:
+      1) Connect Telegram (token + Live / Dry-run chats)
+      2) Enable alerts per running strategy slot (full details)
+      3) Recent alert log
+    """
 
     def __init__(self, dashboard: "BacktestDashboard"):
         super().__init__(dashboard)
         self._dash = dashboard
-        self.setWindowTitle("Telegram notifications")
-        self.setMinimumSize(500, 340)
-        self.resize(540, 380)
+        self.setWindowTitle("Notification Manager")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(720, 720)
+        self.resize(1080, 1080)
+        # Keep room to shrink on smaller screens; user can drag the corner
+        self.setMaximumSize(1600, 1400)
 
-        d = dashboard
+        from notification.manager import MODE_DRY_RUN, MODE_LIVE
+        from notification.store import bot_to_dict
+        import uuid
+
+        self._MODE_LIVE = MODE_LIVE
+        self._MODE_DRY = MODE_DRY_RUN
+        self._live_id = uuid.uuid4().hex[:10]
+        self._dry_id = uuid.uuid4().hex[:10]
+
         root = QVBoxLayout(self)
-        intro = QLabel(
-            "Get a Telegram message when the bot places an order, runs dry run, "
-            "fails an order, or hits a safety block. Retries automatically if Telegram is slow."
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(12)
+
+        tip = QLabel(
+            "Connect Telegram, then toggle <b>Alert</b> on each slot. "
+            "All accounts / slots listed (running first)."
         )
-        intro.setWordWrap(True)
-        intro.setObjectName("sectionHint")
-        root.addWidget(intro)
-
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        widgets = d._live_notifications_field_widgets()
-        for w in widgets:
-            w.blockSignals(True)
-        try:
-            d.live_telegram_enabled.setText("Send Telegram alerts for all order events")
-            form.addRow(d.live_telegram_enabled)
-            form.addRow("Bot token", d.live_telegram_token)
-            form.addRow("Chat ID", d.live_telegram_chat_id)
-        finally:
-            for w in widgets:
-                w.blockSignals(False)
-
-        if not hasattr(d, "live_telegram_status"):
-            d.live_telegram_status = QLabel("Off")
-        d.live_telegram_status.setObjectName("liveNotifyStatus")
-        d._refresh_live_telegram_status()
-        root.addWidget(d.live_telegram_status)
-
-        self._test_btn = QPushButton("Send test notification")
-        self._test_btn.setObjectName("secondaryButton")
-        self._test_btn.setToolTip("Verify bot token and chat id (with retries).")
-        self._test_btn.clicked.connect(self._on_test_clicked)
-        root.addWidget(self._test_btn)
-
-        hint = QLabel(
-            "Create a bot with <b>@BotFather</b>, paste the token, then message your bot once. "
-            "Get your numeric chat id from <b>@userinfobot</b>."
+        tip.setWordWrap(True)
+        tip.setTextFormat(Qt.RichText)
+        tip.setObjectName("sectionHint")
+        tip.setToolTip(
+            "Token from @BotFather. Chat id from @userinfobot "
+            "(message your bot once first)."
         )
-        hint.setWordWrap(True)
-        hint.setTextFormat(Qt.RichText)
-        hint.setObjectName("sectionHint")
-        root.addWidget(hint)
-        root.addStretch()
+        root.addWidget(tip)
+
+        # ---- 1. Connection ----
+        token_box = QGroupBox("1. Telegram")
+        token_box.setObjectName("fieldGroup")
+        token_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        form = QFormLayout(token_box)
+        form.setContentsMargins(14, 12, 14, 12)
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        def _action_btn(label: str) -> QPushButton:
+            btn = QPushButton(label)
+            btn.setObjectName("secondaryButton")
+            btn.setMinimumWidth(100)
+            btn.setMinimumHeight(36)
+            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            return btn
+
+        token_row = QWidget()
+        token_h = QHBoxLayout(token_row)
+        token_h.setContentsMargins(0, 0, 0, 0)
+        token_h.setSpacing(10)
+        self.shared_token = QLineEdit()
+        self.shared_token.setEchoMode(QLineEdit.Password)
+        self.shared_token.setPlaceholderText("Bot token from @BotFather")
+        self.shared_token.setMinimumHeight(36)
+        token_h.addWidget(self.shared_token, 1)
+        self._show_token_btn = _action_btn("Show")
+        self._show_token_btn.setCheckable(True)
+        self._show_token_btn.toggled.connect(self._on_show_token_toggled)
+        token_h.addWidget(self._show_token_btn)
+        form.addRow("Token", token_row)
+
+        live_row = QWidget()
+        live_h = QHBoxLayout(live_row)
+        live_h.setContentsMargins(0, 0, 0, 0)
+        live_h.setSpacing(10)
+        self.live_enabled = QCheckBox("On")
+        self.live_enabled.setChecked(True)
+        live_h.addWidget(self.live_enabled)
+        self.live_chat = QLineEdit()
+        self.live_chat.setPlaceholderText("Live chat id")
+        self.live_chat.setMinimumHeight(36)
+        self.live_chat.textChanged.connect(self._sync_same_chat_if_needed)
+        live_h.addWidget(self.live_chat, 1)
+        live_test = _action_btn("Test Live")
+        live_test.clicked.connect(lambda: self._test_channel("live"))
+        live_h.addWidget(live_test)
+        form.addRow("Live", live_row)
+
+        dry_row = QWidget()
+        dry_h = QHBoxLayout(dry_row)
+        dry_h.setContentsMargins(0, 0, 0, 0)
+        dry_h.setSpacing(10)
+        self.dry_enabled = QCheckBox("On")
+        self.dry_enabled.setChecked(True)
+        dry_h.addWidget(self.dry_enabled)
+        self.dry_chat = QLineEdit()
+        self.dry_chat.setPlaceholderText("Dry-run chat id (entry only)")
+        self.dry_chat.setMinimumHeight(36)
+        dry_h.addWidget(self.dry_chat, 1)
+        dry_test = _action_btn("Test Dry")
+        dry_test.clicked.connect(lambda: self._test_channel("dry"))
+        dry_h.addWidget(dry_test)
+        form.addRow("Dry-run", dry_row)
+
+        self.same_chat_cb = QCheckBox("Same chat for both (testing)")
+        self.same_chat_cb.toggled.connect(self._on_same_chat_toggled)
+        form.addRow("", self.same_chat_cb)
+        root.addWidget(token_box)
+
+        # ---- 2. All slots ----
+        strat_box = QGroupBox("2. All slots — Alert on/off")
+        strat_box.setObjectName("fieldGroup")
+        strat_layout = QVBoxLayout(strat_box)
+        strat_layout.setContentsMargins(12, 10, 12, 10)
+        strat_layout.setSpacing(8)
+
+        head = QHBoxLayout()
+        self.slot_count_label = QLabel("")
+        self.slot_count_label.setObjectName("sectionHint")
+        head.addWidget(self.slot_count_label, 1)
+        refresh_s = _action_btn("Refresh")
+        refresh_s.clicked.connect(self._reload_strategies)
+        head.addWidget(refresh_s)
+        strat_layout.addLayout(head)
+
+        self.strategy_table = QTableWidget(0, 8)
+        self.strategy_table.setHorizontalHeaderLabels(
+            ["Alert", "Account", "Slot", "Symbol", "TF", "Preset", "Magic", "Status"]
+        )
+        self.strategy_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.strategy_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.strategy_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.strategy_table.verticalHeader().setVisible(False)
+        hdr = self.strategy_table.horizontalHeader()
+        hdr.setStretchLastSection(True)
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setMinimumSectionSize(70)
+        self.strategy_table.setAlternatingRowColors(True)
+        self.strategy_table.setMinimumHeight(320)
+        self.strategy_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        strat_layout.addWidget(self.strategy_table, 1)
+
+        strat_btns = QHBoxLayout()
+        all_on = _action_btn("All on")
+        all_on.clicked.connect(lambda: self._set_all_alerts(True))
+        all_off = _action_btn("All off")
+        all_off.clicked.connect(lambda: self._set_all_alerts(False))
+        strat_btns.addWidget(all_on)
+        strat_btns.addWidget(all_off)
+        strat_btns.addStretch()
+        strat_layout.addLayout(strat_btns)
+        root.addWidget(strat_box, 1)
+
+        # ---- 3. Recent ----
+        recent_box = QGroupBox("3. Recent alerts")
+        recent_box.setObjectName("fieldGroup")
+        recent_layout = QVBoxLayout(recent_box)
+        recent_layout.setContentsMargins(12, 10, 12, 10)
+        filter_row = QHBoxLayout()
+        self.event_filter = QComboBox()
+        self.event_filter.addItem("All", "all")
+        self.event_filter.addItem("Live", MODE_LIVE)
+        self.event_filter.addItem("Dry-run", MODE_DRY_RUN)
+        self.event_filter.setMinimumWidth(140)
+        self.event_filter.currentIndexChanged.connect(self._reload_events)
+        filter_row.addWidget(QLabel("Show"))
+        filter_row.addWidget(self.event_filter)
+        filter_row.addStretch()
+        recent_layout.addLayout(filter_row)
+        self.events_list = QPlainTextEdit()
+        self.events_list.setReadOnly(True)
+        self.events_list.setMinimumHeight(160)
+        self.events_list.setPlaceholderText("Alerts appear here after trades.")
+        recent_layout.addWidget(self.events_list)
+        root.addWidget(recent_box)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        save_btn = buttons.button(QDialogButtonBox.Save)
+        save_btn.setText("Save & close")
+        save_btn.setMinimumWidth(120)
+        save_btn.setMinimumHeight(40)
+        cancel_btn = buttons.button(QDialogButtonBox.Cancel)
+        cancel_btn.setMinimumWidth(100)
+        cancel_btn.setMinimumHeight(40)
         buttons.accepted.connect(self._on_save)
-        buttons.rejected.connect(self._on_cancel)
+        buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    def _on_test_clicked(self):
-        self._dash._test_telegram_notification(test_button=self._test_btn)
+        bots = [bot_to_dict(b) for b in self._dash._notification_manager.list_bots()]
+        self._load_from_bots(bots)
+        self._reload_strategies()
+        self._reload_events()
+        self._test_btn = live_test
 
-    def _release_widgets(self):
-        self._dash._stash_live_notifications_widgets()
+    def _on_show_token_toggled(self, checked: bool):
+        self.shared_token.setEchoMode(
+            QLineEdit.Normal if checked else QLineEdit.Password
+        )
+        self._show_token_btn.setText("Hide" if checked else "Show")
 
-    def _on_cancel(self):
-        self._dash._cancel_telegram_test_worker()
-        self._release_widgets()
-        self.reject()
+    def _on_same_chat_toggled(self, checked: bool):
+        if checked:
+            self.dry_chat.setText(self.live_chat.text())
+            self.dry_chat.setEnabled(False)
+        else:
+            self.dry_chat.setEnabled(True)
+
+    def _sync_same_chat_if_needed(self, _text: str = ""):
+        if self.same_chat_cb.isChecked():
+            self.dry_chat.setText(self.live_chat.text())
+
+    def _find_bot(self, bots: list, mode: str) -> Optional[dict]:
+        exact = next((b for b in bots if b.get("mode") == mode and b.get("enabled", True)), None)
+        if exact:
+            return exact
+        both = next((b for b in bots if b.get("mode") == "both"), None)
+        return both
+
+    def _load_from_bots(self, bots: list):
+        live = self._find_bot(bots, self._MODE_LIVE)
+        dry = self._find_bot(bots, self._MODE_DRY)
+        token = ""
+        if live:
+            token = str(live.get("bot_token") or "")
+            self._live_id = str(live.get("id") or self._live_id)
+        if dry and not token:
+            token = str(dry.get("bot_token") or "")
+        if not token and bots:
+            token = str(bots[0].get("bot_token") or "")
+        self.shared_token.setText(token)
+
+        if live:
+            self.live_enabled.setChecked(bool(live.get("enabled", True)))
+            self.live_chat.setText(str(live.get("chat_id") or ""))
+        elif bots and str(bots[0].get("mode")) == "both":
+            self.live_enabled.setChecked(bool(bots[0].get("enabled", True)))
+            self.live_chat.setText(str(bots[0].get("chat_id") or ""))
+
+        if dry:
+            self._dry_id = str(dry.get("id") or self._dry_id)
+            self.dry_enabled.setChecked(bool(dry.get("enabled", True)))
+            self.dry_chat.setText(str(dry.get("chat_id") or ""))
+        elif bots and str(bots[0].get("mode")) == "both":
+            self.dry_enabled.setChecked(bool(bots[0].get("enabled", True)))
+            self.dry_chat.setText(str(bots[0].get("chat_id") or ""))
+
+        if (
+            self.live_chat.text().strip()
+            and self.live_chat.text().strip() == self.dry_chat.text().strip()
+        ):
+            self.same_chat_cb.setChecked(True)
+
+    def _reload_strategies(self):
+        """List every slot on every account — running slots first."""
+        desk = self._dash._live_desk
+        desk.ensure_defaults()
+        workers = getattr(self._dash, "_live_workers", {}) or {}
+        table = self.strategy_table
+        table.setRowCount(0)
+
+        slots = list(desk.slots)
+        slots.sort(
+            key=lambda s: (
+                0 if s.id in workers else 1,
+                (desk.account_by_id(s.account_id).name if desk.account_by_id(s.account_id) else ""),
+                s.name or "",
+                s.timeframe or "",
+            )
+        )
+        running_n = sum(1 for s in slots if s.id in workers)
+        if hasattr(self, "slot_count_label"):
+            self.slot_count_label.setText(
+                f"{len(slots)} slot(s) · {running_n} running · "
+                f"{len(desk.accounts)} account(s)"
+            )
+
+        for slot in slots:
+            acc = desk.account_by_id(slot.account_id)
+            row = table.rowCount()
+            table.insertRow(row)
+
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            chk.setCheckState(Qt.Checked if getattr(slot, "notify_enabled", True) else Qt.Unchecked)
+            chk.setData(Qt.UserRole, slot.id)
+            chk.setToolTip("Send Telegram alerts for this slot")
+            table.setItem(row, 0, chk)
+
+            running = slot.id in workers
+            status = "RUNNING" if running else "stopped"
+            preset = self._dash._preset_display_name(slot.preset_file) or "Parameters"
+            values = [
+                acc.name if acc else (slot.account_id or "?"),
+                slot.name,
+                slot.symbol,
+                slot.timeframe,
+                preset,
+                str(slot.magic),
+                status,
+            ]
+            for col, text in enumerate(values, start=1):
+                item = QTableWidgetItem(str(text))
+                item.setData(Qt.UserRole, slot.id)
+                if running and col == 7:
+                    item.setForeground(Qt.darkGreen)
+                table.setItem(row, col, item)
+            table.setRowHeight(row, 24)
+        table.resizeColumnsToContents()
+
+    def _set_all_alerts(self, enabled: bool):
+        state = Qt.Checked if enabled else Qt.Unchecked
+        for row in range(self.strategy_table.rowCount()):
+            item = self.strategy_table.item(row, 0)
+            if item is not None:
+                item.setCheckState(state)
+
+    def _apply_strategy_alerts_to_desk(self) -> int:
+        """Write Alert checkboxes back onto LiveSlot.notify_enabled. Returns enabled count."""
+        desk = self._dash._live_desk
+        on_count = 0
+        for row in range(self.strategy_table.rowCount()):
+            item = self.strategy_table.item(row, 0)
+            if item is None:
+                continue
+            sid = item.data(Qt.UserRole)
+            slot = desk.slot_by_id(str(sid)) if sid else None
+            if slot is None:
+                continue
+            on = item.checkState() == Qt.Checked
+            slot.notify_enabled = on
+            if on:
+                on_count += 1
+        return on_count
+
+    def _build_bots_draft(self) -> list:
+        import uuid
+        from notification.manager import NotificationBot
+        from notification.store import bot_to_dict
+
+        token = self.shared_token.text().strip()
+        live_chat = self.live_chat.text().strip()
+        dry_chat = self.dry_chat.text().strip()
+        if self.same_chat_cb.isChecked():
+            dry_chat = live_chat
+
+        rows = []
+        if self.live_enabled.isChecked() and token and live_chat:
+            rows.append(bot_to_dict(NotificationBot(
+                id=self._live_id or uuid.uuid4().hex[:10],
+                name="Live trades",
+                bot_token=token,
+                chat_id=live_chat,
+                enabled=True,
+                mode=self._MODE_LIVE,
+            )))
+        if self.dry_enabled.isChecked() and token and dry_chat:
+            rows.append(bot_to_dict(NotificationBot(
+                id=self._dry_id or uuid.uuid4().hex[:10],
+                name="Dry-run / paper",
+                bot_token=token,
+                chat_id=dry_chat,
+                enabled=True,
+                mode=self._MODE_DRY,
+            )))
+        return rows
+
+    def _test_channel(self, which: str):
+        token = self.shared_token.text().strip()
+        chat = (
+            self.live_chat.text().strip()
+            if which == "live"
+            else (
+                self.live_chat.text().strip()
+                if self.same_chat_cb.isChecked()
+                else self.dry_chat.text().strip()
+            )
+        )
+        if not token or not chat:
+            QMessageBox.warning(
+                self,
+                "Telegram",
+                "Enter the bot token and this channel’s chat id first.",
+            )
+            return
+        label = "LIVE" if which == "live" else "DRY RUN"
+        self._dash._test_telegram_notification_to(
+            token,
+            chat,
+            text=(
+                f"Hammer — {label} channel test\n"
+                "If you see this, alerts for this lane are connected."
+            ),
+            test_button=self._test_btn,
+        )
+
+    def _reload_events(self):
+        mode = self.event_filter.currentData()
+        events = self._dash._notification_manager.list_events(
+            mode=None if mode == "all" else mode,
+            limit=50,
+        )
+        if not events:
+            self.events_list.setPlainText("")
+            return
+        lines = []
+        for ev in events:
+            lane = "DRY" if ev.mode == self._MODE_DRY else "LIVE"
+            acc = ev.account_name or ev.account_id or "-"
+            lines.append(
+                f"{ev.ts}  [{lane}]  {ev.event}  {ev.symbol} {ev.timeframe}  "
+                f"{ev.direction}  · {acc}  → {ev.bot_name}"
+                + (f"  ({ev.detail})" if ev.detail else "")
+            )
+        self.events_list.setPlainText("\n".join(lines))
 
     def _on_save(self):
-        self._dash._save_telegram_settings()
+        token = self.shared_token.text().strip()
+        if (self.live_enabled.isChecked() or self.dry_enabled.isChecked()) and not token:
+            QMessageBox.warning(self, "Telegram", "Paste a bot token before saving.")
+            return
+        if self.live_enabled.isChecked() and not self.live_chat.text().strip():
+            QMessageBox.warning(self, "Telegram", "Enter a Live chat id (or turn Live alerts off).")
+            return
+        if self.dry_enabled.isChecked() and not (
+            self.dry_chat.text().strip() or self.same_chat_cb.isChecked()
+        ):
+            QMessageBox.warning(self, "Telegram", "Enter a Dry-run chat id (or turn Dry-run alerts off).")
+            return
+
+        on_count = self._apply_strategy_alerts_to_desk()
+        self._dash._save_live_desk()
+        rows = self._build_bots_draft()
+        self._dash._save_notification_bots(rows)
         self._dash._apply_live_telegram_settings()
         self._dash._refresh_live_telegram_status()
-        self._dash._live_log("Telegram notification settings saved.")
-        self._release_widgets()
+        self._dash._refresh_live_desk_tables()
+        self._dash._live_log(
+            f"Notification Manager saved "
+            f"(Live={'on' if self.live_enabled.isChecked() else 'off'}, "
+            f"Dry-run={'on' if self.dry_enabled.isChecked() else 'off'}, "
+            f"slot alerts={on_count}/{self.strategy_table.rowCount()})."
+        )
         self.accept()
 
     def closeEvent(self, event):
         self._dash._cancel_telegram_test_worker()
-        self._release_widgets()
         super().closeEvent(event)
 
 
@@ -3502,8 +4181,9 @@ class LiveManagerDialog(QDialog):
         super().__init__(dashboard)
         self._dash = dashboard
         self.setWindowTitle("Live manager")
-        self.setMinimumSize(820, 520)
-        self.resize(900, 580)
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(720, 720)
+        self.resize(900, 900)
         # Independent tool window — never modal, never blocks live/backtest
         self.setModal(False)
         self.setWindowModality(Qt.NonModal)
@@ -3532,7 +4212,9 @@ class LiveManagerDialog(QDialog):
         self.acc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.acc_table.verticalHeader().setVisible(False)
         self.acc_table.horizontalHeader().setStretchLastSection(True)
-        self.acc_table.setMaximumHeight(160)
+        self.acc_table.setMinimumHeight(180)
+        self.acc_table.setMaximumHeight(280)
+        self.acc_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.acc_table.itemSelectionChanged.connect(self._on_account_selected)
         self.acc_table.cellDoubleClicked.connect(lambda *_: self._edit_account())
         acc_layout.addWidget(self.acc_table)
@@ -3567,17 +4249,19 @@ class LiveManagerDialog(QDialog):
         self.filter_this_account.setChecked(True)
         self.filter_this_account.toggled.connect(self.refresh)
         slot_layout.addWidget(self.filter_this_account)
-        self.slot_table = QTableWidget(0, 8)
+        self.slot_table = QTableWidget(0, 9)
         self.slot_table.setHorizontalHeaderLabels(
-            ["Account", "Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
+            ["Alert", "Account", "Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
         )
         self.slot_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.slot_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.slot_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.slot_table.verticalHeader().setVisible(False)
         self.slot_table.horizontalHeader().setStretchLastSection(True)
+        self.slot_table.setMinimumHeight(280)
+        self.slot_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.slot_table.cellDoubleClicked.connect(lambda *_: self._edit_slot())
-        slot_layout.addWidget(self.slot_table)
+        slot_layout.addWidget(self.slot_table, 1)
         slot_btns = QHBoxLayout()
         add_s = QPushButton("Add slot")
         add_s.setObjectName("secondaryButton")
@@ -3699,6 +4383,7 @@ class LiveManagerDialog(QDialog):
             self.slot_table.insertRow(row)
             status = "RUNNING" if slot.id in dash._live_workers else "stopped"
             values = [
+                "On" if getattr(slot, "notify_enabled", True) else "Off",
                 names.get(slot.account_id, slot.account_id),
                 slot.name,
                 slot.symbol,
@@ -4039,6 +4724,9 @@ class BacktestDashboard(QMainWindow):
         self.field_labels: Dict[str, QLabel] = {}
         self.timeframe_widgets: Dict[str, Dict[str, QLineEdit]] = {}
         self.timeframe_enabled_widgets: Dict[str, QCheckBox] = {}
+        self.custom_timeframe_widgets: Dict[str, Dict[str, QLineEdit]] = {}
+        self.custom_timeframe_enabled_widgets: Dict[str, QCheckBox] = {}
+        self._tf_list_mode = "standard"
         self.session_enabled_widgets: Dict[str, QCheckBox] = {}
         self.added_indicator_ids: set = set()
         self.indicator_group_boxes: Dict[str, QGroupBox] = {}
@@ -4077,6 +4765,10 @@ class BacktestDashboard(QMainWindow):
                     live_accounts.save_desk(LIVE_DESK_PATH, self._live_desk)
                 except OSError:
                     pass
+        self._notification_manager = NotificationManager(
+            log=lambda m: self._live_log(m) if hasattr(self, "_live_log") else None,
+        )
+        self._load_notification_manager()
         self._live_desk.ensure_defaults()
         try:
             from hammer_boot import boot_log
@@ -4714,9 +5406,9 @@ class BacktestDashboard(QMainWindow):
         """Top-level Notifications menu — separate from Live settings."""
         menu_bar = self.menuBar()
         notify_menu = menu_bar.addMenu("Notifications")
-        open_tg = QAction("Telegram alerts…", self)
+        open_tg = QAction("Notification Manager…", self)
         open_tg.setToolTip(
-            "Configure Telegram alerts for placed orders, dry run, failures, and safety blocks"
+            "Connect Telegram and enable alerts per strategy slot"
         )
         open_tg.triggered.connect(self._open_live_notifications)
         notify_menu.addAction(open_tg)
@@ -4727,8 +5419,8 @@ class BacktestDashboard(QMainWindow):
         fetch_menu = menu_bar.addMenu("Fetch")
         open_fetch = QAction("Fetch / update data from MT5…", self)
         open_fetch.setToolTip(
-            "Detect the data folder, connect to the nearest MT5 terminal, "
-            "and update CSVs with newer bars (or full re-fetch)."
+            "Update CSVs from MT5. Works while Live is running — reuses the Live "
+            "connection when connected, so you do not need to stop trading."
         )
         open_fetch.triggered.connect(self._open_fetch_data_dialog)
         fetch_menu.addAction(open_fetch)
@@ -4737,14 +5429,6 @@ class BacktestDashboard(QMainWindow):
         fetch_menu.addAction(open_data)
 
     def _open_fetch_data_dialog(self):
-        if self._live_worker_running():
-            QMessageBox.warning(
-                self,
-                "Live is running",
-                "Stop live trading before opening Fetch.\n\n"
-                "History download and live trading share one MT5 Python connection.",
-            )
-            return
         dlg = FetchDataDialog(self)
         dlg.exec()
 
@@ -4958,7 +5642,7 @@ class BacktestDashboard(QMainWindow):
             "F4   Toggle Pattern & Preview panel\n"
             "F8   Toggle Results panel\n"
             "F9   Toggle Live Trading panel\n"
-            "Notifications → Telegram alerts   Order notifications\n"
+            "Notifications → Notification Manager   Telegram + per-slot alerts\n"
             "Fetch → Fetch / update data from MT5   History CSVs\n"
             "Live → Performance   Dry run, thread pool, Ray (advanced)\n"
             "F1   This help\n\n"
@@ -6175,6 +6859,61 @@ class BacktestDashboard(QMainWindow):
         self._sync_time_filter_mode_ui()
         layout.addWidget(session_box)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Timeframe list:"))
+        self.tf_mode_standard_btn = QPushButton("Standard")
+        self.tf_mode_custom_btn = QPushButton("Custom")
+        for btn, side in (
+            (self.tf_mode_standard_btn, "left"),
+            (self.tf_mode_custom_btn, "right"),
+        ):
+            btn.setCheckable(True)
+            btn.setObjectName("tfModeToggle")
+            btn.setProperty("side", side)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+        self.tf_mode_standard_btn.setChecked(True)
+        self.tf_mode_standard_btn.clicked.connect(lambda: self._set_tf_list_mode("standard"))
+        self.tf_mode_custom_btn.clicked.connect(lambda: self._set_tf_list_mode("custom"))
+        mode_row.addWidget(self.tf_mode_standard_btn)
+        mode_row.addWidget(self.tf_mode_custom_btn)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+        layout.addWidget(self._make_info_icon(
+            "Standard = broker/MT5 folders (1h…1m). "
+            "Custom = N-minute bars built from your 1min CSVs "
+            "(Fetch → Convert from 1-minute data), e.g. 4min / 12min.",
+            label="Standard vs Custom",
+        ))
+
+        self.tf_tables_stack = QStackedWidget()
+        self.standard_tf_table = self._build_standard_timeframe_table()
+        self.tf_tables_stack.addWidget(self.standard_tf_table)
+        custom_page = QWidget()
+        custom_page_layout = QVBoxLayout(custom_page)
+        custom_page_layout.setContentsMargins(0, 0, 0, 0)
+        self.custom_tf_table = self._build_custom_timeframe_table()
+        custom_page_layout.addWidget(self.custom_tf_table)
+        add_row = QHBoxLayout()
+        add_row.addWidget(QLabel("Add minutes"))
+        self.custom_tf_add_spin = QSpinBox()
+        self.custom_tf_add_spin.setRange(2, 240)
+        self.custom_tf_add_spin.setValue(7)
+        self.custom_tf_add_spin.setToolTip("Any N ≥ 2; bars are aggregated from 1min wall-clock buckets.")
+        add_row.addWidget(self.custom_tf_add_spin)
+        add_btn = QPushButton("Add to list")
+        add_btn.setObjectName("secondaryButton")
+        add_btn.clicked.connect(self._add_custom_timeframe_row)
+        add_row.addWidget(add_btn)
+        add_row.addStretch()
+        custom_page_layout.addLayout(add_row)
+        self.tf_tables_stack.addWidget(custom_page)
+        layout.addWidget(self.tf_tables_stack)
+        layout.addStretch()
+        scroll.setWidget(inner)
+        return scroll
+
+    def _build_standard_timeframe_table(self) -> QTableWidget:
         table = QTableWidget(len(TIMEFRAME_LABELS), 4)
         table.setHorizontalHeaderLabels(["Include", "Timeframe", "RR Multiple", "Max SL ($)"])
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -6222,10 +6961,142 @@ class BacktestDashboard(QMainWindow):
             self.timeframe_widgets[tf] = {"rr": rr_edit, "sl": sl_edit}
 
         table.setMinimumHeight(340)
-        layout.addWidget(table)
-        layout.addStretch()
-        scroll.setWidget(inner)
-        return scroll
+        return table
+
+    def _build_custom_timeframe_table(self) -> QTableWidget:
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Include", "Timeframe", "RR Multiple", "Max SL ($)"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        _configure_table_widget_mac(table)
+        table.setMinimumHeight(280)
+        for mins in CUSTOM_TIMEFRAME_MINUTES:
+            self._append_custom_timeframe_row(table, mins, checked=(mins in (4, 12)))
+        return table
+
+    def _append_custom_timeframe_row(
+        self,
+        table: QTableWidget,
+        minutes: int,
+        *,
+        checked: bool = True,
+        rr: Optional[float] = None,
+        sl: Optional[float] = None,
+    ) -> None:
+        from candle_resample import folder_for_minutes, logic_label_for_minutes
+
+        mins = int(minutes)
+        if mins < 2:
+            return
+        folder = folder_for_minutes(mins)
+        label = logic_label_for_minutes(mins)
+        if folder in self.custom_timeframe_enabled_widgets:
+            return
+
+        defaults = _default_custom_tf_setting(mins)
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setRowHeight(row, 44)
+
+        include_wrap = QWidget()
+        include_layout = QHBoxLayout(include_wrap)
+        include_layout.setContentsMargins(0, 0, 0, 0)
+        include_layout.setAlignment(Qt.AlignCenter)
+        include_cb = QCheckBox()
+        include_cb.setChecked(checked)
+        include_cb.setToolTip(
+            f"Include {folder} folder in the backtest "
+            f"(build it via Fetch → Convert from 1-minute data)."
+        )
+        include_layout.addWidget(include_cb)
+        table.setCellWidget(row, 0, include_wrap)
+        self.custom_timeframe_enabled_widgets[folder] = include_cb
+
+        tf_item = QTableWidgetItem(f"{label} ({folder})")
+        tf_item.setFlags(tf_item.flags() & ~Qt.ItemIsEditable)
+        tf_item.setTextAlignment(Qt.AlignCenter)
+        table.setItem(row, 1, tf_item)
+
+        rr_val = defaults.rr_multiple if rr is None else float(rr)
+        sl_val = defaults.max_sl_usd if sl is None else float(sl)
+        rr_edit = QLineEdit(f"{rr_val:.1f}")
+        rr_edit.setObjectName("tableNumberInput")
+        rr_edit.setAlignment(Qt.AlignCenter)
+        rr_edit.setToolTip(f"Reward:risk for custom {label}.")
+        rr_edit.textChanged.connect(self._redraw_candle_preview)
+
+        sl_edit = QLineEdit(f"{sl_val:g}")
+        sl_edit.setObjectName("tableNumberInput")
+        sl_edit.setAlignment(Qt.AlignCenter)
+        sl_edit.setToolTip(f"Maximum $ stop-loss for custom {label}.")
+        sl_edit.textChanged.connect(self._redraw_candle_preview)
+
+        table.setCellWidget(row, 2, rr_edit)
+        table.setCellWidget(row, 3, sl_edit)
+        self.custom_timeframe_widgets[label] = {"rr": rr_edit, "sl": sl_edit}
+
+    def _add_custom_timeframe_row(self):
+        mins = int(self.custom_tf_add_spin.value()) if hasattr(self, "custom_tf_add_spin") else 0
+        if mins < 2:
+            return
+        from candle_resample import folder_for_minutes
+
+        folder = folder_for_minutes(mins)
+        if folder in self.custom_timeframe_enabled_widgets:
+            QMessageBox.information(self, "Custom timeframe", f"{folder} is already in the list.")
+            return
+        if folder in TIMEFRAME_TO_FOLDER.values():
+            QMessageBox.information(
+                self,
+                "Custom timeframe",
+                f"{folder} is a Standard timeframe — switch to Standard to use it.",
+            )
+            return
+        self._append_custom_timeframe_row(self.custom_tf_table, mins, checked=True)
+
+    def _set_tf_list_mode(self, mode: str):
+        mode = "custom" if mode == "custom" else "standard"
+        self._tf_list_mode = mode
+        if hasattr(self, "tf_mode_standard_btn"):
+            self.tf_mode_standard_btn.setChecked(mode == "standard")
+            self.tf_mode_custom_btn.setChecked(mode == "custom")
+        if hasattr(self, "tf_tables_stack"):
+            self.tf_tables_stack.setCurrentIndex(1 if mode == "custom" else 0)
+        self._redraw_candle_preview()
+
+    def _selected_timeframe_folders(self) -> List[str]:
+        if getattr(self, "_tf_list_mode", "standard") == "custom":
+            return [
+                folder for folder, cb in self.custom_timeframe_enabled_widgets.items()
+                if cb.isChecked()
+            ]
+        return [
+            folder for folder, cb in self.timeframe_enabled_widgets.items()
+            if cb.isChecked()
+        ]
+
+    def _collect_timeframe_settings_from_ui(self) -> Dict[str, logic.TimeframeSetting]:
+        """RR/SL for every Standard + Custom row currently on the Timeframes tab."""
+        out: Dict[str, logic.TimeframeSetting] = {
+            tf: logic.TimeframeSetting(
+                rr_multiple=s.rr_multiple, max_sl_usd=s.max_sl_usd,
+            )
+            for tf, s in logic.DEFAULT_TIMEFRAME_SETTINGS.items()
+        }
+        for store in (self.timeframe_widgets, self.custom_timeframe_widgets):
+            for tf, tw in store.items():
+                try:
+                    rr = float(tw["rr"].text())
+                    sl = float(tw["sl"].text())
+                except (ValueError, AttributeError, KeyError, TypeError):
+                    defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
+                    if defaults_tf is not None:
+                        rr, sl = defaults_tf.rr_multiple, defaults_tf.max_sl_usd
+                    else:
+                        rr, sl = 2.0, 12.0
+                out[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
+        return out
 
     # ------------------------------------------------------------------
     # PREVIEW PANEL: split into two horizontal sub-tabs -- "Signal Shape"
@@ -7515,9 +8386,9 @@ class BacktestDashboard(QMainWindow):
         desk_btns.addWidget(self.live_remove_slot_btn)
         desk_btns.addStretch()
         desk_layout.addLayout(desk_btns)
-        self.live_desk_table = QTableWidget(0, 7)
+        self.live_desk_table = QTableWidget(0, 8)
         self.live_desk_table.setHorizontalHeaderLabels(
-            ["Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
+            ["Alert", "Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
         )
         self.live_desk_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.live_desk_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -7905,8 +8776,10 @@ class BacktestDashboard(QMainWindow):
         btns.addWidget(remove_slot)
         btns.addStretch()
         desk_layout.addLayout(btns)
-        table = QTableWidget(0, 7)
-        table.setHorizontalHeaderLabels(["Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"])
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels(
+            ["Alert", "Slot", "Symbol", "TF", "Preset", "Magic", "Lots", "Status"]
+        )
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -8163,9 +9036,12 @@ class BacktestDashboard(QMainWindow):
                 ist_time_filter_enabled=tf["ist_time_filter_enabled"],
                 ist_time_start=tf["ist_time_start"],
                 ist_time_end=tf["ist_time_end"],
-                telegram_enabled=self.live_telegram_enabled.isChecked(),
+                telegram_enabled=self.live_telegram_enabled.isChecked() or bool(
+                    self._notification_manager.list_bots()
+                ),
                 telegram_bot_token=self.live_telegram_token.text().strip(),
                 telegram_chat_id=self.live_telegram_chat_id.text().strip(),
+                notification_bots=self._notification_manager.to_snapshot(),
             )
             applied += 1
         self._refresh_live_strategy_summary()
@@ -8188,13 +9064,49 @@ class BacktestDashboard(QMainWindow):
         dlg.exec()
 
     def _open_live_notifications(self):
-        host = getattr(self, "_live_notifications_host", None)
-        if host is not None:
-            for w in self._live_notifications_field_widgets():
-                if _qt_widget_valid(w) and w.parent() is not host:
-                    w.setParent(host)
         dlg = LiveNotificationsDialog(self)
         dlg.exec()
+
+    def _load_notification_manager(self) -> None:
+        bots = load_bots(NOTIFICATION_BOTS_PATH)
+        # Migrate legacy QSettings single-bot into Live + Dry bots if file empty
+        try:
+            s = self._settings
+            enabled = s.value("live/telegram_enabled", False, type=bool)
+            token = s.value("live/telegram_token", "", type=str)
+            chat = s.value("live/telegram_chat_id", "", type=str)
+            bots = migrate_legacy_single_bot(
+                enabled=bool(enabled),
+                bot_token=str(token or ""),
+                chat_id=str(chat or ""),
+                existing=bots,
+            )
+            if bots and not os.path.isfile(NOTIFICATION_BOTS_PATH):
+                save_bots(NOTIFICATION_BOTS_PATH, bots)
+        except Exception:
+            pass
+        self._notification_manager.set_bots(bots)
+
+    def _save_notification_bots(self, rows: List[dict]) -> None:
+        bots = [bot_from_dict(r) for r in rows if isinstance(r, dict)]
+        self._notification_manager.set_bots(bots)
+        save_bots(NOTIFICATION_BOTS_PATH, bots)
+        # Keep legacy QSettings in sync with first enabled bot (compat)
+        enabled_bots = [b for b in bots if b.enabled and b.bot_token and b.chat_id]
+        primary = enabled_bots[0] if enabled_bots else None
+        if self._telegram_widgets_valid():
+            self.live_telegram_enabled.blockSignals(True)
+            self.live_telegram_token.blockSignals(True)
+            self.live_telegram_chat_id.blockSignals(True)
+            try:
+                self.live_telegram_enabled.setChecked(bool(primary))
+                self.live_telegram_token.setText(primary.bot_token if primary else "")
+                self.live_telegram_chat_id.setText(primary.chat_id if primary else "")
+            finally:
+                self.live_telegram_enabled.blockSignals(False)
+                self.live_telegram_token.blockSignals(False)
+                self.live_telegram_chat_id.blockSignals(False)
+        self._save_telegram_settings()
 
     def _telegram_field_values(self) -> tuple[bool, str, str]:
         if not self._telegram_widgets_valid():
@@ -8221,15 +9133,82 @@ class BacktestDashboard(QMainWindow):
         s.setValue("live/telegram_chat_id", chat_id)
 
     def _apply_live_telegram_settings(self) -> None:
-        if not self._telegram_widgets_valid():
-            return
+        bots_snap = self._notification_manager.to_snapshot()
         enabled, token, chat_id = self._telegram_field_values()
-        if self._live_engine is not None and self._live_worker_running():
-            self._live_engine.update_telegram_settings(
-                enabled=enabled,
-                bot_token=token,
-                chat_id=chat_id,
+        if not bots_snap and enabled and token and chat_id:
+            self._notification_manager.update_from_legacy_single(
+                enabled=enabled, bot_token=token, chat_id=chat_id,
             )
+            bots_snap = self._notification_manager.to_snapshot()
+        tg_on = enabled or bool(bots_snap)
+
+        def _push_engine(eng, slot_id: str = "") -> None:
+            if eng is None:
+                return
+            if hasattr(eng, "update_telegram_settings"):
+                try:
+                    eng.update_telegram_settings(
+                        enabled=tg_on,
+                        bot_token=token,
+                        chat_id=chat_id,
+                        notification_bots=bots_snap,
+                    )
+                except Exception:
+                    pass
+            slot = self._live_desk.slot_by_id(slot_id) if slot_id else None
+            if slot is not None and hasattr(eng, "set_notify_enabled"):
+                try:
+                    eng.set_notify_enabled(bool(getattr(slot, "notify_enabled", True)))
+                except Exception:
+                    pass
+
+        if self._live_engine is not None and self._live_worker_running():
+            # Legacy primary engine (may also be in _live_workers)
+            sid = ""
+            for wid, w in (self._live_workers or {}).items():
+                if w.get("engine") is self._live_engine:
+                    sid = wid
+                    break
+            _push_engine(self._live_engine, sid)
+
+        # In-process slot engines
+        for sid, worker in (self._live_workers or {}).items():
+            eng = worker.get("engine")
+            if eng is not None and eng is not self._live_engine:
+                _push_engine(eng, sid)
+
+        # Remote multi-account workers (no local engine object)
+        pushed_accounts: set = set()
+        for sid, worker in (self._live_workers or {}).items():
+            if not worker.get("remote"):
+                continue
+            acc_id = str(worker.get("account_id") or "")
+            handle = self._account_handles.get(acc_id) if acc_id else None
+            if handle is None or not getattr(handle, "connected", False):
+                continue
+            if acc_id not in pushed_accounts:
+                try:
+                    handle.send(
+                        "update_telegram",
+                        enabled=tg_on,
+                        bot_token=token,
+                        chat_id=chat_id,
+                        notification_bots=bots_snap,
+                    )
+                except Exception:
+                    pass
+                pushed_accounts.add(acc_id)
+            slot = self._live_desk.slot_by_id(sid)
+            if slot is None:
+                continue
+            try:
+                handle.send(
+                    "set_notify_enabled",
+                    slot_id=sid,
+                    notify_enabled=bool(getattr(slot, "notify_enabled", True)),
+                )
+            except Exception:
+                pass
 
     def _live_notifications_field_widgets(self):
         widgets = [
@@ -8475,21 +9454,26 @@ class BacktestDashboard(QMainWindow):
     def _refresh_live_telegram_status(self) -> None:
         if not hasattr(self, "live_telegram_status") or not _qt_widget_valid(self.live_telegram_status):
             return
-        if not self._telegram_widgets_valid():
-            return
-        enabled = self.live_telegram_enabled.isChecked()
-        token = self.live_telegram_token.text().strip()
-        chat_id = self.live_telegram_chat_id.text().strip()
+        bots = self._notification_manager.list_bots() if hasattr(self, "_notification_manager") else []
+        on = [b for b in bots if b.enabled and b.bot_token and b.chat_id]
         badge = self.live_telegram_status
-        if not enabled:
-            badge.setText("Off")
+        if not on:
+            badge.setText("Notifications: Off — open Notification Manager")
             badge.setProperty("ready", False)
-        elif token and chat_id:
-            badge.setText("Ready")
-            badge.setProperty("ready", True)
         else:
-            badge.setText("Needs token + chat id")
-            badge.setProperty("ready", False)
+            live_n = sum(1 for b in on if b.mode in ("live", "both"))
+            dry_n = sum(1 for b in on if b.mode in ("dry_run", "both"))
+            slots = getattr(self, "_live_desk", None)
+            slot_on = 0
+            slot_total = 0
+            if slots is not None:
+                slot_total = len(slots.slots)
+                slot_on = sum(1 for s in slots.slots if getattr(s, "notify_enabled", True))
+            badge.setText(
+                f"Notifications: Live {'on' if live_n else 'off'} · Dry {'on' if dry_n else 'off'}"
+                + (f" · slots {slot_on}/{slot_total}" if slot_total else "")
+            )
+            badge.setProperty("ready", True)
         badge.style().unpolish(badge)
         badge.style().polish(badge)
 
@@ -8998,6 +9982,11 @@ class BacktestDashboard(QMainWindow):
 
         sym = self.live_symbol.text().strip() or "XAUUSD"
         journal_dir = LIVE_JOURNAL_DIR
+        _notify_acc_id = str(
+            getattr(self, "_focused_live_account_id", "") or self._live_desk.active_account_id or ""
+        )
+        _acc = self._live_desk.account_by_id(_notify_acc_id) if _notify_acc_id else None
+        _notify_acc_name = _acc.name if _acc is not None else ""
 
         return live_trading.LiveRunConfig(
             symbol=sym,
@@ -9024,9 +10013,14 @@ class BacktestDashboard(QMainWindow):
             fallback_to_market_on_limit_fail=self.live_fallback_market.isChecked(),
             max_entry_deviation_points=_f("live_max_entry_deviation", 200.0),
             limit_offset_from_market=self.live_limit_offset_from_market.isChecked(),
-            telegram_enabled=self.live_telegram_enabled.isChecked(),
+            telegram_enabled=self.live_telegram_enabled.isChecked() or bool(
+                self._notification_manager.list_bots()
+            ),
             telegram_bot_token=self.live_telegram_token.text().strip(),
             telegram_chat_id=self.live_telegram_chat_id.text().strip(),
+            notification_bots=self._notification_manager.to_snapshot(),
+            account_id=_notify_acc_id,
+            account_name=_notify_acc_name,
             **{k: v for k, v in self._collect_time_filter_kwargs().items() if k != "time_filter_mode"},
         )
 
@@ -9048,6 +10042,23 @@ class BacktestDashboard(QMainWindow):
             return
         token = self.live_telegram_token.text().strip()
         chat_id = self.live_telegram_chat_id.text().strip()
+        self._test_telegram_notification_to(
+            token,
+            chat_id,
+            text="Hammer Live — test notification.\nIf you see this, Telegram alerts are configured.",
+            test_button=test_button,
+        )
+
+    def _test_telegram_notification_to(
+        self,
+        token: str,
+        chat_id: str,
+        *,
+        text: str,
+        test_button: Optional[QPushButton] = None,
+    ) -> None:
+        token = (token or "").strip()
+        chat_id = (chat_id or "").strip()
         if not token or not chat_id:
             QMessageBox.warning(
                 self,
@@ -9067,7 +10078,7 @@ class BacktestDashboard(QMainWindow):
         self._telegram_test_worker = TelegramTestWorker(
             token,
             chat_id,
-            "Hammer Live — test notification.\nIf you see this, Telegram alerts are configured.",
+            text,
             self,
         )
         self._telegram_test_worker.finished_ok.connect(
@@ -9210,12 +10221,15 @@ class BacktestDashboard(QMainWindow):
             row = table.rowCount()
             table.insertRow(row)
             status = "running" if slot.id in self._live_workers else "stopped"
+            alert_item = QTableWidgetItem("On" if getattr(slot, "notify_enabled", True) else "Off")
+            alert_item.setData(Qt.UserRole, slot.id)
+            table.setItem(row, 0, alert_item)
             values = [
                 slot.name, slot.symbol, slot.timeframe,
                 self._preset_display_name(slot.preset_file),
                 str(slot.magic), str(slot.volume), status,
             ]
-            for col, text in enumerate(values):
+            for col, text in enumerate(values, start=1):
                 item = QTableWidgetItem(text)
                 item.setData(Qt.UserRole, slot.id)
                 table.setItem(row, col, item)
@@ -9695,6 +10709,16 @@ class BacktestDashboard(QMainWindow):
                     live_cfg,
                     max_daily_loss_usd=float(acc.max_daily_loss_usd or 0),
                 )
+            live_cfg = dataclasses.replace(
+                live_cfg,
+                notify_enabled=bool(getattr(slot, "notify_enabled", True)),
+                slot_id=str(slot.id),
+                slot_name=str(slot.name or ""),
+                account_id=str(slot.account_id or getattr(live_cfg, "account_id", "") or ""),
+                account_name=(
+                    acc.name if acc is not None else getattr(live_cfg, "account_name", "") or ""
+                ),
+            )
             pattern, pattern_type, strategy_config, indicator_stack = (
                 self._collect_live_strategy_for_slot(slot)
             )
@@ -10689,26 +11713,7 @@ class BacktestDashboard(QMainWindow):
             default_val = getattr(defaults, name)
             kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
-        timeframe_settings = {}
-        for tf in TIMEFRAME_LABELS:
-            tw = self.timeframe_widgets.get(tf)
-            if tw is None:
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                if defaults_tf is not None:
-                    timeframe_settings[tf] = logic.TimeframeSetting(
-                        rr_multiple=defaults_tf.rr_multiple,
-                        max_sl_usd=defaults_tf.max_sl_usd,
-                    )
-                continue
-            try:
-                rr = float(tw["rr"].text())
-                sl = float(tw["sl"].text())
-            except (ValueError, AttributeError, KeyError):
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
-                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
-            timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
-        kwargs["timeframe_settings"] = timeframe_settings
+        kwargs["timeframe_settings"] = self._collect_timeframe_settings_from_ui()
         cfg = logic.StrategyConfig(**kwargs)
         return cfg
 
@@ -10783,26 +11788,7 @@ class BacktestDashboard(QMainWindow):
             default_val = getattr(defaults, name)
             kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
-        timeframe_settings = {}
-        for tf in TIMEFRAME_LABELS:
-            tw = self.timeframe_widgets.get(tf)
-            if tw is None:
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                if defaults_tf is not None:
-                    timeframe_settings[tf] = logic.TimeframeSetting(
-                        rr_multiple=defaults_tf.rr_multiple,
-                        max_sl_usd=defaults_tf.max_sl_usd,
-                    )
-                continue
-            try:
-                rr = float(tw["rr"].text())
-                sl = float(tw["sl"].text())
-            except (ValueError, AttributeError, KeyError):
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
-                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
-            timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
-        kwargs["timeframe_settings"] = timeframe_settings
+        kwargs["timeframe_settings"] = self._collect_timeframe_settings_from_ui()
 
         return doji_logic.DojiStrategyConfig(**kwargs)
 
@@ -10859,26 +11845,7 @@ class BacktestDashboard(QMainWindow):
             default_val = getattr(defaults, name)
             kwargs[name] = self._read_ui_field(name, default_val, ftype)
 
-        timeframe_settings = {}
-        for tf in TIMEFRAME_LABELS:
-            tw = self.timeframe_widgets.get(tf)
-            if tw is None:
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                if defaults_tf is not None:
-                    timeframe_settings[tf] = logic.TimeframeSetting(
-                        rr_multiple=defaults_tf.rr_multiple,
-                        max_sl_usd=defaults_tf.max_sl_usd,
-                    )
-                continue
-            try:
-                rr = float(tw["rr"].text())
-                sl = float(tw["sl"].text())
-            except (ValueError, AttributeError, KeyError):
-                defaults_tf = logic.DEFAULT_TIMEFRAME_SETTINGS.get(tf)
-                rr = defaults_tf.rr_multiple if defaults_tf else 2.0
-                sl = defaults_tf.max_sl_usd if defaults_tf else 50.0
-            timeframe_settings[tf] = logic.TimeframeSetting(rr_multiple=rr, max_sl_usd=sl)
-        kwargs["timeframe_settings"] = timeframe_settings
+        kwargs["timeframe_settings"] = self._collect_timeframe_settings_from_ui()
         return hammer_context_logic.HammerContextConfig(**kwargs)
 
     def _build_backtest_config(self, strategy_config) -> backtest.BacktestConfig:
@@ -10915,10 +11882,16 @@ class BacktestDashboard(QMainWindow):
             else:
                 kwargs[name] = self._parse_value(raw, default_val)
 
-        selected_timeframes = [
-            tf for tf, cb in self.timeframe_enabled_widgets.items() if cb.isChecked()
-        ]
+        selected_timeframes = self._selected_timeframe_folders()
         kwargs["timeframes_to_test"] = selected_timeframes
+        try:
+            from candle_resample import logic_label_for_folder
+
+            kwargs["timeframe_folder_to_logic_label"] = {
+                folder: logic_label_for_folder(folder) for folder in selected_timeframes
+            }
+        except Exception:
+            pass
         tf_kwargs = self._collect_time_filter_kwargs()
         kwargs["sessions_enabled"] = tf_kwargs["sessions_enabled"]
         kwargs["session_clock"] = tf_kwargs["session_clock"]
@@ -12172,12 +13145,22 @@ class BacktestDashboard(QMainWindow):
                 fields[name] = "" if val is None else str(val)
         timeframes = {}
         for tf, edits in self.timeframe_widgets.items():
-            folder = TIMEFRAME_TO_FOLDER[tf]
+            folder = _folder_for_logic_label(tf)
             cb = self.timeframe_enabled_widgets.get(folder)
             timeframes[tf] = {
                 "rr": edits["rr"].text(),
                 "sl": edits["sl"].text(),
                 "enabled": cb.isChecked() if cb else True,
+            }
+        custom_timeframes = {}
+        for tf, edits in self.custom_timeframe_widgets.items():
+            folder = _folder_for_logic_label(tf)
+            cb = self.custom_timeframe_enabled_widgets.get(folder)
+            custom_timeframes[tf] = {
+                "rr": edits["rr"].text(),
+                "sl": edits["sl"].text(),
+                "enabled": cb.isChecked() if cb else True,
+                "folder": folder,
             }
         sessions_preset = {
             name: (self.session_enabled_widgets[name].isChecked()
@@ -12201,6 +13184,8 @@ class BacktestDashboard(QMainWindow):
             "backtest": self._collect_preset_backtest_settings(),
             "fields": fields,
             "timeframes": timeframes,
+            "custom_timeframes": custom_timeframes,
+            "tf_list_mode": getattr(self, "_tf_list_mode", "standard"),
             "sessions": sessions_preset,
             "indicators_added": sorted(self.added_indicator_ids),
             "indicators": {
@@ -12295,9 +13280,45 @@ class BacktestDashboard(QMainWindow):
                 edits["rr"].setText(str(cfg["rr"]))
             if "sl" in cfg:
                 edits["sl"].setText(str(cfg["sl"]))
-            folder = TIMEFRAME_TO_FOLDER.get(tf)
+            folder = TIMEFRAME_TO_FOLDER.get(tf) or _folder_for_logic_label(tf)
             if folder and folder in self.timeframe_enabled_widgets and "enabled" in cfg:
                 self.timeframe_enabled_widgets[folder].setChecked(bool(cfg["enabled"]))
+        for tf, cfg in (data.get("custom_timeframes") or {}).items():
+            folder = cfg.get("folder") or _folder_for_logic_label(tf)
+            if folder not in self.custom_timeframe_enabled_widgets:
+                try:
+                    from candle_resample import minutes_from_folder
+
+                    mins = minutes_from_folder(folder)
+                except Exception:
+                    mins = None
+                if mins and mins >= 2 and hasattr(self, "custom_tf_table"):
+                    rr = sl = None
+                    try:
+                        if cfg.get("rr") not in (None, ""):
+                            rr = float(cfg["rr"])
+                        if cfg.get("sl") not in (None, ""):
+                            sl = float(cfg["sl"])
+                    except (TypeError, ValueError):
+                        rr = sl = None
+                    self._append_custom_timeframe_row(
+                        self.custom_tf_table,
+                        mins,
+                        checked=bool(cfg.get("enabled", True)),
+                        rr=rr,
+                        sl=sl,
+                    )
+            edits = self.custom_timeframe_widgets.get(tf)
+            if edits:
+                if "rr" in cfg:
+                    edits["rr"].setText(str(cfg["rr"]))
+                if "sl" in cfg:
+                    edits["sl"].setText(str(cfg["sl"]))
+            cb = self.custom_timeframe_enabled_widgets.get(folder)
+            if cb is not None and "enabled" in cfg:
+                cb.setChecked(bool(cfg["enabled"]))
+        mode = data.get("tf_list_mode") or "standard"
+        self._set_tf_list_mode(mode)
         sess_data = data.get("sessions") or {}
         for sess_name in sessions.SESSION_ORDER:
             if sess_name not in sess_data:

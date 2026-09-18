@@ -18,10 +18,13 @@ import traceback
 from update.paths import (
     INSTALL_ROOT_ENV,
     MIN_RUNTIME_BYTES,
+    RUNTIME_EXE_NAME,
+    STUB_EXE_NAME,
     app_dir,
     install_root,
     pending_runtime_path,
     runtime_exe_path,
+    stub_exe_path,
 )
 
 
@@ -123,6 +126,43 @@ def _message_box(title: str, text: str) -> None:
         pass
 
 
+def _cleanup_old_swap_files(root: str) -> None:
+    """
+    Delete leftover *.exe.old from Windows rename-swap (migration / updates).
+    Safe: never removes the live stub or runtime.
+    """
+    live = {
+        os.path.abspath(stub_exe_path(root)),
+        os.path.abspath(runtime_exe_path(root)),
+    }
+    candidates = [
+        os.path.join(root, STUB_EXE_NAME + ".old"),
+        os.path.join(app_dir(root), RUNTIME_EXE_NAME + ".old"),
+    ]
+    for folder in (root, app_dir(root)):
+        try:
+            for fn in os.listdir(folder):
+                low = fn.lower()
+                if not low.startswith("hammer"):
+                    continue
+                if low.endswith(".exe.old") or ".exe.old." in low:
+                    candidates.append(os.path.join(folder, fn))
+        except OSError:
+            pass
+
+    seen = set()
+    for path in candidates:
+        ap = os.path.abspath(path)
+        if ap in seen or ap in live or not os.path.isfile(ap):
+            continue
+        seen.add(ap)
+        try:
+            os.remove(ap)
+            _log(root, f"removed leftover {os.path.basename(ap)}")
+        except OSError as exc:
+            _log(root, f"could not remove {os.path.basename(ap)}: {exc}")
+
+
 def main() -> int:
     # When frozen, this exe sits at install root
     if getattr(sys, "frozen", False):
@@ -133,6 +173,7 @@ def main() -> int:
     os.environ[INSTALL_ROOT_ENV] = root
     _log(root, "stub start")
     _apply_pending(root)
+    _cleanup_old_swap_files(root)
 
     runtime = runtime_exe_path(root)
     if not os.path.isfile(runtime):
