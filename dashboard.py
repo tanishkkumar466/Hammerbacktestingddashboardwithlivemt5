@@ -125,9 +125,14 @@ from live_account_ipc import AccountWorkerHandle, apply_worker_event
 # regardless of the launch working directory.
 # ============================================================================
 def get_app_dir() -> str:
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    try:
+        from update.paths import install_root
+
+        return install_root()
+    except Exception:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
 
 def get_asset_path(filename: str) -> str:
@@ -4963,7 +4968,7 @@ class BacktestDashboard(QMainWindow):
 
     def _check_for_updates(self):
         try:
-            from update_window import open_update_window
+            from update.window import open_update_window
         except Exception as e:
             QMessageBox.warning(
                 self,
@@ -4974,7 +4979,7 @@ class BacktestDashboard(QMainWindow):
         open_update_window(self)
 
     def _show_github_token_dialog(self):
-        import updater
+        import update.updater as updater
 
         dlg = QDialog(self)
         dlg.setWindowTitle("GitHub Update Token")

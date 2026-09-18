@@ -1,5 +1,5 @@
-# Build full Windows one-file exe and attach ONLY to the GitHub Release for this tag.
-# Real exe is ~150–450 MB. If you see ~300 KB on the release, that is the source .zip — not the exe.
+# Build stub launcher + HammerRuntime, smoke-test, attach to the GitHub Release for this tag.
+# Prefer Hammer-windows.zip (stub + app/HammerRuntime.exe). Also upload bridge EXEs for older clients.
 
 name: Release Windows EXE
 
@@ -35,6 +35,7 @@ jobs:
           pip install -r requirements-build.txt
           pip uninstall -y polars 2>nul || true
           pip show polars-lts-cpu
+          pip install pytest
 
       - name: Assert PyInstaller matches known-good local (6.19.0)
         shell: pwsh
@@ -43,6 +44,12 @@ jobs:
 
       - name: Verify Python syntax
         run: python scripts/verify_syntax.py
+
+      - name: Pipeline sanity (stub package / asset pick / no Qt in stub)
+        run: python scripts/check_update_pipeline.py
+
+      - name: Unit tests (updater + paths)
+        run: python -m pytest tests/test_updater.py tests/test_logs_layout.py -q --tb=short
 
       - name: Verify runtime imports (must pass before PyInstaller)
         shell: pwsh
@@ -61,84 +68,55 @@ jobs:
           import aiohttp, pydantic, pydantic_core, virtualenv, watchfiles, colorful
           print('sqlite3', sqlite3.sqlite_version)
           print('ray', ray.__version__)
+          import update.paths, update.stub, update.updater as updater
+          print('stub helpers OK', updater.CURRENT_VERSION)
+          import update.migrate
+          print('migrate helpers OK')
           "@
           python -c "import MetaTrader5; print('MetaTrader5 OK')"
           python -c "import importlib.metadata as m; dists=[d.metadata['Name'] for d in m.distributions() if d.metadata['Name'].lower().replace('_','-') in ('polars','polars-lts-cpu')]; print('polars dists:', dists); assert 'polars-lts-cpu' in [x.lower() for x in dists] or any('lts' in x.lower() for x in dists), dists"
 
-      - name: Build one-file executable
+      # Stub first so a later --clean runtime build cannot overwrite the launcher name by mistake
+      - name: Build stub launcher (HammerCandleBacktestDashboard.exe)
+        run: pyinstaller --noconfirm --clean HammerStub.spec
+
+      - name: Stash stub aside
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/HammerCandleBacktestDashboard.exe")) { throw "Stub build missing" }
+          New-Item -ItemType Directory -Force -Path "dist/_stash" | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/_stash/HammerCandleBacktestDashboard.exe" -Force
+          $sz = (Get-Item "dist/_stash/HammerCandleBacktestDashboard.exe").Length
+          Write-Host "Stashed stub $sz bytes"
+          if ($sz -ge 80MB) { throw "Stashed stub is too large — wrong binary" }
+
+      - name: Build runtime (HammerRuntime.exe)
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
-      - name: Verify EXE size (full build ~400–450 MB)
+      - name: Restore stub into dist/
         shell: pwsh
         run: |
-          $exe = "dist/HammerCandleBacktestDashboard.exe"
-          if (-not (Test-Path $exe)) { throw "Build did not produce $exe" }
-          $size = (Get-Item $exe).Length
-          $mb = [math]::Round($size / 1MB, 1)
-          Write-Host "Built $exe ($mb MB, $size bytes)"
-          if ($size -lt 400MB) {
-            throw "EXE too small ($mb MB) — expected ~420-450 MB with full ray[default] bundle."
+          Copy-Item "dist/_stash/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard.exe" -Force
+          if (-not (Test-Path "dist/HammerRuntime.exe")) { throw "Runtime build missing" }
+          if (-not (Test-Path "dist/_stash/stub_embedded.ok")) {
+            throw "Runtime build did not embed stub (missing dist/_stash/stub_embedded.ok) — one-hop migration would fail for old clients"
           }
-          if ($size -lt 420MB) {
-            Write-Warning "EXE is $mb MB (target ~430 MB). Check ray[default] deps in requirements-build.txt."
-          }
+          Write-Host "Stub embed marker OK"
 
-      - name: Smoke-test EXE starts (boot log)
+      - name: Assemble stub package + zip
         shell: pwsh
-        run: |
-          # Wait until log contains "QApplication OK" — do NOT stop when the file first appears
-          # (runtime hook writes hammer_boot.log immediately; killing then hid the real hang).
-          $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
-          Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
-          Unblock-File -LiteralPath (Join-Path $work "HammerCandleBacktestDashboard.exe") -ErrorAction SilentlyContinue
-          Push-Location $work
-          $sys32 = Join-Path $env:SystemRoot "System32"
-          $env:PATH = "$sys32;$env:SystemRoot"
-          Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
-          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Normal
-          $deadline = (Get-Date).AddSeconds(90)
-          $boot = ""
-          $crash = ""
-          function Read-BootLog {
-            $chunks = @()
-            if (Test-Path "logs\boot.log") { $chunks += Get-Content "logs\boot.log" -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path "hammer_boot.log") { $chunks += Get-Content "hammer_boot.log" -Raw -ErrorAction SilentlyContinue }
-            return ($chunks -join "`n")
-          }
-          function Read-CrashLog {
-            if (Test-Path "logs\crash.log") { return Get-Content "logs\crash.log" -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path "hammer_crash.log") { return Get-Content "hammer_crash.log" -Raw -ErrorAction SilentlyContinue }
-            return ""
-          }
-          while ((Get-Date) -lt $deadline) {
-            $boot = Read-BootLog
-            $crash = Read-CrashLog
-            if ($boot -match "QApplication OK") { break }
-            if ($crash -and $crash.Trim().Length -gt 0) { break }
-            if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-          $boot = Read-BootLog
-          $crash = Read-CrashLog
-          Write-Host "==== boot log (logs/boot.log + hammer_boot.log) ===="
-          if ($boot) { Write-Host $boot } else { Write-Host "(missing)" }
-          Write-Host "==== crash log ===="
-          if ($crash) { Write-Host $crash } else { Write-Host "(none)" }
-          Pop-Location
-          if ($crash -and $crash.Trim().Length -gt 0) { throw "EXE wrote crash log — will not open on user PCs:`n$crash" }
-          if (-not $boot) {
-            throw "EXE never wrote boot log — bootloader died before Python (DLL/OpenSSL)."
-          }
-          if ($boot -notmatch "QApplication OK") {
-            throw "boot log missing QApplication OK — real qwindows path failed:`n$boot"
-          }
-          Write-Host "Smoke OK — real qwindows platform + QApplication works (minimal PATH)."
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci_package_stub_windows.ps1
 
-      - name: Upload EXE to GitHub Release
+      - name: Smoke-test stub package (boot log)
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci_smoke_stub_windows.ps1
+
+      - name: Upload package to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/HammerCandleBacktestDashboard.exe
+          files: |
+            dist/release-assets/Hammer-windows.zip
+            dist/release-assets/HammerRuntime.exe
+            dist/release-assets/HammerCandleBacktestDashboard.exe
           fail_on_unmatched_files: true
           generate_release_notes: false

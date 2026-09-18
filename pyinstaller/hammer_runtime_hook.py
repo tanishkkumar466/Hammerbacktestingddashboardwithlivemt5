@@ -11,16 +11,31 @@ import traceback
 
 
 def _exe_dir() -> str:
+    """Install root — parent of app/ when running HammerRuntime.exe."""
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
+        parent = os.path.dirname(sys.executable)
+        if os.path.basename(parent).lower() == "app":
+            return os.path.dirname(parent)
+        env = (os.environ.get("HAMMER_INSTALL_ROOT") or "").strip()
+        if env and os.path.isdir(env):
+            return os.path.abspath(env)
+        return parent
     return os.path.dirname(os.path.abspath(__file__))
 
 
 def _boot_log(msg: str) -> None:
     try:
-        path = os.path.join(_exe_dir(), "hammer_boot.log")
+        root = _exe_dir()
+        path = os.path.join(root, "hammer_boot.log")
         with open(path, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
+        logs = os.path.join(root, "logs")
+        try:
+            os.makedirs(logs, exist_ok=True)
+            with open(os.path.join(logs, "boot.log"), "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
     except OSError:
         pass
 

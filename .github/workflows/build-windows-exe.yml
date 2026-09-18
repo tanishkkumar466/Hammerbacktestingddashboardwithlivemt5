@@ -21,6 +21,11 @@ on:
       - "requirements.txt"
       - "requirements-build.txt"
       - "HammerCandleBacktestDashboard.spec"
+      - "HammerStub.spec"
+      - "update/**"
+      - "scripts/ci_package_stub_windows.ps1"
+      - "scripts/ci_smoke_stub_windows.ps1"
+      - "scripts/check_update_pipeline.py"
       - "logo.ico"
       - "app_icon.ico"
       - ".github/workflows/build-windows-exe.yml"
@@ -48,6 +53,7 @@ jobs:
           pip install -r requirements-build.txt
           pip uninstall -y polars 2>nul || true
           pip show polars-lts-cpu
+          pip install pytest
 
       - name: Assert PyInstaller matches known-good local (6.19.0)
         shell: pwsh
@@ -57,101 +63,68 @@ jobs:
       - name: Verify Python syntax
         run: python scripts/verify_syntax.py
 
+      - name: Pipeline sanity (stub package / asset pick / no Qt in stub)
+        run: python scripts/check_update_pipeline.py
+
+      - name: Unit tests (updater + paths)
+        run: python -m pytest tests/test_updater.py tests/test_logs_layout.py -q --tb=short
+
       - name: Verify runtime imports
         shell: pwsh
         run: |
-          python -c "import sqlite3, _sqlite3, ssl, PySide6, shiboken6, polars, pyarrow, numpy, matplotlib; import matplotlib.backends.backend_qtagg, matplotlib.backends.backend_qt; import openpyxl, et_xmlfile, defusedxml, tzdata, psutil, ray, MetaTrader5; import aiohttp, pydantic, pydantic_core, virtualenv, watchfiles, colorful, ray._private.object_ref_generator; print('imports OK')"
+          python -c "import sqlite3, _sqlite3, ssl, PySide6, shiboken6, polars, pyarrow, numpy, matplotlib; import matplotlib.backends.backend_qtagg, matplotlib.backends.backend_qt; import openpyxl, et_xmlfile, defusedxml, tzdata, psutil, ray, MetaTrader5; import aiohttp, pydantic, pydantic_core, virtualenv, watchfiles, colorful, ray._private.object_ref_generator; import update, update.paths, update.stub, update.migrate, update.updater; print('imports OK', update.updater.CURRENT_VERSION)"
           python -c "import importlib.metadata as m; names=[d.metadata['Name'].lower() for d in m.distributions()]; print([n for n in names if 'polars' in n]); assert any(n=='polars-lts-cpu' or n.startswith('polars-lts') for n in names), 'need polars-lts-cpu installed'"
 
-      - name: Build one-file executable
+      - name: Build stub launcher (HammerCandleBacktestDashboard.exe)
+        run: pyinstaller --noconfirm --clean HammerStub.spec
+
+      - name: Stash stub aside
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/HammerCandleBacktestDashboard.exe")) { throw "Stub build missing" }
+          New-Item -ItemType Directory -Force -Path "dist/_stash" | Out-Null
+          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/_stash/HammerCandleBacktestDashboard.exe" -Force
+          $sz = (Get-Item "dist/_stash/HammerCandleBacktestDashboard.exe").Length
+          if ($sz -ge 80MB) { throw "Stashed stub is too large — wrong binary" }
+
+      - name: Build runtime (HammerRuntime.exe)
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
-      - name: Verify EXE size
+      - name: Restore stub into dist/
         shell: pwsh
         run: |
-          $exe = "dist/HammerCandleBacktestDashboard.exe"
-          if (-not (Test-Path $exe)) { throw "Missing $exe" }
-          $size = (Get-Item $exe).Length
-          $mb = [math]::Round($size / 1MB, 1)
-          Write-Host "Built $exe ($mb MB)"
-          if ($size -lt 400MB) { throw "EXE too small ($mb MB) — expected ~420-450 MB" }
-          if ($size -lt 420MB) { Write-Warning "EXE is $mb MB (target ~430 MB)" }
+          Copy-Item "dist/_stash/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard.exe" -Force
+          if (-not (Test-Path "dist/HammerRuntime.exe")) { throw "Runtime build missing" }
+          if (-not (Test-Path "dist/_stash/stub_embedded.ok")) {
+            throw "Runtime build did not embed stub (missing dist/_stash/stub_embedded.ok) — one-hop migration would fail for old clients"
+          }
+          Write-Host "Stub embed marker OK"
 
-      - name: Smoke-test EXE starts (boot log)
+      - name: Assemble stub package + zip
         shell: pwsh
-        run: |
-          $work = Join-Path $env:RUNNER_TEMP "hammer_smoke"
-          New-Item -ItemType Directory -Force -Path $work | Out-Null
-          Copy-Item "dist/HammerCandleBacktestDashboard.exe" $work
-          Unblock-File -LiteralPath (Join-Path $work "HammerCandleBacktestDashboard.exe") -ErrorAction SilentlyContinue
-          Push-Location $work
-          $sys32 = Join-Path $env:SystemRoot "System32"
-          $env:PATH = "$sys32;$env:SystemRoot"
-          Remove-Item Env:QT_QPA_PLATFORM -ErrorAction SilentlyContinue
-          $proc = Start-Process -FilePath ".\HammerCandleBacktestDashboard.exe" -PassThru -WindowStyle Normal
-          $deadline = (Get-Date).AddSeconds(90)
-          $boot = ""
-          $crash = ""
-          function Read-BootLog {
-            $chunks = @()
-            if (Test-Path "logs\boot.log") { $chunks += Get-Content "logs\boot.log" -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path "hammer_boot.log") { $chunks += Get-Content "hammer_boot.log" -Raw -ErrorAction SilentlyContinue }
-            return ($chunks -join "`n")
-          }
-          function Read-CrashLog {
-            if (Test-Path "logs\crash.log") { return Get-Content "logs\crash.log" -Raw -ErrorAction SilentlyContinue }
-            if (Test-Path "hammer_crash.log") { return Get-Content "hammer_crash.log" -Raw -ErrorAction SilentlyContinue }
-            return ""
-          }
-          while ((Get-Date) -lt $deadline) {
-            $boot = Read-BootLog
-            $crash = Read-CrashLog
-            if ($boot -match "QApplication OK") { break }
-            if ($crash -and $crash.Trim().Length -gt 0) { break }
-            if ($proc.HasExited -and $proc.ExitCode -ne 0) { break }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
-          $boot = Read-BootLog
-          $crash = Read-CrashLog
-          Write-Host "==== boot log (logs/boot.log + hammer_boot.log) ===="
-          if ($boot) { Write-Host $boot } else { Write-Host "(missing)" }
-          Write-Host "==== crash log ===="
-          if ($crash) { Write-Host $crash } else { Write-Host "(none)" }
-          Pop-Location
-          if ($crash -and $crash.Trim().Length -gt 0) { throw "EXE wrote crash log:`n$crash" }
-          if (-not $boot) { throw "EXE never wrote boot log — bootloader died before Python (DLL/OpenSSL)." }
-          if ($boot -notmatch "QApplication OK") {
-            throw "boot log missing QApplication OK:`n$boot"
-          }
-          Write-Host "Smoke OK (minimal PATH, qwindows)"
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci_package_stub_windows.ps1
 
-      - name: Package delivery zip
+      - name: Smoke-test stub package (boot log)
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path "dist/HammerCandleBacktestDashboard" | Out-Null
-          Copy-Item "dist/HammerCandleBacktestDashboard.exe" "dist/HammerCandleBacktestDashboard/"
-          @"
-          Hammer Candle Backtest Dashboard (Windows)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/ci_smoke_stub_windows.ps1
 
-          1. Put HammerCandleBacktestDashboard.exe next to your data/ folder.
-          2. Double-click the exe (NOT the small Hammer-x.y.z.zip source file on GitHub).
-          3. Real exe size is about 150-450 MB.
-
-          Self-update: Help -> Check for Updates (downloads HammerCandleBacktestDashboard.exe).
-          "@ | Set-Content -Encoding UTF8 "dist/HammerCandleBacktestDashboard/README.txt"
-          Compress-Archive -Path "dist/HammerCandleBacktestDashboard/*" -DestinationPath "dist/HammerCandleBacktestDashboard-windows.zip" -Force
-
-      - name: Upload artifact (exe)
+      - name: Upload artifact (stub package zip)
         uses: actions/upload-artifact@v4
         with:
-          name: HammerCandleBacktestDashboard.exe
-          path: dist/HammerCandleBacktestDashboard.exe
+          name: Hammer-windows-zip
+          path: dist/Hammer-windows.zip
           if-no-files-found: error
 
-      - name: Upload artifact (delivery zip)
+      - name: Upload artifact (runtime exe)
         uses: actions/upload-artifact@v4
         with:
-          name: HammerCandleBacktestDashboard-windows-zip
-          path: dist/HammerCandleBacktestDashboard-windows.zip
+          name: HammerRuntime.exe
+          path: dist/HammerRuntime.exe
+          if-no-files-found: error
+
+      - name: Upload artifact (stub exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: HammerCandleBacktestDashboard-stub.exe
+          path: dist/HammerCandleBacktestDashboard.exe
           if-no-files-found: error

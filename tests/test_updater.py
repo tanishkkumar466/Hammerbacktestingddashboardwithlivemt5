@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-import updater
+import update.updater as updater
 
 
 def test_is_newer_basic():
@@ -61,6 +61,26 @@ def test_pick_large_exe_when_frozen(monkeypatch):
     assert int(picked["size"]) >= 350_000_000
 
 
+def test_pick_windows_zip_over_exe_when_frozen(monkeypatch):
+    """Stub package zip is preferred over a raw runtime exe."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    assets = [
+        {
+            "name": "HammerCandleBacktestDashboard.exe",
+            "browser_download_url": "https://x/e",
+            "size": 430_000_000,
+        },
+        {
+            "name": "Hammer-windows.zip",
+            "browser_download_url": "https://x/z",
+            "size": 435_000_000,
+        },
+    ]
+    picked = updater._pick_release_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "Hammer-windows.zip"
+
+
 def test_reject_tiny_assets_when_frozen(monkeypatch):
     """Frozen update with only tiny zips must refuse (would brick the install)."""
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
@@ -69,6 +89,57 @@ def test_reject_tiny_assets_when_frozen(monkeypatch):
         {"name": "HammerCandleBacktestDashboard-windows.zip", "browser_download_url": "https://x/win", "size": 200},
     ]
     assert updater._pick_release_asset(assets) is None
+
+
+def test_install_root_from_runtime_path(tmp_path, monkeypatch):
+    import update.paths as hp
+
+    app = tmp_path / "app"
+    app.mkdir()
+    runtime = app / "HammerRuntime.exe"
+    runtime.write_bytes(b"x")
+    monkeypatch.setattr(hp.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(hp.sys, "executable", str(runtime), raising=False)
+    monkeypatch.delenv(hp.INSTALL_ROOT_ENV, raising=False)
+    assert hp.install_root() == str(tmp_path)
+    assert hp.is_running_as_runtime()
+
+
+def test_stage_runtime_pending(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_root", lambda: str(tmp_path))
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater, "is_running_as_runtime", lambda: True)
+    monkeypatch.setattr(updater, "is_stub_layout", lambda root=None: True)
+    monkeypatch.setattr(updater, "_schedule_relaunch_stub", lambda root, cb, note: root)
+    # Avoid writing a 350MB file in unit tests / CI
+    monkeypatch.setattr(updater, "MIN_RUNTIME_BYTES", 1024)
+    src = tmp_path / "new.exe"
+    src.write_bytes(b"x" * 2048)
+    notes = []
+    root = updater._stage_runtime_pending(str(src), notes.append)
+    assert root == str(tmp_path)
+    pending = tmp_path / "app" / "HammerRuntime.exe.pending"
+    assert pending.is_file()
+    assert pending.stat().st_size >= 1024
+
+
+def test_find_embedded_stub(tmp_path, monkeypatch):
+    import update.migrate as hm
+
+    monkeypatch.setattr(hm.sys, "frozen", True, raising=False)
+    embed = tmp_path / "_hammer_embedded_stub"
+    embed.mkdir()
+    stub = embed / "HammerCandleBacktestDashboard.exe"
+    stub.write_bytes(b"stub" * 1000)
+    monkeypatch.setattr(hm.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert hm.find_embedded_stub() == str(stub)
+
+
+def test_needs_migration_false_when_already_runtime(monkeypatch):
+    import update.migrate as hm
+
+    monkeypatch.setattr(hm, "is_running_as_runtime", lambda: True)
+    assert hm.needs_legacy_stub_migration() is False
 
 
 def test_tree_has_source_only_layout(tmp_path):

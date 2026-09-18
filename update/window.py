@@ -1,7 +1,7 @@
 """
 "Check for Updates" dialog for Hammer (Safari-style).
 
-Slow work runs in update_workers.QThread subclasses; this file only
+Slow work runs in update.workers.QThread subclasses; this file only
 reacts to their signals on the GUI thread.
 """
 
@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-import updater
-from update_workers import CheckUpdateWorker, DownloadInstallWorker
+import update.updater as updater
+from update.workers import CheckUpdateWorker, DownloadInstallWorker
 from version import __version__ as CURRENT_VERSION
 
 

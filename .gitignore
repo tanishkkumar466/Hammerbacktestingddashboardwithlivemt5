@@ -33,6 +33,7 @@ build/
 dist/
 *.spec
 !HammerCandleBacktestDashboard.spec
+!HammerStub.spec
 *.exe
 
 # Python

@@ -1,4 +1,4 @@
-# PyInstaller spec — Windows one-file HammerCandleBacktestDashboard.exe
+# PyInstaller spec — Windows one-file HammerRuntime.exe (launched by the stub)
 # Local:  pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 #
 # Bundles every runtime library from requirements.txt + requirements-build.txt.
@@ -21,6 +21,34 @@ entry_script = str(ROOT / "main.py")
 
 datas = []
 binaries = []
+
+# Embed the stub launcher so old one-file clients can one-hop migrate on first run.
+# CI builds stub → dist/_stash/… before this spec runs.
+_stub_embed_candidates = (
+    ROOT / "dist" / "_stash" / "HammerCandleBacktestDashboard.exe",
+    ROOT / "dist" / "HammerCandleBacktestDashboard.exe",
+)
+_stub_embedded = False
+for _stub_path in _stub_embed_candidates:
+    try:
+        if _stub_path.is_file() and _stub_path.stat().st_size < 80_000_000:
+            datas.append((str(_stub_path), "_hammer_embedded_stub"))
+            print(f"[spec] embedding stub for one-hop migration: {_stub_path} "
+                  f"({_stub_path.stat().st_size} bytes)")
+            _stub_embedded = True
+            break
+    except OSError:
+        continue
+if not _stub_embedded:
+    print("[spec] WARNING: no stub EXE to embed — legacy clients will not "
+          "auto-migrate to stub layout on first launch")
+else:
+    try:
+        marker = ROOT / "dist" / "_stash" / "stub_embedded.ok"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("embedded\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[spec] could not write embed marker: {exc}")
 
 # Every pip package — keep in sync with requirements-build.txt
 # NOTE: do NOT collect_all("google") — pulls conflicting native DLLs and breaks startup.
@@ -58,8 +86,9 @@ hiddenimports = [
     "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker",     "live",
     "live_accounts", "live_account_ipc", "live_account_worker",
     "live_journal", "fetch", "sessions", "hammer_context_logic",
-    "telegram_notify", "telegram_workers", "version", "updater",
-    "update_workers", "update_window", "hammer_boot",
+    "telegram_notify", "telegram_workers", "version", "hammer_boot",
+    "update", "update.updater", "update.workers", "update.window",
+    "update.paths", "update.migrate", "update.stub",
     "indicators", "indicators.config", "indicators.filter", "indicators.registry",
     "indicators.supertrend", "indicators.vwap", "indicators.rolling_vwap", "indicators.rsi",
     # --- stdlib ---
@@ -334,7 +363,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="HammerCandleBacktestDashboard",
+    name="HammerRuntime",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

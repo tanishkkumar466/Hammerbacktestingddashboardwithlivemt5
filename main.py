@@ -14,9 +14,14 @@ import sys
 
 
 def _app_dir() -> str:
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    try:
+        from update.paths import install_root
+
+        return install_root()
+    except Exception:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
 
 def _cleanup_stale_update_artifacts() -> None:
@@ -46,7 +51,7 @@ def _report_pending_update_failure() -> None:
     if not getattr(sys, "frozen", False) or os.name != "nt":
         return
     try:
-        import updater
+        import update.updater as updater
 
         message = updater.read_pending_update_message()
     except Exception:
@@ -219,6 +224,15 @@ def main() -> int:
         from hammer_boot import boot_log
 
         boot_log("main: entered")
+        # Old one-file installs (1.0.14+) → stub + app/runtime on first launch
+        try:
+            from update.migrate import migrate_legacy_onefile_to_stub_if_needed
+
+            if migrate_legacy_onefile_to_stub_if_needed():
+                boot_log("main: exiting after stub migration relaunch")
+                os._exit(0)
+        except Exception as exc:
+            boot_log(f"main: stub migration skipped/failed: {exc}")
 
     _report_pending_update_failure()
     _cleanup_stale_update_artifacts()

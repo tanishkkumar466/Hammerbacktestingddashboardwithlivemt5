@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
 
-import updater
+import update.updater as updater
 
 
 class CheckUpdateWorker(QThread):

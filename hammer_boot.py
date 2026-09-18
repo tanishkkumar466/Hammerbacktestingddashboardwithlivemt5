@@ -9,9 +9,15 @@ from datetime import datetime
 
 
 def exe_dir() -> str:
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    """Install root (stub folder), not app/ when running as HammerRuntime."""
+    try:
+        from update.paths import install_root
+
+        return install_root()
+    except Exception:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
 
 def logs_dir() -> str:

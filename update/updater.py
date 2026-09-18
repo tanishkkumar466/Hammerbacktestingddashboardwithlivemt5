@@ -1,15 +1,16 @@
 """
 Self-update engine for Hammer.
 
-Pure Python — no Qt imports. QThread wrappers live in update_workers.py;
-the dialog is update_window.py.
+Pure Python — no Qt imports. QThread wrappers live in update.workers;
+the dialog is update.window.
 
 check_for_update()       -> blocking; call off the GUI thread
 download_and_install()   -> blocking; progress/status callbacks for UI
 
-Release packaging:
-  - Source / script install: attach one .zip of the app .py tree
-  - Frozen Windows EXE: attach HammerCandleBacktestDashboard.exe (or any .exe)
+Release packaging (stub launcher):
+  - Prefer Hammer-windows.zip = stub exe + app/HammerRuntime.exe
+  - Legacy: large HammerCandleBacktestDashboard.exe / HammerRuntime.exe
+    still accepted (stages into app/ or one-file swap for old installs)
 """
 
 from __future__ import annotations
@@ -28,6 +29,19 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from version import __version__ as CURRENT_VERSION
+from update.paths import (
+    MIN_RUNTIME_BYTES,
+    RUNTIME_EXE_NAME,
+    STUB_EXE_NAME,
+    app_dir as hammer_app_dir,
+    install_root as hammer_install_root,
+    is_running_as_legacy_onefile,
+    is_running_as_runtime,
+    is_stub_layout,
+    pending_runtime_path,
+    runtime_exe_path,
+    stub_exe_path,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +85,14 @@ def _read_token_file(path: str) -> Optional[str]:
 def _token_search_roots() -> list[str]:
     """Folders where we look for (or save) the GitHub token file."""
     roots: list[str] = []
+    try:
+        roots.append(hammer_install_root())
+    except Exception:
+        pass
     if getattr(sys, "frozen", False):
         roots.append(os.path.dirname(sys.executable))
-    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    # Repo / install root (update/ is one level down when running from source)
+    roots.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if os.getcwd():
         roots.append(os.getcwd())
     seen: set[str] = set()
@@ -264,19 +283,33 @@ def _api_request(url: str, *, not_found_message: Optional[str] = None):
 
 
 def _pick_release_asset(assets: list) -> Optional[dict]:
-    """Prefer Windows delivery assets when frozen; source .zip when running from code."""
+    """Prefer stub zip when frozen; source .zip when running from code."""
     if not assets:
         return None
 
-    # Exact exe name first — never grab Source code.zip by accident
-    if getattr(sys, "frozen", False):
+    frozen = bool(getattr(sys, "frozen", False))
+
+    if frozen:
+        # 1) Official stub+runtime package
         for asset in assets:
             name = str(asset.get("name", "")).lower()
             size = int(asset.get("size", 0) or 0)
-            if name == "hammercandlebacktestdashboard.exe" and size >= 350_000_000:
+            if name in (
+                "hammer-windows.zip",
+                "hammercandlebacktestdashboard-windows.zip",
+            ) and size >= MIN_RUNTIME_BYTES:
                 return asset
-
-    frozen = bool(getattr(sys, "frozen", False))
+        # 2) Legacy exact one-file name (bridge for older clients / incomplete zips)
+        for asset in assets:
+            name = str(asset.get("name", "")).lower()
+            size = int(asset.get("size", 0) or 0)
+            if name == "hammercandlebacktestdashboard.exe" and size >= MIN_RUNTIME_BYTES:
+                return asset
+        for asset in assets:
+            name = str(asset.get("name", "")).lower()
+            size = int(asset.get("size", 0) or 0)
+            if name == "hammerruntime.exe" and size >= MIN_RUNTIME_BYTES:
+                return asset
 
     def score(asset: dict) -> int:
         name = str(asset.get("name", "")).lower()
@@ -284,7 +317,6 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
         pts = 0
         if name.endswith(".exe"):
             pts += 200
-            # Full Windows bundle ~420–450 MB (ray[default]); ~408 MB = missing ray extras
             if size and size < 50_000_000:
                 pts -= 200
             elif size and size < 300_000_000:
@@ -295,13 +327,14 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
                 pts += 50
             elif size >= 380_000_000:
                 pts += 30
-            elif size and size < 350_000_000:
+            elif size and size < MIN_RUNTIME_BYTES:
                 pts -= 80
-            # From source: never prefer a Windows .exe over a source zip
             if not frozen:
                 pts -= 250
         if name == "hammercandlebacktestdashboard.exe":
             pts += 60
+        if name == "hammerruntime.exe":
+            pts += 55
         if "windows" in name:
             pts += 90
         if "hammercandle" in name:
@@ -310,14 +343,14 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
             pts += 30
         if name.endswith(".zip"):
             pts += 20
-            # Source-only git archive (~300 KB) — never use for frozen Windows
             if size and size < 5_000_000:
                 pts -= 150
-            # From source: prefer Hammer source / delivery zips
+            if frozen and "windows" in name and size >= MIN_RUNTIME_BYTES:
+                pts += 250
             if not frozen and "hammer" in name:
                 pts += 200
         if frozen and name.endswith(".zip"):
-            if "windows" not in name and not name.endswith(".exe"):
+            if "windows" not in name:
                 if name.startswith("hammer-") or name.endswith("src.zip"):
                     pts -= 120
         return pts
@@ -379,7 +412,7 @@ def check_for_update() -> Optional[ReleaseInfo]:
     if not asset:
         if getattr(sys, "frozen", False):
             raise UpdateError(
-                "Latest release has no HammerCandleBacktestDashboard.exe yet.\n\n"
+                "Latest release has no Hammer-windows.zip / HammerRuntime.exe yet.\n\n"
                 "Wait for the Release Windows EXE GitHub Action to finish for this "
                 "version (runs automatically on each v* tag), then try again."
             )
@@ -474,7 +507,7 @@ def _download_file(
             pass
         raise UpdateError(
             f"Downloaded file is only {got / (1024 * 1024):.1f} MB — that is not the "
-            "Windows exe (likely source zip). Need HammerCandleBacktestDashboard.exe."
+            "Windows exe (likely source zip). Need Hammer-windows.zip or HammerRuntime.exe."
         )
 
 
@@ -513,9 +546,7 @@ def _unblock_windows_download(path: str) -> None:
 
 
 def app_root() -> str:
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    return hammer_install_root()
 
 
 def _find_source_root(extracted_dir: str) -> str:
@@ -587,8 +618,182 @@ def _is_onedir_payload(payload_root: str) -> bool:
     return os.path.isdir(os.path.join(payload_root, "_internal"))
 
 
-# Windows: apply update after this process exits (exe swap or onedir folder copy)
+# Filled by install helpers with path to _hammer_apply_update.bat (Windows).
 _WINDOWS_UPDATE_BAT: list = [None]
+
+
+def _find_runtime_exe_in_tree(root: str) -> Optional[str]:
+    """Prefer app/HammerRuntime.exe inside an extracted package."""
+    direct = os.path.join(root, "app", RUNTIME_EXE_NAME)
+    if os.path.isfile(direct):
+        return direct
+    found: Optional[str] = None
+    for dirpath, _, files in os.walk(root):
+        for fname in files:
+            if fname.lower() == RUNTIME_EXE_NAME.lower():
+                return os.path.join(dirpath, fname)
+            if fname.lower() == "hammercandlebacktestdashboard.exe":
+                path = os.path.join(dirpath, fname)
+                try:
+                    if os.path.getsize(path) >= MIN_RUNTIME_BYTES:
+                        found = found or path
+                except OSError:
+                    pass
+    return found
+
+
+def _find_stub_exe_in_tree(root: str) -> Optional[str]:
+    """Small launcher named HammerCandleBacktestDashboard.exe (not the huge runtime)."""
+    direct = os.path.join(root, STUB_EXE_NAME)
+    if os.path.isfile(direct):
+        try:
+            if os.path.getsize(direct) < MIN_RUNTIME_BYTES:
+                return direct
+        except OSError:
+            return direct
+    for dirpath, _, files in os.walk(root):
+        for fname in files:
+            if fname.lower() != STUB_EXE_NAME.lower():
+                continue
+            path = os.path.join(dirpath, fname)
+            try:
+                if os.path.getsize(path) < MIN_RUNTIME_BYTES:
+                    return path
+            except OSError:
+                return path
+    return None
+
+
+def _validate_runtime_file(path: str) -> None:
+    size = os.path.getsize(path)
+    if size < MIN_RUNTIME_BYTES:
+        raise UpdateError(
+            f"Runtime is only {size / (1024 * 1024):.1f} MB — expected ~420–450 MB.\n\n"
+            "The release may be incomplete or the wrong file was attached."
+        )
+
+
+def _schedule_relaunch_stub(root: str, status_cb: Callable[[str], None], note: str) -> str:
+    """After this process exits, start the stub (which applies pending + launches runtime)."""
+    stub = stub_exe_path(root)
+    log_path = update_log_path()
+    if os.name == "nt":
+        if not os.path.isfile(stub):
+            # Legacy fallback: relaunch whatever we are
+            stub = os.path.abspath(sys.executable)
+        bat = _write_windows_update_bat(
+            pid=os.getpid(),
+            exe_path=stub,
+            lines=[
+                _bat_echo_log(log_path, note),
+                _bat_echo_log(log_path, "UPDATE_OK staging done — relaunching stub"),
+                *_windows_relaunch_lines(root, stub, log_path),
+            ],
+        )
+        _WINDOWS_UPDATE_BAT[0] = bat
+        status_cb("Update staged — closing to finish via launcher...")
+    else:
+        status_cb("Update staged.")
+    return root
+
+
+def _stage_runtime_pending(downloaded_runtime: str, status_cb: Callable[[str], None]) -> str:
+    """Copy new runtime beside the live one as .pending; stub applies it on next start."""
+    root = app_root()
+    os.makedirs(hammer_app_dir(root), exist_ok=True)
+    pending = pending_runtime_path(root)
+    status_cb("Staging new runtime (no replace while running)...")
+    shutil.copy2(downloaded_runtime, pending)
+    _unblock_windows_download(pending)
+    _validate_runtime_file(pending)
+    return _schedule_relaunch_stub(root, status_cb, "Pending runtime ready")
+
+
+def _install_stub_package(
+    *,_stub: Optional[str],
+    next_runtime: str,
+    status_cb: Callable[[str], None],
+) -> str:
+    """
+    Install stub launcher + runtime into install root.
+
+    Never overwrites the running runtime in place — uses .pending when needed.
+    First migration from legacy one-file: write app/runtime, then rename-swap stub.
+    """
+    root = app_root()
+    os.makedirs(hammer_app_dir(root), exist_ok=True)
+    _validate_runtime_file(next_runtime)
+
+    # Always refresh stub when provided (stub is not the running UI process when
+    # we are inside HammerRuntime; when legacy one-file, we swap after).
+    if next_stub and os.path.isfile(next_stub) and not is_running_as_legacy_onefile():
+        dest_stub = stub_exe_path(root)
+        status_cb("Updating launcher...")
+        shutil.copy2(next_stub, dest_stub + ".new")
+        _unblock_windows_download(dest_stub + ".new")
+        try:
+            if os.path.isfile(dest_stub):
+                os.replace(dest_stub, dest_stub + ".old")
+            os.replace(dest_stub + ".new", dest_stub)
+            try:
+                os.remove(dest_stub + ".old")
+            except OSError:
+                pass
+        except OSError:
+            # Keep .new for the bat to finish
+            pass
+
+    if is_running_as_runtime() or is_stub_layout(root):
+        return _stage_runtime_pending(next_runtime, status_cb)
+
+    # Legacy one-file at install root: place runtime (path free), then swap stub in.
+    status_cb("Installing runtime into app/...")
+    dest_runtime = runtime_exe_path(root)
+    shutil.copy2(next_runtime, dest_runtime)
+    _unblock_windows_download(dest_runtime)
+    _validate_runtime_file(dest_runtime)
+
+    if next_stub and os.path.isfile(next_stub) and os.name == "nt":
+        status_cb("Installing launcher (one-time migration)...")
+        current_exe = os.path.abspath(sys.executable)
+        staged_stub = os.path.join(root, STUB_EXE_NAME + ".new")
+        shutil.copy2(next_stub, staged_stub)
+        _unblock_windows_download(staged_stub)
+        log_path = update_log_path()
+        swapped = _swap_exe_while_running(staged_stub, current_exe, min_bytes=50_000)
+        if swapped:
+            bat = _write_windows_update_bat(
+                pid=os.getpid(),
+                exe_path=current_exe,
+                lines=[
+                    _bat_echo_log(log_path, "Stub installed; runtime in app/"),
+                    f'del /F /Q "{current_exe}.old" 2>nul',
+                    _bat_echo_log(log_path, "UPDATE_OK stub migration"),
+                    *_windows_relaunch_lines(root, current_exe, log_path),
+                ],
+            )
+        else:
+            bat = _write_windows_update_bat(
+                pid=os.getpid(),
+                exe_path=current_exe,
+                lines=[
+                    *_windows_replace_exe_lines(
+                        staged=staged_stub, current_exe=current_exe, log_path=log_path
+                    ),
+                    *_windows_relaunch_lines(root, current_exe, log_path),
+                ],
+            )
+        _WINDOWS_UPDATE_BAT[0] = bat
+        status_cb("Migration staged — closing to finish...")
+        return root
+
+    # Non-Windows or no stub in package: just save runtime path note
+    status_cb("Runtime installed under app/.")
+    return root
+
+
+# Windows: apply update after this process exits (exe swap or onedir folder copy)
+# _WINDOWS_UPDATE_BAT declared earlier (near stub install helpers)
 _UPDATE_LOG_NAME = "_hammer_update.log"
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
@@ -692,9 +897,9 @@ def read_pending_update_message() -> Optional[str]:
             "The last Check for Updates could not replace the .exe.\n\n"
             "Details (_hammer_update.log):\n"
             f"{text}\n\n"
-            "Fix: close all Hammer windows, download the latest "
-            "HammerCandleBacktestDashboard.exe from GitHub Releases "
-            "(~420–450 MB), replace the file manually, then double-click it."
+            "Fix: close all Hammer windows, download Hammer-windows.zip from GitHub "
+            "Releases (or the large HammerCandleBacktestDashboard.exe bridge build), "
+            "replace/extract next to your data/ folder, then double-click the launcher."
         )
     if "UPDATE_OK" in text:
         return None
@@ -769,7 +974,12 @@ def _windows_relaunch_lines(root: str, exe_path: str, log_path: str) -> list[str
     return lines
 
 
-def _swap_exe_while_running(staged: str, current_exe: str) -> bool:
+def _swap_exe_while_running(
+    staged: str,
+    current_exe: str,
+    *,
+    min_bytes: Optional[int] = MIN_RUNTIME_BYTES,
+) -> bool:
     """
     Windows: rename the running one-file exe, then copy the new file into
     the original name.
@@ -777,6 +987,9 @@ def _swap_exe_while_running(staged: str, current_exe: str) -> bool:
     A running .exe can be RENAMED even when it cannot be deleted or
     overwritten. Waiting until after exit (old bat `move`) is what failed
     with "exe still locked" — Defender / bootloader still holds the path.
+
+    min_bytes: size floor for the file written onto current_exe. Use a small
+    value when installing the stub launcher (migration).
     """
     if os.name != "nt":
         return False
@@ -793,7 +1006,7 @@ def _swap_exe_while_running(staged: str, current_exe: str) -> bool:
     try:
         shutil.copy2(staged, current_exe)
         _unblock_windows_download(current_exe)
-        if os.path.getsize(current_exe) < 350_000_000:
+        if min_bytes and os.path.getsize(current_exe) < min_bytes:
             raise OSError("copied exe too small")
         try:
             os.remove(staged)
@@ -984,7 +1197,7 @@ def _schedule_windows_onedir_update(payload_root: str, status_cb: Callable[[str]
 
 
 def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
-    """Replace the running frozen EXE (Windows one-file or onedir launcher)."""
+    """Install a downloaded runtime .exe into stub layout (or legacy one-file swap)."""
     root = app_root()
     if not getattr(sys, "frozen", False):
         dest = os.path.join(root, os.path.basename(downloaded_exe))
@@ -992,19 +1205,20 @@ def _install_exe(downloaded_exe: str, status_cb: Callable[[str], None]) -> str:
         shutil.copy2(downloaded_exe, dest)
         return root
 
+    _validate_runtime_file(downloaded_exe)
+
+    # Preferred path: never replace the running UI binary in place
+    if is_running_as_runtime() or is_stub_layout(root):
+        return _stage_runtime_pending(downloaded_exe, status_cb)
+
+    # Legacy single-file install — keep old rename/sidecar path once
     current_exe = os.path.abspath(sys.executable)
     dest_name = os.path.basename(current_exe)
     staged = os.path.join(root, dest_name + ".new")
     status_cb("Staging new executable...")
     shutil.copy2(downloaded_exe, staged)
     _unblock_windows_download(staged)
-    staged_size = os.path.getsize(staged)
-    if staged_size < 350_000_000:
-        raise UpdateError(
-            f"Downloaded exe is only {staged_size / (1024 * 1024):.1f} MB — expected ~420–450 MB.\n\n"
-            "The release may be incomplete or the wrong file was attached. "
-            "Use HammerCandleBacktestDashboard.exe from GitHub Actions, not a source zip."
-        )
+    _validate_runtime_file(staged)
 
     if os.name == "nt":
         log_path = update_log_path()
@@ -1062,9 +1276,15 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
         time.sleep(1.0)
         os._exit(0)
 
+    # Prefer stub so pending runtime is applied before UI start
+    launch_exe = python_exe
+    stub = stub_exe_path(root)
+    if getattr(sys, "frozen", False) and os.path.isfile(stub):
+        launch_exe = stub
+
     if os.name == "nt":
         if getattr(sys, "frozen", False):
-            _spawn_frozen_relaunch(python_exe, root)
+            _spawn_frozen_relaunch(launch_exe, root)
         else:
             relauncher = os.path.join(root, "_hammer_relaunch.bat")
             with open(relauncher, "w", encoding="ascii", newline="\r\n", errors="replace") as f:
@@ -1081,7 +1301,7 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
                 if str(key).startswith("_PYI_"):
                     env.pop(key, None)
             env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-            subprocess.Popen([python_exe], cwd=root, env=env)
+            subprocess.Popen([launch_exe], cwd=root, env=env)
         else:
             subprocess.Popen([python_exe, main_script], cwd=root)
 
@@ -1108,10 +1328,13 @@ def _install_from_zip(
                 raise UpdateError(
                     "This release zip is source code only and cannot update the "
                     "Windows .exe.\n\n"
-                    "The maintainer must attach HammerCandleBacktestDashboard.exe or "
-                    "HammerCandleBacktestDashboard-windows.zip (from GitHub Actions) "
-                    "to the GitHub Release."
+                    "The maintainer must attach Hammer-windows.zip (stub + runtime) "
+                    "from GitHub Actions to the GitHub Release."
                 )
+            runtime_in_tree = _find_runtime_exe_in_tree(source_root)
+            stub_in_tree = _find_stub_exe_in_tree(source_root)
+            if runtime_in_tree:
+                return _install_stub_package(stub_in_tree, runtime_in_tree, status_cb)
             exe_in_tree = _find_hammer_exe_in_tree(source_root)
             if exe_in_tree:
                 payload_root = os.path.dirname(exe_in_tree)
@@ -1124,7 +1347,8 @@ def _install_from_zip(
                     return app_root()
                 return _install_exe(exe_in_tree, status_cb)
             raise UpdateError(
-                "Could not find HammerCandleBacktestDashboard.exe inside the release zip."
+                "Could not find HammerRuntime.exe (or a full Hammer .exe) inside "
+                "the release zip."
             )
 
         status_cb("Installing update...")

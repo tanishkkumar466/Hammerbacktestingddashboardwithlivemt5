@@ -234,10 +234,15 @@ _MARKET_SUBFOLDERS = ("spot", "futures")
 
 
 def _default_data_anchor() -> str:
-    """App/exe folder — same idea as dashboard.get_app_dir() for frozen builds."""
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    """Install root (stub folder) — same idea as dashboard.get_app_dir()."""
+    try:
+        from update.paths import install_root
+
+        return install_root()
+    except Exception:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
 
 def resolve_data_root(data_root: str, anchor_dir: Optional[str] = None) -> str:
