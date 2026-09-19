@@ -4,7 +4,7 @@
 #   dist/HammerRuntime.exe                  (full app)
 # Writes:
 #   dist/HammerPackage/...
-#   dist/Hammer-windows.zip
+#   dist/Hammer-stub-package.zip
 #   dist/release-assets/...  (optional bridge copies)
 #
 # IMPORTANT: keep this file ASCII-only. Windows PowerShell 5.x mis-parses
@@ -52,27 +52,27 @@ Old one-file installs: Check for Updates downloads the large bridge EXE once;
 on first open it auto-converts to this stub + app\ layout.
 "@ | Set-Content -Encoding ascii "$pkg/README.txt"
 
-$zip = "dist/Hammer-windows.zip"
+$zip = "dist/Hammer-stub-package.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 
 # Compress-Archive is unreliable for ~400MB+ trees; use .NET ZipFile instead
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory(
   (Resolve-Path $pkg).Path,
-  (Join-Path (Resolve-Path "dist").Path "Hammer-windows.zip")
+  (Join-Path (Resolve-Path "dist").Path "Hammer-stub-package.zip")
 )
 
 $zipSize = (Get-Item $zip).Length
 Write-Host "Wrote $zip ($([math]::Round($zipSize/1MB,1)) MB)"
-if ($zipSize -lt 400MB) { throw "Hammer-windows.zip too small ($([math]::Round($zipSize/1MB,1)) MB)" }
+if ($zipSize -lt 400MB) { throw "Hammer-stub-package.zip too small ($([math]::Round($zipSize/1MB,1)) MB)" }
 
 # Release / artifact bridge copies
 $assets = "dist/release-assets"
 if (Test-Path $assets) { Remove-Item $assets -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $assets | Out-Null
-Copy-Item -LiteralPath $zip -Destination "$assets/Hammer-windows.zip" -Force
+Copy-Item -LiteralPath $zip -Destination "$assets/Hammer-stub-package.zip" -Force
 Copy-Item -LiteralPath $runtime -Destination "$assets/HammerRuntime.exe" -Force
-# Older clients (pre-stub updater) only accept this exact large filename
+# Older clients (pre-stub updater / broken 1.0.27-1.0.28 zip installer) accept this exact large filename
 Copy-Item -LiteralPath $runtime -Destination "$assets/HammerCandleBacktestDashboard.exe" -Force
 
-Write-Host "Package OK -> dist/HammerPackage + dist/Hammer-windows.zip + dist/release-assets/"
+Write-Host "Package OK -> dist/HammerPackage + dist/Hammer-stub-package.zip + dist/release-assets/"

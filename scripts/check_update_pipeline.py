@@ -63,13 +63,24 @@ def check_asset_pick() -> None:
     picked = updater._pick_release_asset(
         [
             {"name": "HammerCandleBacktestDashboard.exe", "size": 430_000_000},
-            {"name": "Hammer-windows.zip", "size": 435_000_000},
+            {"name": "Hammer-stub-package.zip", "size": 435_000_000},
             {"name": "Source code.zip", "size": 100_000},
         ]
     )
-    if not picked or picked["name"] != "Hammer-windows.zip":
-        _fail(f"expected Hammer-windows.zip, got {picked}")
-    print("OK frozen asset pick prefers Hammer-windows.zip")
+    if not picked or picked["name"] != "Hammer-stub-package.zip":
+        _fail(f"expected Hammer-stub-package.zip, got {picked}")
+    print("OK frozen asset pick prefers Hammer-stub-package.zip")
+
+    # Recovery path used for 1.0.27/1.0.28: no legacy windows zip name → .exe bridge
+    picked_exe = updater._pick_release_asset(
+        [
+            {"name": "HammerCandleBacktestDashboard.exe", "size": 430_000_000},
+            {"name": "HammerRuntime.exe", "size": 430_000_000},
+        ]
+    )
+    if not picked_exe or picked_exe["name"] != "HammerCandleBacktestDashboard.exe":
+        _fail(f"expected bridge exe when stub zip absent, got {picked_exe}")
+    print("OK frozen asset pick falls back to bridge exe")
 
 
 def check_zip_layout_detection() -> None:
@@ -86,7 +97,7 @@ def check_zip_layout_detection() -> None:
         (pkg / "HammerCandleBacktestDashboard.exe").write_bytes(b"STUB" * 200)  # ~800 bytes
         rt = pkg / "app" / "HammerRuntime.exe"
         rt.write_bytes(b"R" * 60_000)
-        zpath = td / "Hammer-windows.zip"
+        zpath = td / "Hammer-stub-package.zip"
         with zipfile.ZipFile(zpath, "w") as zf:
             for p in pkg.rglob("*"):
                 if p.is_file():

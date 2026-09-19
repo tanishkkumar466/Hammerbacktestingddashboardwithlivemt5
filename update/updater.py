@@ -8,7 +8,9 @@ check_for_update()       -> blocking; call off the GUI thread
 download_and_install()   -> blocking; progress/status callbacks for UI
 
 Release packaging (stub launcher):
-  - Prefer Hammer-windows.zip = stub exe + app/HammerRuntime.exe
+  - Prefer Hammer-stub-package.zip = stub exe + app/HammerRuntime.exe
+    (not Hammer-windows.zip — 1.0.27/1.0.28 exact-match that name and then
+    crash in their broken zip installer; new name lets them use the .exe bridge)
   - Legacy: large HammerCandleBacktestDashboard.exe / HammerRuntime.exe
     still accepted (stages into app/ or one-file swap for old installs)
 """
@@ -282,6 +284,17 @@ def _api_request(url: str, *, not_found_message: Optional[str] = None):
         raise UpdateError(f"Network error contacting GitHub: {e.reason}") from e
 
 
+# Zip names preferred by fixed clients (1.0.30+).
+# Do NOT make Hammer-windows.zip the only package on "latest": 1.0.27/1.0.28
+# exact-match it then crash in their broken zip installer. New name lets those
+# builds fall through to the .exe bridge path (_install_exe), which works.
+STUB_PACKAGE_ZIP_NAMES = (
+    "hammer-stub-package.zip",
+    "hammer-windows.zip",  # legacy; avoid uploading while broken clients exist
+    "hammercandlebacktestdashboard-windows.zip",
+)
+
+
 def _pick_release_asset(assets: list) -> Optional[dict]:
     """Prefer stub zip when frozen; source .zip when running from code."""
     if not assets:
@@ -290,14 +303,11 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
     frozen = bool(getattr(sys, "frozen", False))
 
     if frozen:
-        # 1) Official stub+runtime package
+        # 1) Official stub+runtime package (new name first)
         for asset in assets:
             name = str(asset.get("name", "")).lower()
             size = int(asset.get("size", 0) or 0)
-            if name in (
-                "hammer-windows.zip",
-                "hammercandlebacktestdashboard-windows.zip",
-            ) and size >= MIN_RUNTIME_BYTES:
+            if name in STUB_PACKAGE_ZIP_NAMES and size >= MIN_RUNTIME_BYTES:
                 return asset
         # 2) Legacy exact one-file name (bridge for older clients / incomplete zips)
         for asset in assets:
@@ -345,12 +355,14 @@ def _pick_release_asset(assets: list) -> Optional[dict]:
             pts += 20
             if size and size < 5_000_000:
                 pts -= 150
-            if frozen and "windows" in name and size >= MIN_RUNTIME_BYTES:
+            if frozen and (
+                "stub-package" in name or "windows" in name
+            ) and size >= MIN_RUNTIME_BYTES:
                 pts += 250
             if not frozen and "hammer" in name:
                 pts += 200
         if frozen and name.endswith(".zip"):
-            if "windows" not in name:
+            if "stub-package" not in name and "windows" not in name:
                 if name.startswith("hammer-") or name.endswith("src.zip"):
                     pts -= 120
         return pts
@@ -412,7 +424,7 @@ def check_for_update() -> Optional[ReleaseInfo]:
     if not asset:
         if getattr(sys, "frozen", False):
             raise UpdateError(
-                "Latest release has no Hammer-windows.zip / HammerRuntime.exe yet.\n\n"
+                "Latest release has no Hammer-stub-package.zip / HammerRuntime.exe yet.\n\n"
                 "Wait for the Release Windows EXE GitHub Action to finish for this "
                 "version (runs automatically on each v* tag), then try again."
             )
@@ -507,7 +519,7 @@ def _download_file(
             pass
         raise UpdateError(
             f"Downloaded file is only {got / (1024 * 1024):.1f} MB — that is not the "
-            "Windows exe (likely source zip). Need Hammer-windows.zip or HammerRuntime.exe."
+            "Windows exe (likely source zip). Need Hammer-stub-package.zip or HammerRuntime.exe."
         )
 
 
@@ -897,7 +909,7 @@ def read_pending_update_message() -> Optional[str]:
             "The last Check for Updates could not replace the .exe.\n\n"
             "Details (_hammer_update.log):\n"
             f"{text}\n\n"
-            "Fix: close all Hammer windows, download Hammer-windows.zip from GitHub "
+            "Fix: close all Hammer windows, download Hammer-stub-package.zip from GitHub "
             "Releases (or the large HammerCandleBacktestDashboard.exe bridge build), "
             "replace/extract next to your data/ folder, then double-click the launcher."
         )
@@ -1328,17 +1340,26 @@ def _install_from_zip(
                 raise UpdateError(
                     "This release zip is source code only and cannot update the "
                     "Windows .exe.\n\n"
-                    "The maintainer must attach Hammer-windows.zip (stub + runtime) "
-                    "from GitHub Actions to the GitHub Release."
+                    "The maintainer must attach Hammer-stub-package.zip "
+                    "(stub + runtime) from GitHub Actions to the GitHub Release."
                 )
             runtime_in_tree = _find_runtime_exe_in_tree(source_root)
             stub_in_tree = _find_stub_exe_in_tree(source_root)
             if runtime_in_tree:
-                return _install_stub_package(
-                    next_stub=stub_in_tree,
-                    next_runtime=runtime_in_tree,
-                    status_cb=status_cb,
-                )
+                try:
+                    return _install_stub_package(
+                        next_stub=stub_in_tree,
+                        next_runtime=runtime_in_tree,
+                        status_cb=status_cb,
+                    )
+                except TypeError as exc:
+                    # Safety net if an old broken binary somehow runs new assets
+                    raise UpdateError(
+                        "Zip install failed on this build (known 1.0.27/1.0.28 bug).\n\n"
+                        "Close Hammer, download HammerRuntime.exe from the GitHub "
+                        "Release, replace app\\HammerRuntime.exe, then reopen the "
+                        f"launcher.\n\n({exc})"
+                    ) from exc
             exe_in_tree = _find_hammer_exe_in_tree(source_root)
             if exe_in_tree:
                 payload_root = os.path.dirname(exe_in_tree)

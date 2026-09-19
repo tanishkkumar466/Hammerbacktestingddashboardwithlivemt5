@@ -1,5 +1,6 @@
 # Build stub launcher + HammerRuntime, smoke-test, attach to the GitHub Release for this tag.
-# Prefer Hammer-windows.zip (stub + app/HammerRuntime.exe). Also upload bridge EXEs for older clients.
+# Prefer Hammer-stub-package.zip (stub + app/HammerRuntime.exe). Also upload bridge EXEs
+# for older clients. Do NOT upload Hammer-windows.zip: 1.0.27/1.0.28 exact-match it and crash.
 
 name: Release Windows EXE
 
@@ -118,7 +119,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/release-assets/Hammer-windows.zip
+            dist/release-assets/Hammer-stub-package.zip
             dist/release-assets/HammerRuntime.exe
             dist/release-assets/HammerCandleBacktestDashboard.exe
           fail_on_unmatched_files: true

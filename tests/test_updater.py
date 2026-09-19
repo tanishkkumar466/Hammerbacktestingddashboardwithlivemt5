@@ -61,7 +61,7 @@ def test_pick_large_exe_when_frozen(monkeypatch):
     assert int(picked["size"]) >= 350_000_000
 
 
-def test_pick_windows_zip_over_exe_when_frozen(monkeypatch):
+def test_pick_stub_package_zip_over_exe_when_frozen(monkeypatch):
     """Stub package zip is preferred over a raw runtime exe."""
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
     assets = [
@@ -71,14 +71,34 @@ def test_pick_windows_zip_over_exe_when_frozen(monkeypatch):
             "size": 430_000_000,
         },
         {
-            "name": "Hammer-windows.zip",
+            "name": "Hammer-stub-package.zip",
             "browser_download_url": "https://x/z",
             "size": 435_000_000,
         },
     ]
     picked = updater._pick_release_asset(assets)
     assert picked is not None
-    assert picked["name"] == "Hammer-windows.zip"
+    assert picked["name"] == "Hammer-stub-package.zip"
+
+
+def test_broken_client_zip_name_not_required_for_exe_bridge(monkeypatch):
+    """Without Hammer-windows.zip, frozen pickers must take the large .exe bridge."""
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    assets = [
+        {
+            "name": "HammerCandleBacktestDashboard.exe",
+            "browser_download_url": "https://x/e",
+            "size": 430_000_000,
+        },
+        {
+            "name": "HammerRuntime.exe",
+            "browser_download_url": "https://x/r",
+            "size": 430_000_000,
+        },
+    ]
+    picked = updater._pick_release_asset(assets)
+    assert picked is not None
+    assert picked["name"] == "HammerCandleBacktestDashboard.exe"
 
 
 def test_reject_tiny_assets_when_frozen(monkeypatch):

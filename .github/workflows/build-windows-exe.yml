@@ -114,8 +114,8 @@ jobs:
       - name: Upload artifact (stub package zip)
         uses: actions/upload-artifact@v4
         with:
-          name: Hammer-windows-zip
-          path: dist/Hammer-windows.zip
+          name: Hammer-stub-package-zip
+          path: dist/Hammer-stub-package.zip
           if-no-files-found: error
 
       - name: Upload artifact (runtime exe)

@@ -185,7 +185,7 @@ def main() -> int:
                 return subprocess.call([sys.executable, main_py, *sys.argv[1:]], cwd=root)
         msg = (
             f"Hammer runtime not found:\n{runtime}\n\n"
-            "Re-download Hammer-windows.zip from GitHub Releases, or use "
+            "Re-download Hammer-stub-package.zip from GitHub Releases, or use "
             "Help → Check for Updates from a working install."
         )
         _log(root, msg)
