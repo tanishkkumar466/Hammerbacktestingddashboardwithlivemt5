@@ -8,6 +8,8 @@ so MT5 order flow is never blocked.
 from __future__ import annotations
 
 import json
+import os
+import ssl
 import threading
 import time
 import urllib.error
@@ -34,6 +36,59 @@ EVENT_TITLES = {
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SEC = 2.0
 DEFAULT_TIMEOUT_SEC = 15.0
+
+
+def _is_ssl_verify_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "certificate_verify_failed" in text or "certificate verify failed" in text:
+        return True
+    if "ssl" in text and "certificate" in text:
+        return True
+    try:
+        import ssl as _ssl
+
+        if isinstance(exc, _ssl.SSLError):
+            return True
+    except Exception:
+        pass
+    reason = getattr(exc, "reason", None)
+    if reason is not None and reason is not exc:
+        return _is_ssl_verify_error(reason) if isinstance(reason, BaseException) else (
+            "certificate" in str(reason).lower() and "ssl" in str(reason).lower()
+        )
+    return False
+
+
+def build_ssl_context(*, insecure: bool = False) -> ssl.SSLContext:
+    """
+    SSL context for Telegram HTTPS.
+
+    Frozen Windows builds often lack a system CA store; prefer certifi.
+    Antivirus MITM can still fail verify — callers may retry insecure=True.
+    """
+    if insecure or (os.environ.get("HAMMER_TELEGRAM_INSECURE_SSL") or "").strip().lower() in (
+        "1", "true", "yes", "on",
+    ):
+        return ssl._create_unverified_context()
+
+    ctx = ssl.create_default_context()
+    # Prefer bundled Mozilla CA bundle (certifi) when available
+    try:
+        import certifi
+
+        ca = certifi.where()
+        if ca and os.path.isfile(ca):
+            ctx.load_verify_locations(cafile=ca)
+    except Exception:
+        pass
+    # Optional override from env / runtime hook
+    ca_file = (os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE") or "").strip()
+    if ca_file and os.path.isfile(ca_file):
+        try:
+            ctx.load_verify_locations(cafile=ca_file)
+        except Exception:
+            pass
+    return ctx
 
 
 def _fmt_price(value: float) -> str:
@@ -177,6 +232,10 @@ def send_message(
 ) -> Tuple[bool, str]:
     """
     POST to Telegram sendMessage with retries. Returns (success, detail).
+
+    Uses certifi CA bundle when available. If SSL verify still fails
+    (common with Windows AV MITM / frozen exe), retries once with an
+    unverified context so Notification Manager tests remain usable.
     """
     token = (bot_token or "").strip()
     cid = (chat_id or "").strip()
@@ -202,14 +261,25 @@ def send_message(
 
     attempts = max(1, int(max_retries))
     last_err = "unknown error"
+    used_insecure = False
+    ssl_ctx = build_ssl_context(insecure=False)
+
+    def _post(ctx: ssl.SSLContext) -> Tuple[bool, str]:
+        with urllib.request.urlopen(req, timeout=timeout_sec, context=ctx) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        payload = json.loads(raw)
+        if payload.get("ok"):
+            return True, "sent"
+        return False, str(payload.get("description") or raw)
+
     for attempt in range(1, attempts + 1):
         try:
-            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-            payload = json.loads(raw)
-            if payload.get("ok"):
-                return True, "sent"
-            last_err = payload.get("description") or raw
+            ok, detail = _post(ssl_ctx)
+            if ok:
+                if used_insecure:
+                    return True, "sent (SSL verify relaxed — antivirus/proxy CA)"
+                return True, detail
+            last_err = detail
         except urllib.error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8", errors="replace")
@@ -219,16 +289,62 @@ def send_message(
                 last_err = str(e)
         except urllib.error.URLError as e:
             last_err = str(e.reason if hasattr(e, "reason") else e)
+            if _is_ssl_verify_error(e) and not used_insecure:
+                # Retry remaining attempts with unverified TLS (Telegram only)
+                used_insecure = True
+                ssl_ctx = build_ssl_context(insecure=True)
+                last_err = (
+                    f"{last_err} — retrying with relaxed SSL "
+                    "(common with Windows antivirus HTTPS scan)"
+                )
+                # Immediate retry this attempt with insecure context
+                try:
+                    ok, detail = _post(ssl_ctx)
+                    if ok:
+                        return True, "sent (SSL verify relaxed — antivirus/proxy CA)"
+                    last_err = detail
+                except Exception as e2:
+                    last_err = str(getattr(e2, "reason", e2))
         except TimeoutError:
             last_err = "request timed out"
+        except ssl.SSLError as e:
+            last_err = str(e)
+            if not used_insecure:
+                used_insecure = True
+                ssl_ctx = build_ssl_context(insecure=True)
+                try:
+                    ok, detail = _post(ssl_ctx)
+                    if ok:
+                        return True, "sent (SSL verify relaxed — antivirus/proxy CA)"
+                    last_err = detail
+                except Exception as e2:
+                    last_err = str(e2)
         except json.JSONDecodeError as e:
             last_err = f"invalid JSON response: {e}"
         except Exception as e:
             last_err = str(e)
+            if _is_ssl_verify_error(e) and not used_insecure:
+                used_insecure = True
+                ssl_ctx = build_ssl_context(insecure=True)
+                try:
+                    ok, detail = _post(ssl_ctx)
+                    if ok:
+                        return True, "sent (SSL verify relaxed — antivirus/proxy CA)"
+                    last_err = detail
+                except Exception as e2:
+                    last_err = str(e2)
 
         if attempt < attempts:
             time.sleep(retry_delay_sec)
 
+    if _is_ssl_verify_error(Exception(last_err)) or "certificate" in last_err.lower():
+        last_err = (
+            f"{last_err}\n\n"
+            "Tip: Windows antivirus HTTPS scanning often causes this. "
+            "Hammer already retries with relaxed SSL; if it still fails, "
+            "allow Hammer.exe through the antivirus or set "
+            "HAMMER_TELEGRAM_INSECURE_SSL=1."
+        )
     return False, last_err
 
 

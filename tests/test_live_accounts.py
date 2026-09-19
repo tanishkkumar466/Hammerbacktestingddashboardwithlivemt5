@@ -123,3 +123,99 @@ def test_remove_account_keeps_one():
     assert len(desk.accounts) == 1
     assert desk.accounts[0].id == acc2.id
     assert all(s.account_id == acc2.id for s in desk.slots)
+
+
+def test_next_magic_raises_when_series_full():
+    desk = la.LiveDesk()
+    desk.ensure_defaults()
+    acc = desk.accounts[0]
+    lo, hi = acc.magic_range()
+    # Fill every magic in the series (including the default slot)
+    desk.slots = [
+        la.LiveSlot.new(acc.id, f"S{i}", lo + i) for i in range(hi - lo + 1)
+    ]
+    try:
+        desk.next_magic_for_account(acc.id)
+        assert False, "expected ValueError"
+    except ValueError as exc:
+        assert "full" in str(exc).lower() or "Max" in str(exc)
+
+
+def test_many_accounts_get_isolated_magic_series():
+    desk = la.LiveDesk()
+    desk.ensure_defaults()
+    for i in range(5):
+        acc = la.LiveAccount.new(f"Acc{i + 2}", desk.next_account_magic_base())
+        desk.accounts.append(acc)
+        desk.slots.append(la.LiveSlot.new(acc.id, "S1", desk.next_magic_for_account(acc.id)))
+    desk.ensure_magic_series()
+    bases = [a.magic_base for a in desk.accounts]
+    assert len(bases) == len(set(bases))
+    assert desk.magics_unique()
+    assert desk.magics_in_series()
+    # No overlapping ranges
+    ranges = [a.magic_range() for a in desk.accounts]
+    for i, (lo_a, hi_a) in enumerate(ranges):
+        for j, (lo_b, hi_b) in enumerate(ranges):
+            if i >= j:
+                continue
+            assert hi_a < lo_b or hi_b < lo_a
+
+
+def test_dry_run_persists_per_account(tmp_path):
+    desk = la.LiveDesk()
+    desk.ensure_defaults()
+    desk.accounts[0].dry_run = False
+    acc2 = la.LiveAccount.new("Two", desk.next_account_magic_base())
+    acc2.dry_run = True
+    desk.accounts.append(acc2)
+    desk.slots.append(la.LiveSlot.new(acc2.id, "S", desk.next_magic_for_account(acc2.id)))
+    path = str(tmp_path / "desk.json")
+    la.save_desk(path, desk)
+    loaded = la.load_desk(path)
+    by_name = {a.name: a for a in loaded.accounts}
+    assert by_name[desk.accounts[0].name].dry_run is False
+    assert by_name["Two"].dry_run is True
+
+
+def test_normalize_hhmm():
+    assert la.normalize_hhmm("") == ""
+    assert la.normalize_hhmm("9:5") == "09:05"
+    assert la.normalize_hhmm("15:55") == "15:55"
+    assert la.normalize_hhmm("25:00") == ""
+    assert la.normalize_hhmm("bad") == ""
+
+
+def test_apply_global_schedule_same_and_per_account(tmp_path):
+    desk = la.LiveDesk()
+    desk.ensure_defaults()
+    a2 = la.LiveAccount.new("Two", desk.next_account_magic_base())
+    desk.accounts.append(a2)
+    desk.slots.append(la.LiveSlot.new(a2.id, "S", desk.next_magic_for_account(a2.id)))
+    desk.apply_global_schedule(start_hhmm="09:15", stop_hhmm="15:55")
+    assert desk.global_start_hhmm == "09:15"
+    assert all(a.schedule_start_hhmm == "09:15" for a in desk.accounts)
+    assert all(a.schedule_stop_hhmm == "15:55" for a in desk.accounts)
+    # Per-account override
+    desk.accounts[0].schedule_start_hhmm = "10:00"
+    path = str(tmp_path / "desk.json")
+    la.save_desk(path, desk)
+    loaded = la.load_desk(path)
+    assert loaded.accounts[0].schedule_start_hhmm == "10:00"
+    assert loaded.accounts[1].schedule_start_hhmm == "09:15"
+    desk.apply_global_schedule(clear=True)
+    assert desk.global_start_hhmm == ""
+    assert all(a.schedule_start_hhmm == "" for a in desk.accounts)
+
+
+def test_dashboard_schedule_stop_closes_positions():
+    """Global/schedule stop must flatten (close positions), not only halt bots."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "dashboard.py").read_text(encoding="utf-8")
+    marker = "def _check_live_schedule_timers"
+    idx = src.find(marker)
+    assert idx > 0
+    chunk = src[idx : idx + 2500]
+    assert "_emergency_flatten_account" in chunk
+    assert "stop slots + close positions" in chunk

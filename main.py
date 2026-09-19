@@ -93,14 +93,25 @@ def _run_dashboard() -> None:
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtWidgets import QApplication, QLabel
 
-    if getattr(sys, "frozen", False):
+    # Software OpenGL fixes some CI/driver crashes but paints black windows on
+    # many Windows GPUs. Opt-in only: HAMMER_SOFTWARE_OPENGL=1
+    _soft_gl = (os.environ.get("HAMMER_SOFTWARE_OPENGL") or "").strip().lower()
+    if getattr(sys, "frozen", False) and _soft_gl in ("1", "true", "yes", "on"):
         QGuiApplication.setAttribute(Qt.ApplicationAttribute.AA_UseSoftwareOpenGL, True)
-        boot_log("main: AA_UseSoftwareOpenGL set")
+        boot_log("main: AA_UseSoftwareOpenGL set (HAMMER_SOFTWARE_OPENGL)")
+    elif getattr(sys, "frozen", False):
+        boot_log("main: using hardware OpenGL (set HAMMER_SOFTWARE_OPENGL=1 if GPU crashes)")
 
     boot_log("launch: QApplication() ...")
     try:
         app = QApplication.instance() or QApplication(sys.argv)
         boot_log("launch: QApplication OK")
+        if sys.platform.startswith("win"):
+            try:
+                app.setStyle("Fusion")
+                boot_log("main: Fusion style")
+            except Exception:
+                pass
     except Exception as exc:
         boot_log(f"launch: QApplication FAILED: {exc}")
         write_crash(exc)

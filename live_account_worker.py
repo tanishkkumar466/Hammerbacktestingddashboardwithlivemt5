@@ -217,6 +217,34 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
                         log(f"[TELEGRAM] set_notify_enabled failed: {exc}")
                 elif eng is not None and hasattr(eng, "live_config"):
                     eng.live_config.notify_enabled = bool(msg.get("notify_enabled", True))
+            elif cmd == "update_strategy":
+                sid = str(msg.get("slot_id") or "")
+                entry = slots.get(sid)
+                eng = entry.get("engine") if entry else None
+                if eng is None:
+                    emit("error", message=f"update_strategy: slot {sid} not running")
+                else:
+                    try:
+                        eng.update_runtime_strategy(
+                            msg["strategy_config"],
+                            msg["indicator_stack"],
+                            str(msg.get("pattern_type") or eng.pattern_type),
+                            str(msg.get("pattern_label") or eng.pattern_label),
+                            sessions_enabled=msg.get("sessions_enabled"),
+                            session_clock=msg.get("session_clock"),
+                            broker_utc_offset_hours=msg.get("broker_utc_offset_hours"),
+                            ist_time_filter_enabled=msg.get("ist_time_filter_enabled"),
+                            ist_time_start=msg.get("ist_time_start"),
+                            ist_time_end=msg.get("ist_time_end"),
+                            telegram_enabled=msg.get("telegram_enabled"),
+                            telegram_bot_token=msg.get("telegram_bot_token"),
+                            telegram_chat_id=msg.get("telegram_chat_id"),
+                            notification_bots=msg.get("notification_bots"),
+                        )
+                        log(f"Strategy hot-reloaded on slot {sid}.")
+                    except Exception as exc:
+                        log(f"[STRATEGY] update failed: {exc}\n{traceback.format_exc()}")
+                        emit("error", message=f"update_strategy failed: {exc}")
             elif cmd == "ping":
                 emit("pong")
             elif cmd == "shutdown":

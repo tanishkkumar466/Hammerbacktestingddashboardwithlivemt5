@@ -309,6 +309,9 @@ def find_bar_signal_outcome(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
     elif hammer_context_logic.is_context_pattern_type(pattern_type):
+        strategy_config = hammer_context_logic.apply_pullback_for_pattern_type(
+            strategy_config, pattern_type,
+        )
         signals = hammer_context_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
@@ -359,6 +362,9 @@ def find_bar_signal_outcome(
                     ignored=True,
                     ignore_reason=vmsg,
                     pattern_variant=getattr(sig, "pattern_variant", None),
+                    await_limit_fill=bool(getattr(sig, "await_limit_fill", False)),
+                    signal_entry_price=getattr(sig, "signal_entry_price", None),
+                    entry_pullback_pct=getattr(sig, "entry_pullback_pct", None),
                 )
                 ignored_match = sig
                 continue
@@ -1159,6 +1165,19 @@ class LiveTradingEngine:
                 f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill "
                 f"(not forcing market)."
             )
+            signal_e = getattr(sig, "signal_entry_price", None)
+            pull = getattr(sig, "entry_pullback_pct", None)
+            if signal_e is not None:
+                try:
+                    se = float(signal_e)
+                    direction = "DOWN" if is_buy else "UP"
+                    pct_txt = f"{float(pull):g}%" if pull is not None else "?"
+                    self.log(
+                        f"[LIVE] Pullback check: signal entry {se:.2f} → limit {strat_entry:.2f} "
+                        f"({pct_txt} toward SL, wait {direction})."
+                    )
+                except (TypeError, ValueError):
+                    pass
             return "limit_entry", strat_entry, sl, tp
 
         order_mode = (cfg.order_mode or "market").strip().lower()
@@ -1284,11 +1303,19 @@ class LiveTradingEngine:
                 f"forming close≈{f_close}{tick_part} | source={rate_meta.get('rates_source', '?')}"
             )
             gap = rate_meta.get("tick_vs_last_closed")
-            if gap is not None and abs(float(gap)) > 20.0:
+            gap_thr = 20.0
+            # BTC/ETH move more than gold; only warn on large gaps.
+            try:
+                lc_f = float(lc) if lc is not None else 0.0
+            except (TypeError, ValueError):
+                lc_f = 0.0
+            if lc_f >= 1000.0:
+                gap_thr = max(50.0, lc_f * 0.0005)
+            if gap is not None and abs(float(gap)) > gap_thr:
                 self.log(
                     f"[LIVE] Tick vs last closed gap={float(gap):+.2f} — "
-                    "expected while price moves in the OPEN 3m bar; "
-                    "hammer/signals use the last CLOSED bar only (timestamps are UTC)."
+                    f"expected while price moves in the OPEN {cfg.timeframe_label} bar; "
+                    "signals use the last CLOSED bar only (same OHLC as MT5 chart bid bars)."
                 )
 
         last_ts = closed[-1].timestamp
@@ -1301,7 +1328,8 @@ class LiveTradingEngine:
             if snapshot:
                 self.log(
                     f"[LIVE] Indicators right now ({cfg.timeframe_label}, broker feed): {snapshot} — "
-                    "Bar times are UTC (MT5 server). Compare with your M3 chart on the same symbol."
+                    f"Compare OHLC with your MT5 {cfg.timeframe_label} chart on the same symbol "
+                    "(live uses closed bars; the open bar's tick can differ)."
                 )
             return
 
@@ -1331,6 +1359,16 @@ class LiveTradingEngine:
                 self.log(
                     f"[LIVE] Pattern on signal bar but not traded ({variant}): {ignored.ignore_reason}"
                 )
+                reason_l = (ignored.ignore_reason or "").lower()
+                if "exceeds max" in reason_l and "sl" in reason_l:
+                    tip_key = "_max_sl_tip_logged"
+                    if not getattr(self, tip_key, False):
+                        setattr(self, tip_key, True)
+                        self.log(
+                            "[LIVE] Tip: max SL is in price units (same as OHLC), not account $ risk. "
+                            "BTC/ETH often need a much larger max SL than gold (e.g. $50–$200+), "
+                            "or turn off the risk-limit toggle — otherwise every setup is skipped."
+                        )
                 if self.pattern_type == "hammer":
                     self.log(
                         logic.explain_hammer_signal_direction(

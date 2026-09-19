@@ -131,7 +131,12 @@ def build_hammer_strategy(data: dict) -> logic.StrategyConfig:
 def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
     fields = data.get("fields") or {}
     pattern = data.get("pattern", "")
-    default_pull = 35.0 if pattern == hc.PATTERN_LABEL_35 else 0.0
+    for_35 = hc.is_35_pattern_label(pattern)
+    raw_pull = _f(fields, "entry_pullback_pct")
+    pull = hc.resolve_entry_pullback_pct(
+        _float(raw_pull, hc.DEFAULT_PULLBACK_PCT_35 if for_35 else 0.0),
+        for_35_pattern=for_35,
+    )
     return hc.HammerContextConfig(
         buy_hammer_ratios=_ratio_from_fields(fields, "buy"),
         sell_hammer_ratios=_ratio_from_fields(fields, "sell"),
@@ -142,7 +147,7 @@ def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
         sell_require_wick=_bool(_f(fields, "sell_require_wick"), True),
         entry_rule=logic.coerce_entry_rule(_f(fields, "entry_rule", "NEXT_CANDLE_OPEN")),
         entry_offset=_float(_f(fields, "entry_offset"), 0.0),
-        entry_pullback_pct=_float(_f(fields, "entry_pullback_pct"), default_pull),
+        entry_pullback_pct=pull,
         sl_mode=logic.coerce_stop_loss_mode(_f(fields, "sl_mode", "CANDLE_EXTREME")),
         sl_fixed_distance=_float(_f(fields, "sl_fixed_distance"), 5.0),
         buffer_mode=logic.coerce_buffer_mode(_f(fields, "buffer_mode", "PERCENT_OF_RANGE")),

@@ -461,7 +461,8 @@ def build_trade_signal(
         ignored = True
         ignore_reason = (
             f"Risk (${risk:.2f}) exceeds max allowed SL "
-            f"(${tf_setting.max_sl_usd}) for timeframe '{timeframe}'."
+            f"(${tf_setting.max_sl_usd}) for timeframe '{timeframe}' "
+            f"(max SL is price distance, not lot P&L)."
         )
 
     reward = risk * tf_setting.rr_multiple

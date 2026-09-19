@@ -1013,8 +1013,13 @@ def simulate_timeframe_outcomes(
             candles, timeframe=logic_label, config=config.strategy_config,
         )
     elif hammer_context_logic.is_context_pattern_type(config.pattern_type):
+        # Hammer with candle 35%: never silently run at 0% pullback.
+        strat = hammer_context_logic.apply_pullback_for_pattern_type(
+            config.strategy_config, config.pattern_type,
+        )
+        config.strategy_config = strat
         all_signals = hammer_context_logic.run_strategy(
-            candles, timeframe=logic_label, config=config.strategy_config,
+            candles, timeframe=logic_label, config=strat,
         )
     else:
         all_signals = logic.run_strategy(
@@ -1308,6 +1313,9 @@ def ledger_to_polars(
             "pattern_variant": pl.Utf8,
             "entry_time": pl.Datetime, "entry_time_ist": pl.Datetime,
             "entry_price": pl.Float64,
+            "signal_entry_price": pl.Float64,
+            "await_limit_fill": pl.Boolean,
+            "entry_pullback_pct": pl.Float64,
             "stop_loss": pl.Float64, "target": pl.Float64,
             "risk_price_distance": pl.Float64, "rr_multiple_target": pl.Float64,
             "position_size": pl.Float64, "risk_usd": pl.Float64,
@@ -1322,6 +1330,9 @@ def ledger_to_polars(
     for t in trades:
         sig = t.signal
         entry_ist = sessions.broker_to_ist(t.entry_time, broker_utc_offset_hours)
+        signal_entry = getattr(sig, "signal_entry_price", None)
+        await_limit = bool(getattr(sig, "await_limit_fill", False))
+        pull_pct = getattr(sig, "entry_pullback_pct", None)
         base = {
             "timeframe": t.timeframe_folder,
             "direction": sig.direction.value,
@@ -1331,6 +1342,9 @@ def ledger_to_polars(
             "entry_time": t.entry_time,
             "entry_time_ist": entry_ist,
             "entry_price": sig.entry_price,
+            "signal_entry_price": float(signal_entry) if signal_entry is not None else None,
+            "await_limit_fill": await_limit,
+            "entry_pullback_pct": float(pull_pct) if pull_pct is not None else None,
             "stop_loss": sig.stop_loss,
             "target": sig.target,
             "risk_price_distance": sig.risk,

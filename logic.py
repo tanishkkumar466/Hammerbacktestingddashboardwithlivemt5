@@ -802,6 +802,10 @@ class TradeSignal:
     pattern_variant: Optional[str] = None  # CLASSIC / INVERTED for hammer (+ indicators)
     # True when entry_price is a limit toward SL (e.g. hammer-with-candle 35% pullback)
     await_limit_fill: bool = False
+    # Base entry used for RR/TP before any pullback (None = same as entry_price)
+    signal_entry_price: Optional[float] = None
+    # Configured pullback % when await_limit_fill (for inspect / ledger)
+    entry_pullback_pct: Optional[float] = None
 
 
 # ============================================================================
@@ -1173,7 +1177,8 @@ def build_trade_signal(
         ignored = True
         ignore_reason = (
             f"Risk (${risk:.2f}) exceeds max allowed SL "
-            f"(${tf_setting.max_sl_usd}) for timeframe '{timeframe}'."
+            f"(${tf_setting.max_sl_usd}) for timeframe '{timeframe}' "
+            f"(max SL is price distance, not lot P&L)."
         )
 
     # ---- STEP 5: TARGET CALCULATION -----------------------------------

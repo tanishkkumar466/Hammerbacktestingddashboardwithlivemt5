@@ -12,6 +12,7 @@ from .telegram import (
     EVENT_TITLES,
     ORDER_EVENTS,
     TelegramNotifier,
+    build_ssl_context,
     format_order_alert,
     send_message,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "NotificationManager",
     "TelegramNotifier",
     "TelegramTestWorker",
+    "build_ssl_context",
     "default_bots_path",
     "format_order_alert",
     "load_bots",

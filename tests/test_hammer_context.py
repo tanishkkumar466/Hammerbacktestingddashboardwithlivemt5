@@ -386,6 +386,8 @@ def test_signal_applies_pullback_and_awaits_limit():
     assert abs(sig.stop_loss - 90.0) < 1e-9
     assert abs(sig.target - 126.0) < 1e-9
     assert abs(sig.risk - (97.8 - 90.0)) < 1e-9
+    assert abs(float(sig.signal_entry_price) - 102.0) < 1e-9
+    assert abs(float(sig.entry_pullback_pct) - 35.0) < 1e-9
 
 
 def test_pullback_keeps_signal_rr_target():
@@ -410,6 +412,87 @@ def test_pullback_keeps_signal_rr_target():
     assert abs(sig.stop_loss - 4000.0) < 1e-9
     assert abs(sig.entry_price - 4006.5) < 1e-9  # 4010 - 0.35*10
     assert abs(sig.target - 4030.0) < 1e-9
+
+
+def test_resolve_pullback_pct_for_35_never_stays_zero():
+    assert hc.resolve_entry_pullback_pct(0, for_35_pattern=True) == 35.0
+    assert hc.resolve_entry_pullback_pct(None, for_35_pattern=True) == 35.0
+    assert hc.resolve_entry_pullback_pct("", for_35_pattern=True) == 35.0
+    assert hc.resolve_entry_pullback_pct(20, for_35_pattern=True) == 20.0
+    assert hc.resolve_entry_pullback_pct(50, for_35_pattern=False) == 0.0
+    assert hc.resolve_entry_pullback_pct(35, for_35_pattern=False) == 0.0
+
+
+def test_apply_pullback_for_35_pattern_type_mutates_zero():
+    cfg = hc.HammerContextConfig(entry_pullback_pct=0.0)
+    out = hc.apply_pullback_for_pattern_type(cfg, hc.PATTERN_TYPE_35)
+    assert out.entry_pullback_pct == 35.0
+    plain = hc.HammerContextConfig(entry_pullback_pct=35.0)
+    out2 = hc.apply_pullback_for_pattern_type(plain, hc.PATTERN_TYPE)
+    assert out2.entry_pullback_pct == 0.0
+
+
+def test_variable_pullback_pct_changes_limit_price():
+    """Changing the % must move the wait-for-entry level (strategy under test)."""
+    import logic
+    signal = Candle("s", 4005.0, 4012.0, 4000.0, 4008.0)
+    nxt = Candle("n", 4010.0, 4015.0, 4007.0, 4012.0)
+    entries = {}
+    for pct in (20.0, 35.0, 50.0):
+        cfg = hc.HammerContextConfig(
+            lookback_candles=1,
+            enable_sell=False,
+            entry_pullback_pct=pct,
+            buffer_mode=logic.BufferMode.NONE,
+            sl_buffer_pct=0.0,
+            timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
+            enable_risk_limit=False,
+        )
+        sig = hc.build_context_signal(TradeDirection.BUY, signal, nxt, "3m", cfg)
+        assert sig is not None and sig.await_limit_fill
+        entries[pct] = sig.entry_price
+        assert abs(sig.target - 4030.0) < 1e-9  # TP fixed from 4010
+    assert entries[20.0] > entries[35.0] > entries[50.0]
+    assert abs(entries[35.0] - 4006.5) < 1e-9
+
+
+def test_backtest_35_pattern_coerces_zero_pullback():
+    """pattern_type hammer_with_candles_35 with pct=0 must still await a 35% limit."""
+    from datetime import datetime
+    from backtest import BacktestConfig, simulate_timeframe_outcomes, PositionSizingMode
+
+    cfg0 = hc.HammerContextConfig(
+        entry_pullback_pct=0.0,
+        timeframe_settings={"1h": TimeframeSetting(2.0, 50.0)},
+        enable_risk_limit=True,
+        lookback_candles=5,
+        buffer_mode=__import__("logic").BufferMode.NONE,
+        sl_buffer_pct=0.0,
+        inverted_buffer_mode=__import__("logic").BufferMode.NONE,
+        inverted_sl_buffer_pct=0.0,
+    )
+    bt = BacktestConfig(
+        strategy_config=cfg0,
+        pattern_type=hc.PATTERN_TYPE_35,
+        symbol="XAUUSD",
+        data_root="data",
+        start_date=datetime(2025, 1, 1),
+        end_date=datetime(2025, 2, 1),
+        timeframes_to_test=["1hour"],
+        max_forward_candles=100,
+        position_sizing_mode=PositionSizingMode.FIXED_RISK_USD,
+        fixed_risk_usd=100.0,
+        starting_capital=10000.0,
+        allow_overlapping_trades=True,
+        sessions_enabled={"Asian": True, "London": True, "US": True},
+    )
+    outcomes, ignored = simulate_timeframe_outcomes("1hour", bt)
+    assert bt.strategy_config.entry_pullback_pct == 35.0
+    em = list(outcomes.keys())[0]
+    rows = outcomes[em]
+    assert any(getattr(item[0], "await_limit_fill", False) for item in rows) or any(
+        "Limit not filled" in (s.ignore_reason or "") for s in ignored
+    )
 
 
 def test_find_limit_fill_index_buy():
@@ -480,6 +563,9 @@ if __name__ == "__main__":
     test_pullback_entry_buy_and_sell()
     test_signal_applies_pullback_and_awaits_limit()
     test_pullback_keeps_signal_rr_target()
+    test_resolve_pullback_pct_for_35_never_stays_zero()
+    test_apply_pullback_for_35_pattern_type_mutates_zero()
+    test_variable_pullback_pct_changes_limit_price()
     test_find_limit_fill_index_buy()
     test_pullback_same_bar_sl_counted_as_loss()
     print("ok  hammer context tests passed")

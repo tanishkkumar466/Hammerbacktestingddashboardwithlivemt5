@@ -58,11 +58,12 @@ class AccountWorkerHandle:
         msg = {"cmd": cmd, **payload}
         self.cmd_q.put(msg)
 
-    def poll_events(self, max_n: int = 50) -> List[Dict[str, Any]]:
+    def poll_events(self, max_n: int = 200) -> List[Dict[str, Any]]:
+        """Drain up to max_n events. Default 200 so many accounts × slots do not lag UI."""
         if self.evt_q is None:
             return []
         out: List[Dict[str, Any]] = []
-        for _ in range(max_n):
+        for _ in range(max(1, int(max_n))):
             try:
                 out.append(self.evt_q.get_nowait())
             except queue.Empty:

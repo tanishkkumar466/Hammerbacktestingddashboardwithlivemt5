@@ -20,6 +20,24 @@ MAGIC_SERIES_SIZE = 100
 LEGACY_MAGIC_MIN = 1_000_000
 
 
+def normalize_hhmm(raw: Optional[str]) -> str:
+    """Return 'HH:MM' from user text, or '' if empty / invalid."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        if ":" in text:
+            hh_s, mm_s = text.split(":", 1)
+            hh, mm = int(hh_s), int(mm_s.split()[0] if mm_s else 0)
+        else:
+            hh, mm = int(text), 0
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return ""
+        return f"{hh:02d}:{mm:02d}"
+    except (TypeError, ValueError):
+        return ""
+
+
 @dataclass
 class LiveAccount:
     id: str
@@ -30,6 +48,11 @@ class LiveAccount:
     max_daily_loss_usd: float = 100.0
     magic_base: int = MAGIC_BASE
     flatten_hhmm: str = ""  # "15:55" local system clock; empty = off
+    # Auto Start all / Stop live at local clock (empty = off)
+    schedule_start_hhmm: str = ""
+    schedule_stop_hhmm: str = ""
+    # Per-account: do not mirror dry-run across other logins
+    dry_run: bool = True
     # In-memory only — never written to live_desk.json
     password: str = ""
 
@@ -76,6 +99,9 @@ class LiveDesk:
     accounts: List[LiveAccount] = field(default_factory=list)
     slots: List[LiveSlot] = field(default_factory=list)
     active_account_id: str = ""
+    # Last global schedule values shown in Live manager (Apply copies onto accounts)
+    global_start_hhmm: str = ""
+    global_stop_hhmm: str = ""
 
     def ensure_defaults(self) -> None:
         if not self.accounts:
@@ -113,9 +139,14 @@ class LiveDesk:
             lo, hi = acc.magic_range() if acc else (MAGIC_BASE, MAGIC_BASE + MAGIC_SERIES_SIZE - 1)
             mag = int(slot.magic)
             if mag in seen or mag < lo or mag > hi:
-                mag = lo
-                while mag in seen:
-                    mag += 1
+                mag = None
+                for candidate in range(lo, hi + 1):
+                    if candidate not in seen:
+                        mag = candidate
+                        break
+                if mag is None:
+                    # Series exhausted — keep original and let magics_unique() fail closed
+                    mag = int(slot.magic)
                 slot.magic = mag
             seen.add(int(slot.magic))
 
@@ -152,15 +183,13 @@ class LiveDesk:
         acc = self.account_by_id(account_id)
         lo, hi = acc.magic_range() if acc else (MAGIC_BASE, MAGIC_BASE + MAGIC_SERIES_SIZE - 1)
         used = {int(s.magic) for s in self.slots}
-        n = lo
-        while n in used:
-            n += 1
-            if n > hi:
-                n = lo
-                while n in used:
-                    n += 1
-                break
-        return n
+        for n in range(lo, hi + 1):
+            if n not in used:
+                return n
+        raise ValueError(
+            f"Magic series full for this account ({lo}–{hi}). "
+            f"Max {MAGIC_SERIES_SIZE} slots per account — remove a slot or add another account."
+        )
 
     def next_magic(self) -> int:
         acc_id = self.active_account_id or (self.accounts[0].id if self.accounts else "")
@@ -179,6 +208,30 @@ class LiveDesk:
             if int(slot.magic) < lo or int(slot.magic) > hi:
                 return False
         return True
+
+    def apply_global_schedule(
+        self,
+        *,
+        start_hhmm: Optional[str] = None,
+        stop_hhmm: Optional[str] = None,
+        clear: bool = False,
+    ) -> None:
+        """Copy global start/stop onto every account (or clear schedules)."""
+        if clear:
+            self.global_start_hhmm = ""
+            self.global_stop_hhmm = ""
+            for acc in self.accounts:
+                acc.schedule_start_hhmm = ""
+                acc.schedule_stop_hhmm = ""
+            return
+        if start_hhmm is not None:
+            self.global_start_hhmm = normalize_hhmm(start_hhmm)
+            for acc in self.accounts:
+                acc.schedule_start_hhmm = self.global_start_hhmm
+        if stop_hhmm is not None:
+            self.global_stop_hhmm = normalize_hhmm(stop_hhmm)
+            for acc in self.accounts:
+                acc.schedule_stop_hhmm = self.global_stop_hhmm
 
     def remove_slot(self, slot_id: str) -> bool:
         slot = self.slot_by_id(slot_id)
@@ -209,6 +262,8 @@ def desk_to_dict(desk: LiveDesk) -> Dict[str, Any]:
         accounts.append(row)
     return {
         "active_account_id": desk.active_account_id,
+        "global_start_hhmm": normalize_hhmm(getattr(desk, "global_start_hhmm", "")),
+        "global_stop_hhmm": normalize_hhmm(getattr(desk, "global_stop_hhmm", "")),
         "accounts": accounts,
         "slots": [asdict(s) for s in desk.slots],
     }
@@ -220,6 +275,8 @@ def desk_from_dict(raw: Optional[Dict[str, Any]]) -> LiveDesk:
         desk.ensure_defaults()
         return desk
     desk.active_account_id = str(raw.get("active_account_id") or "")
+    desk.global_start_hhmm = normalize_hhmm(str(raw.get("global_start_hhmm") or ""))
+    desk.global_stop_hhmm = normalize_hhmm(str(raw.get("global_stop_hhmm") or ""))
     for row in raw.get("accounts") or []:
         try:
             magic_base = int(row.get("magic_base") or MAGIC_BASE)
@@ -233,7 +290,10 @@ def desk_from_dict(raw: Optional[Dict[str, Any]]) -> LiveDesk:
             terminal_path=str(row.get("terminal_path") or ""),
             max_daily_loss_usd=float(row.get("max_daily_loss_usd") or 100.0),
             magic_base=magic_base,
-            flatten_hhmm=str(row.get("flatten_hhmm") or ""),
+            flatten_hhmm=normalize_hhmm(str(row.get("flatten_hhmm") or "")),
+            schedule_start_hhmm=normalize_hhmm(str(row.get("schedule_start_hhmm") or "")),
+            schedule_stop_hhmm=normalize_hhmm(str(row.get("schedule_stop_hhmm") or "")),
+            dry_run=bool(row["dry_run"]) if "dry_run" in row else True,
         ))
     for row in raw.get("slots") or []:
         try:

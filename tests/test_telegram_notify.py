@@ -113,6 +113,42 @@ def test_send_message_success(mock_urlopen):
     ok, detail = tg.send_message("token123", "999888", "hello", max_retries=1)
     assert ok is True
     assert detail == "sent"
+    # SSL context must be passed (certifi / verify path)
+    assert mock_urlopen.call_args.kwargs.get("context") is not None
+
+
+@patch("notification.telegram.urllib.request.urlopen")
+def test_send_message_ssl_verify_fallback(mock_urlopen):
+    import ssl
+    import urllib.error
+
+    ok_resp = MagicMock()
+    ok_resp.read.return_value = json.dumps({"ok": True}).encode()
+    ok_resp.__enter__ = MagicMock(return_value=ok_resp)
+    ok_resp.__exit__ = MagicMock(return_value=False)
+
+    def _side_effect(*_a, **kwargs):
+        ctx = kwargs.get("context")
+        # First call uses verifying context → fail; insecure → succeed
+        if ctx is not None and getattr(ctx, "check_hostname", True):
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError(
+                    "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                    "self-signed certificate in certificate chain"
+                )
+            )
+        return ok_resp
+
+    mock_urlopen.side_effect = _side_effect
+    ok, detail = tg.send_message("token", "123", "hi", max_retries=1)
+    assert ok is True
+    assert "relaxed" in detail.lower() or detail == "sent"
+
+
+def test_build_ssl_context_insecure():
+    ctx = tg.build_ssl_context(insecure=True)
+    assert ctx.check_hostname is False
+
 
 
 @patch("notification.telegram.time.sleep")

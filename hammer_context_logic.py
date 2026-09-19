@@ -37,9 +37,12 @@ PATTERN_LABEL_35 = "Hammer with candle 35%"
 PATTERN_TYPE = "hammer_with_candles"
 PATTERN_TYPE_35 = "hammer_with_candles_35"
 
-# Both labels share this engine today; 35% rules will diverge when specified.
+# Both labels share this engine; 35% adds configurable pullback entry toward SL.
 CONTEXT_PATTERN_LABELS = frozenset({PATTERN_LABEL, PATTERN_LABEL_35})
 CONTEXT_PATTERN_TYPES = frozenset({PATTERN_TYPE, "hammer_context", PATTERN_TYPE_35})
+
+# Default pullback when the 35% pattern is selected but the UI/preset has 0 / blank.
+DEFAULT_PULLBACK_PCT_35 = 35.0
 
 
 def is_context_pattern_label(pattern: str) -> bool:
@@ -50,12 +53,63 @@ def is_context_pattern_type(pattern_type: str) -> bool:
     return str(pattern_type or "") in CONTEXT_PATTERN_TYPES
 
 
+def is_35_pattern_label(pattern: str) -> bool:
+    return str(pattern or "") == PATTERN_LABEL_35
+
+
+def is_35_pattern_type(pattern_type: str) -> bool:
+    return str(pattern_type or "") == PATTERN_TYPE_35
+
+
 def pattern_type_for_label(pattern: str) -> str:
     if pattern == PATTERN_LABEL_35:
         return PATTERN_TYPE_35
     if is_context_pattern_label(pattern):
         return PATTERN_TYPE
     return PATTERN_TYPE
+
+
+def resolve_entry_pullback_pct(
+    raw_pct: object,
+    *,
+    for_35_pattern: bool,
+    default_35: float = DEFAULT_PULLBACK_PCT_35,
+) -> float:
+    """
+    Pullback % of |signal_entry − SL| toward the stop.
+
+    - Non-35 patterns always return 0 (enter at the normal entry rule).
+    - 35% pattern: use the configured value; if missing/≤0, default to 35
+      so the pattern never silently behaves like plain Hammer-with-candles.
+    """
+    if not for_35_pattern:
+        return 0.0
+    try:
+        pct = float(raw_pct if raw_pct is not None else 0.0)
+    except (TypeError, ValueError):
+        pct = 0.0
+    if pct != pct:  # NaN
+        pct = 0.0
+    if pct <= 0:
+        pct = float(default_35)
+    return max(0.0, min(100.0, pct))
+
+
+def apply_pullback_for_pattern_type(
+    config: "HammerContextConfig",
+    pattern_type: str,
+) -> "HammerContextConfig":
+    """Ensure strategy_config.entry_pullback_pct matches the selected pattern type."""
+    for_35 = is_35_pattern_type(pattern_type)
+    resolved = resolve_entry_pullback_pct(
+        getattr(config, "entry_pullback_pct", 0.0),
+        for_35_pattern=for_35,
+    )
+    current = float(getattr(config, "entry_pullback_pct", 0.0) or 0.0)
+    if abs(current - resolved) < 1e-12:
+        return config
+    config.entry_pullback_pct = resolved
+    return config
 
 
 @dataclass
@@ -520,7 +574,8 @@ def build_context_signal(
     elif config.enable_risk_limit and signal_risk > tf_setting.max_sl_usd:
         ignored = True
         ignore_reason = (
-            f"Risk (${signal_risk:.2f}) exceeds max SL (${tf_setting.max_sl_usd}) for '{timeframe}'."
+            f"Risk (${signal_risk:.2f}) exceeds max SL (${tf_setting.max_sl_usd}) for '{timeframe}' "
+            f"(max SL is price distance, not lot P&L)."
         )
 
     reward = signal_risk * tf_setting.rr_multiple
@@ -543,6 +598,8 @@ def build_context_signal(
         ignore_reason=ignore_reason,
         pattern_variant=stored_variant,
         await_limit_fill=await_limit,
+        signal_entry_price=float(base_entry) if await_limit else None,
+        entry_pullback_pct=float(pullback_pct) if await_limit else None,
     )
 
 

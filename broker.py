@@ -283,6 +283,10 @@ class MT5Broker:
         Update ONLY the open forming bar from the latest tick.
         Never applied to closed/historical bars. Skipped when the forming bar
         timestamp is stale (e.g. market closed) to avoid monster candles.
+
+        Close prefers **bid** so the forming bar matches MT5 `copy_rates` OHLC
+        (bid series) and the terminal chart — not ask/last, which made live
+        "current price" look several points off the chart on CFDs/crypto.
         """
         if tick is None:
             return forming
@@ -291,18 +295,32 @@ class MT5Broker:
         bid = float(getattr(tick, "bid", 0) or 0)
         ask = float(getattr(tick, "ask", 0) or 0)
         last = float(getattr(tick, "last", 0) or 0)
-        if last <= 0:
-            last = ask if ask > 0 else bid
-        if last <= 0:
+        # Bid-first to stay consistent with closed bars from copy_rates.
+        if bid > 0:
+            close_px = bid
+        elif last > 0:
+            close_px = last
+        elif ask > 0:
+            close_px = ask
+        else:
             return forming
-        hi = max(forming.high, forming.open, last, bid, ask)
-        lo = min(forming.low, forming.open, last, bid, ask)
+        hi_candidates = [forming.high, forming.open, close_px]
+        lo_candidates = [forming.low, forming.open, close_px]
+        if bid > 0:
+            hi_candidates.append(bid)
+            lo_candidates.append(bid)
+        if ask > 0:
+            hi_candidates.append(ask)
+            lo_candidates.append(ask)
+        if last > 0:
+            hi_candidates.append(last)
+            lo_candidates.append(last)
         return logic.Candle(
             timestamp=forming.timestamp,
             open=forming.open,
-            high=hi,
-            low=lo,
-            close=last,
+            high=max(hi_candidates),
+            low=min(lo_candidates),
+            close=close_px,
             volume=forming.volume,
         )
 

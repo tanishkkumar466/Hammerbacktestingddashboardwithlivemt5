@@ -116,6 +116,18 @@ try:
         if not qt_ok:
             _boot_log("WARNING: no PySide6 plugins folder found")
 
+        # Point OpenSSL / urllib at bundled certifi CA (Telegram + updates)
+        try:
+            import certifi
+
+            ca = certifi.where()
+            if ca and os.path.isfile(ca):
+                os.environ.setdefault("SSL_CERT_FILE", ca)
+                os.environ.setdefault("REQUESTS_CA_BUNDLE", ca)
+                _boot_log(f"ssl ca: {ca}")
+        except Exception as ca_exc:
+            _boot_log(f"ssl ca skipped: {ca_exc}")
+
         _boot_log("boot: runtime hook finished")
 except Exception:
     _boot_log("boot: runtime hook CRASHED:\n" + traceback.format_exc())
