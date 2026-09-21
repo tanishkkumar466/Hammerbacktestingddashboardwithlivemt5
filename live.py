@@ -1137,9 +1137,10 @@ class LiveTradingEngine:
         """
         Returns (order_mode, limit_price_or_none, sl, tp) for MT5.
 
-        Pullback signals (await_limit_fill): always place a limit at sig.entry_price
-        (toward SL). Never force market on max-deviation, and never use limit_offset
-        from market — that would skip the wait backtest simulates.
+        Pullback signals (await_limit_fill): respect Live Order type —
+        market → instant ask/bid; limit_entry / limit_offset → resting limit at
+        the pullback entry (never offset-from-market, so the wait matches backtest).
+        Max-deviation never forces market on a pullback limit.
         """
         cfg = self.live_config
         with self._broker_lock:
@@ -1154,17 +1155,11 @@ class LiveTradingEngine:
         strat_entry = float(sig.entry_price)
         pt = point or 0.01
         dev_pts = abs(strat_entry - market) / pt
+        order_mode = (cfg.order_mode or "market").strip().lower()
 
         # ---- Hammer with candle 35% (and any await_limit_fill signal) ----
         if getattr(sig, "await_limit_fill", False):
-            sl, tp = reanchor_sl_tp_to_fill(sig, strat_entry)
             side = "ask" if is_buy else "bid"
-            self.log(
-                f"[LIVE] Pullback limit @ {strat_entry:.2f} "
-                f"(toward SL {float(sig.stop_loss):.2f}; TP fixed @ {tp:.2f}). "
-                f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill "
-                f"(not forcing market)."
-            )
             signal_e = getattr(sig, "signal_entry_price", None)
             pull = getattr(sig, "entry_pullback_pct", None)
             if signal_e is not None:
@@ -1173,14 +1168,31 @@ class LiveTradingEngine:
                     direction = "DOWN" if is_buy else "UP"
                     pct_txt = f"{float(pull):g}%" if pull is not None else "?"
                     self.log(
-                        f"[LIVE] Pullback check: signal entry {se:.2f} → limit {strat_entry:.2f} "
+                        f"[LIVE] Pullback check: signal entry {se:.2f} → target {strat_entry:.2f} "
                         f"({pct_txt} toward SL, wait {direction})."
                     )
                 except (TypeError, ValueError):
                     pass
+
+            if order_mode == "market":
+                # Instant market at ask/bid — Order type Market wins over pullback wait.
+                sl, tp = reanchor_sl_tp_to_fill(sig, market)
+                self.log(
+                    f"[LIVE] Pullback signal + Order type Market → MARKET @ {side} "
+                    f"{market:.2f} (pullback level was {strat_entry:.2f}; "
+                    f"SL={sl:.2f} TP={tp:.2f} absolute)."
+                )
+                return "market", None, sl, tp
+
+            # Limit / limit_offset: resting limit at pullback entry (ignore offset-from-market).
+            sl, tp = reanchor_sl_tp_to_fill(sig, strat_entry)
+            self.log(
+                f"[LIVE] Pullback limit @ {strat_entry:.2f} "
+                f"(toward SL {float(sig.stop_loss):.2f}; TP fixed @ {tp:.2f}). "
+                f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill."
+            )
             return "limit_entry", strat_entry, sl, tp
 
-        order_mode = (cfg.order_mode or "market").strip().lower()
         effective_mode = order_mode
         limit_price: Optional[float] = strat_entry
 

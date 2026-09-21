@@ -58,19 +58,15 @@ def test_reanchor_shifts_sl_tp_for_normal_market_fill():
     assert abs(tp - 4032.0) < 1e-9
 
 
-def test_resolve_live_order_never_force_markets_pullback():
-    """Default max_entry_deviation (200 pts) must NOT skip the pullback wait."""
-    broker = MagicMock()
-    # Market far from pullback limit (ask 4010, limit 4006.5 → 350 pts at 0.01)
-    broker.get_tick_prices.return_value = (4009.0, 4010.0)
-    broker.symbol_point.return_value = 0.01
-
-    cfg = SimpleNamespace(
-        order_mode="market",
-        max_entry_deviation_points=200.0,
-        limit_offset_from_market=True,
-        limit_offset_points=0.0,
-    )
+def _pullback_engine(broker, order_mode: str, **cfg_extra) -> LiveTradingEngine:
+    opts = {
+        "order_mode": order_mode,
+        "max_entry_deviation_points": 200.0,
+        "limit_offset_from_market": True,
+        "limit_offset_points": 0.0,
+    }
+    opts.update(cfg_extra)
+    cfg = SimpleNamespace(**opts)
     engine = LiveTradingEngine.__new__(LiveTradingEngine)
     engine.broker = broker
     engine.live_config = cfg
@@ -78,6 +74,44 @@ def test_resolve_live_order_never_force_markets_pullback():
     engine._broker_lock.__enter__ = MagicMock(return_value=None)
     engine._broker_lock.__exit__ = MagicMock(return_value=False)
     engine.log = lambda *_a, **_k: None
+    return engine
+
+
+def test_resolve_live_order_market_mode_uses_market_on_pullback():
+    """Order type Market → instant market even when the signal is a pullback wait."""
+    broker = MagicMock()
+    broker.get_tick_prices.return_value = (4009.0, 4010.0)
+    broker.symbol_point.return_value = 0.01
+    engine = _pullback_engine(broker, "market")
+
+    sig = logic.TradeSignal(
+        direction=logic.TradeDirection.BUY,
+        hammer_candle=_candle("s", 1, 2, 0, 1.5),
+        entry_candle=_candle("e", 1, 2, 0, 1.5),
+        entry_price=4006.5,
+        stop_loss=4000.0,
+        risk=6.5,
+        rr_multiple=2.0,
+        target=4030.0,
+        timeframe="3m",
+        await_limit_fill=True,
+    )
+    resolved = engine._resolve_live_order(sig, "XAUUSD")
+    assert resolved is not None
+    mode, limit_px, sl, tp = resolved
+    assert mode == "market"
+    assert limit_px is None
+    assert sl == 4000.0
+    assert tp == 4030.0
+
+
+def test_resolve_live_order_limit_mode_keeps_pullback_limit():
+    """Order type Limit → resting limit at pullback price; max_dev must not force market."""
+    broker = MagicMock()
+    # Market far from pullback limit (ask 4010, limit 4006.5 → 350 pts at 0.01)
+    broker.get_tick_prices.return_value = (4009.0, 4010.0)
+    broker.symbol_point.return_value = 0.01
+    engine = _pullback_engine(broker, "limit_entry")
 
     sig = logic.TradeSignal(
         direction=logic.TradeDirection.BUY,
@@ -106,19 +140,9 @@ def test_resolve_live_order_pullback_ignores_limit_offset_mode():
     broker.symbol_point.return_value = 0.01
     broker.limit_price_with_offset.return_value = (4009.5, True)
 
-    cfg = SimpleNamespace(
-        order_mode="limit_offset",
-        max_entry_deviation_points=200.0,
-        limit_offset_from_market=True,
-        limit_offset_points=10.0,
+    engine = _pullback_engine(
+        broker, "limit_offset", limit_offset_points=10.0,
     )
-    engine = LiveTradingEngine.__new__(LiveTradingEngine)
-    engine.broker = broker
-    engine.live_config = cfg
-    engine._broker_lock = MagicMock()
-    engine._broker_lock.__enter__ = MagicMock(return_value=None)
-    engine._broker_lock.__exit__ = MagicMock(return_value=False)
-    engine.log = lambda *_a, **_k: None
 
     sig = logic.TradeSignal(
         direction=logic.TradeDirection.SELL,
