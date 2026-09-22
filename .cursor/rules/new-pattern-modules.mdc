@@ -1,0 +1,27 @@
+---
+description: New trading patterns must live in their own .py module; never bolt special-case exit/entry logic onto shared backtest paths.
+alwaysApply: true
+---
+
+# New pattern = new module
+
+When adding a **new pattern** (or a major variant with different entry/exit semantics):
+
+- Create a **new dedicated `.py` file** (same style as `logic.py`, `doji_logic.py`, `hammer_context_logic.py`).
+- Register it via `pattern_type` / UI label + a clear branch in `backtest.py` / live that calls **that module’s** `run_strategy` / signal builders.
+- Do **not** overload an existing pattern module with divergent entry/exit rules that share one simulator path.
+
+## Why (regression we already hit)
+
+Hammer with candles and Hammer with candle 35% shared one engine. A 1.0.29 fill-bar exit fix for pullbacks spilled into plain HWC market entries and broke client parity on the same data/config.
+
+## Shared `backtest.py` rules
+
+- Gate exit/entry special cases with **explicit** flags (`await_limit_fill`, pattern_type checks) — never change the default scan/start behavior for all patterns to fix one pattern.
+- Prefer pattern-specific helpers in the new module over editing global resolve loops.
+- Add tests for the **new pattern only** and a smoke test that an existing pattern’s exit scan / pullback % is unchanged.
+
+## Do not
+
+- Add “just one more if” inside another pattern’s signal builder for a new product pattern.
+- Mutate shared strategy config objects in place across pattern types (copy when coercing fields).

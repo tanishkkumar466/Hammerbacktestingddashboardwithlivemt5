@@ -34,6 +34,8 @@ class UpdateWindow(QDialog):
         self._release = None
         self._check_worker = None
         self._install_worker = None
+        self._auto_retries = 0
+        self._closing = False
 
         self._build_ui()
         self._start_check()
@@ -103,6 +105,8 @@ class UpdateWindow(QDialog):
         self._check_worker.start()
 
     def _on_check_result(self, release):
+        if self._closing:
+            return
         if release is None:
             self.icon_label.setText("✓")
             self.icon_label.setStyleSheet("color: #22c55e; font-size: 30px;")
@@ -125,10 +129,11 @@ class UpdateWindow(QDialog):
             self.primary_btn.setEnabled(True)
 
     def _on_check_error(self, message: str):
+        if self._closing:
+            return
         self.icon_label.setText("⚠")
         self.icon_label.setStyleSheet("color: #ef4444; font-size: 30px;")
         self.title_label.setText("Couldn't check for updates")
-        # Keep subtitle short; show full detail in a scrollable notes area
         first_line = (message or "").strip().split("\n", 1)[0]
         self.subtitle_label.setText(first_line[:120] or "Unknown error")
         self.notes_text.setPlainText(message.strip())
@@ -138,12 +143,16 @@ class UpdateWindow(QDialog):
     def _on_download_clicked(self):
         if not self._release:
             return
+        self._auto_retries = 0
         self.primary_btn.setEnabled(False)
         self.secondary_btn.setEnabled(False)
         self.notes_text.hide()
         self.progress.setValue(0)
         self.progress.show()
+        self.status_label.setText("Starting download…")
+        self._start_install_worker()
 
+    def _start_install_worker(self):
         self._install_worker = DownloadInstallWorker(self._release)
         self._install_worker.progress.connect(self._on_progress)
         self._install_worker.status.connect(self._on_status)
@@ -152,6 +161,8 @@ class UpdateWindow(QDialog):
         self._install_worker.start()
 
     def _on_progress(self, downloaded: int, total: int):
+        if self._closing:
+            return
         if total > 0:
             self.progress.setRange(0, total)
             self.progress.setValue(downloaded)
@@ -168,34 +179,81 @@ class UpdateWindow(QDialog):
             )
 
     def _on_status(self, text: str):
+        if self._closing:
+            return
         self.status_label.setText(text)
 
     def _on_install_done(self, app_root: str):
+        if self._closing:
+            return
+        self._auto_retries = 0
         self.icon_label.setText("✓")
         self.icon_label.setStyleSheet("color: #22c55e; font-size: 30px;")
-        self.title_label.setText("Update downloaded")
-        self.status_label.setText(
-            "A console window will replace the .exe and restart Hammer — leave it open."
-        )
+        self.title_label.setText("Update ready")
+        self.status_label.setText("Restarting Hammer…")
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
-        QTimer.singleShot(800, lambda: updater.relaunch_and_exit(app_root))
+        QTimer.singleShot(500, lambda: updater.relaunch_and_exit(app_root))
 
     def _on_install_error(self, message: str):
+        if self._closing:
+            return
+        msg = (message or "").strip()
+        if msg.lower().startswith("update cancelled"):
+            self.title_label.setText("Update cancelled")
+            self.status_label.setText("")
+            self.secondary_btn.setEnabled(True)
+            self.primary_btn.setEnabled(bool(self._release))
+            self.primary_btn.setText("Download && Install")
+            return
+
+        # One quiet auto-retry after engine retries (interrupted transfers).
+        if (
+            self._release
+            and self._auto_retries < 1
+            and updater._looks_like_av_interference(Exception(msg))
+        ):
+            self._auto_retries += 1
+            self.status_label.setText("Interrupted — retrying automatically…")
+            self.progress.setValue(0)
+            QTimer.singleShot(800, self._start_install_worker)
+            return
+
         self.icon_label.setText("⚠")
         self.icon_label.setStyleSheet("color: #ef4444; font-size: 30px;")
-        self.title_label.setText("Update failed")
-        self.status_label.setText(message)
+        self.title_label.setText("Couldn't finish update")
+        self.status_label.setText("Your data is safe. Tap Try Again when ready.")
+        # Keep technical detail available but collapsed-feeling in notes
+        short = msg.split("\n", 1)[0][:160]
+        self.notes_text.setPlainText(msg if len(msg) < 800 else short + "\n\n" + msg[:800])
+        self.notes_text.show()
         self.secondary_btn.setEnabled(True)
         self.primary_btn.setEnabled(True)
         self.primary_btn.setText("Try Again")
-        QMessageBox.critical(self, "Update Failed", message)
+        QMessageBox.information(
+            self,
+            "Software Update",
+            "The update didn't finish.\n\n"
+            "Tap Try Again — Hammer will clean up and download again.\n"
+            "Your data folder is never touched.",
+        )
 
     def closeEvent(self, event):
-        for w in (self._check_worker, self._install_worker):
-            if w and w.isRunning():
-                w.setParent(None)
-                w.finished.connect(w.deleteLater)
+        self._closing = True
+        if self._install_worker and self._install_worker.isRunning():
+            try:
+                self._install_worker.request_cancel()
+            except Exception:
+                pass
+            self._install_worker.setParent(None)
+            self._install_worker.finished.connect(self._install_worker.deleteLater)
+        if self._check_worker and self._check_worker.isRunning():
+            self._check_worker.setParent(None)
+            self._check_worker.finished.connect(self._check_worker.deleteLater)
+        try:
+            updater.cleanup_broken_update_files()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 

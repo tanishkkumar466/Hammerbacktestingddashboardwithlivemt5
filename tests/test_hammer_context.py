@@ -427,9 +427,12 @@ def test_apply_pullback_for_35_pattern_type_mutates_zero():
     cfg = hc.HammerContextConfig(entry_pullback_pct=0.0)
     out = hc.apply_pullback_for_pattern_type(cfg, hc.PATTERN_TYPE_35)
     assert out.entry_pullback_pct == 35.0
+    # Original must stay 0 — multi-config runs share strategy objects
+    assert cfg.entry_pullback_pct == 0.0
     plain = hc.HammerContextConfig(entry_pullback_pct=35.0)
     out2 = hc.apply_pullback_for_pattern_type(plain, hc.PATTERN_TYPE)
     assert out2.entry_pullback_pct == 0.0
+    assert plain.entry_pullback_pct == 35.0
 
 
 def test_variable_pullback_pct_changes_limit_price():

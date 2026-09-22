@@ -24,6 +24,7 @@ SELL uses inverted entry+SL fields.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -99,7 +100,12 @@ def apply_pullback_for_pattern_type(
     config: "HammerContextConfig",
     pattern_type: str,
 ) -> "HammerContextConfig":
-    """Ensure strategy_config.entry_pullback_pct matches the selected pattern type."""
+    """
+    Ensure strategy_config.entry_pullback_pct matches the selected pattern type.
+
+    Returns a shallow copy when the value must change so multi-config / multi-pattern
+    runs never mutate a shared strategy object in place (plain HWC must stay at 0%).
+    """
     for_35 = is_35_pattern_type(pattern_type)
     resolved = resolve_entry_pullback_pct(
         getattr(config, "entry_pullback_pct", 0.0),
@@ -108,8 +114,9 @@ def apply_pullback_for_pattern_type(
     current = float(getattr(config, "entry_pullback_pct", 0.0) or 0.0)
     if abs(current - resolved) < 1e-12:
         return config
-    config.entry_pullback_pct = resolved
-    return config
+    out = copy.copy(config)
+    out.entry_pullback_pct = resolved
+    return out
 
 
 @dataclass

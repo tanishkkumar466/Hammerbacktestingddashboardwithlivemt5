@@ -968,6 +968,23 @@ def market_preferred_for_config(config: "BacktestConfig") -> str:
     return pref
 
 
+def _exit_scan_start_index(sig, fill_idx: int) -> int:
+    """
+    Index at which SL/TP scanning begins after entry.
+
+    Pullback/limit fills (await_limit_fill): include the fill bar so same-bar
+    SL after the limit fill counts — required for Hammer with candle 35%.
+
+    Market / next-open entries (Hammer with candles, classic hammer, doji):
+    start on the *next* bar. Including the entry bar was introduced broadly in
+    1.0.29 for pullbacks and incorrectly shifted plain HWC results vs client
+    baselines on identical data/config.
+    """
+    if getattr(sig, "await_limit_fill", False):
+        return fill_idx
+    return fill_idx + 1
+
+
 def simulate_timeframe_outcomes(
     timeframe_folder: str,
     config: BacktestConfig,
@@ -1121,11 +1138,14 @@ def simulate_timeframe_outcomes(
             except Exception:
                 pass
 
-        # Scan from the entry/fill bar: default entry is NEXT_CANDLE_OPEN (or a
-        # pullback limit fill during that bar), so same-bar SL/TP after entry
-        # must count. find_limit_fill_index relies on this for pullbacks.
-        start = fill_idx
+        # Exit scan start — see _exit_scan_start_index.
+        start = _exit_scan_start_index(sig, fill_idx)
         end = min(start + config.max_forward_candles, len(all_high))
+        if start >= len(all_high):
+            # Entry on the last bar with nowhere to scan — empty window
+            # (same as when fill_idx + 1 ran off the end pre-1.0.29).
+            start = len(all_high)
+            end = start
 
         raw_outcomes = resolve_all_exit_models_for_trade(
             direction=sig.direction, sl=sig.stop_loss, target=sig.target,

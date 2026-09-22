@@ -22,7 +22,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -40,6 +39,7 @@ from update.paths import (
     is_running_as_legacy_onefile,
     is_running_as_runtime,
     is_stub_layout,
+    pending_runtime_bin_path,
     pending_runtime_path,
     runtime_exe_path,
     stub_exe_path,
@@ -195,7 +195,13 @@ _SKIP_DIR_NAMES = {
     ".cursor",
     "_hammer_update_staging",
     "_hammer_update_extract",
+    "_hammer_update_cache",
 }
+
+# Neutral extension while bytes are on disk — AV is far more aggressive on *.exe
+# written under %TEMP% than on a non-executable package next to the install.
+_DOWNLOAD_SUFFIX = ".hammerdl"
+_DOWNLOAD_ATTEMPTS = 3
 _SKIP_FILE_NAMES = {
     "run_history.db",
     ".env",
@@ -459,6 +465,113 @@ def check_for_update() -> Optional[ReleaseInfo]:
     return None
 
 
+def _update_cache_dir() -> str:
+    path = os.path.join(app_root(), "_hammer_update_cache")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _safe_download_name(asset_name: str) -> str:
+    """Keep the real name readable, but never end in .exe while downloading."""
+    base = os.path.basename(asset_name or "update").strip() or "update"
+    # Strip trailing .exe so Windows Defender does not treat the download as a new PE drop.
+    low = base.lower()
+    if low.endswith(".exe"):
+        base = base[: -len(".exe")] + ".bin"
+    if not base.lower().endswith(_DOWNLOAD_SUFFIX):
+        base = base + _DOWNLOAD_SUFFIX
+    return base
+
+
+def _looks_like_av_interference(exc: BaseException) -> bool:
+    """Heuristic: security software often deletes / locks the file mid-write."""
+    if isinstance(exc, (PermissionError, FileNotFoundError)):
+        return True
+    msg = str(exc).lower()
+    needles = (
+        "permission denied",
+        "access is denied",
+        "being used by another process",
+        "cannot find the file",
+        "no such file",
+        "winerror 5",
+        "winerror 32",
+        "winerror 33",
+        "quarantine",
+        "virus",
+        "threat",
+        "incomplete or corrupted",
+        "disappeared",
+        "removed while",
+    )
+    return any(n in msg for n in needles)
+
+
+def cleanup_broken_update_files() -> None:
+    """Remove truncated pending / leftover cache so the next Try Again is clean."""
+    root = app_root()
+    candidates = [
+        pending_runtime_path(root),
+        pending_runtime_bin_path(root),
+        pending_runtime_path(root) + ".writing",
+        pending_runtime_bin_path(root) + ".writing",
+    ]
+    for path in candidates:
+        try:
+            if not os.path.isfile(path):
+                continue
+            size = os.path.getsize(path)
+            if size < MIN_RUNTIME_BYTES:
+                os.remove(path)
+        except OSError:
+            pass
+    cache = os.path.join(root, "_hammer_update_cache")
+    if os.path.isdir(cache):
+        try:
+            for name in os.listdir(cache):
+                low = name.lower()
+                if low.endswith((".part", _DOWNLOAD_SUFFIX, ".tmp")):
+                    try:
+                        os.remove(os.path.join(cache, name))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+
+def _copy_file_with_progress(
+    src: str,
+    dst: str,
+    status_cb: Callable[[str], None],
+    *,
+    label: str = "Preparing update",
+) -> None:
+    total = os.path.getsize(src)
+    copied = 0
+    chunk = 1024 * 1024
+    last_pct = -1
+    with open(src, "rb") as inf, open(dst, "wb") as out:
+        while True:
+            buf = inf.read(chunk)
+            if not buf:
+                break
+            out.write(buf)
+            copied += len(buf)
+            if total > 0:
+                pct = int(copied * 100 / total)
+                if pct != last_pct and (pct % 5 == 0 or pct >= 99):
+                    last_pct = pct
+                    status_cb(
+                        f"{label}… {copied / (1024 * 1024):.0f} / "
+                        f"{total / (1024 * 1024):.0f} MB"
+                    )
+    out_size = os.path.getsize(dst)
+    if out_size != total:
+        raise UpdateError(
+            f"Copy incomplete ({out_size} of {total} bytes). Tap Try Again."
+        )
+
+
 def _download_file(
     url: str,
     dest_path: str,
@@ -466,30 +579,64 @@ def _download_file(
     *,
     expected_size: Optional[int] = None,
 ) -> None:
+    """
+    Stream a release asset to dest_path.
+
+    Writes via a sibling .part file, then renames. If security software deletes
+    or locks the file mid-stream, raises UpdateError with an AV-friendly message
+    so the caller can auto-retry.
+    """
     global GITHUB_TOKEN
     GITHUB_TOKEN = _load_github_token()
+
+    part_path = dest_path + ".part"
+    for stale in (dest_path, part_path):
+        try:
+            if os.path.isfile(stale):
+                os.remove(stale)
+        except OSError:
+            pass
 
     req = urllib.request.Request(
         url,
         headers=_request_headers("application/octet-stream"),
     )
+    downloaded = 0
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp, open(dest_path, "wb") as out_file:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             total = int(resp.headers.get("Content-Length", 0) or 0)
             if expected_size and total and abs(total - expected_size) > 1024:
                 raise UpdateError(
                     f"Download Content-Length ({total} bytes) does not match "
                     f"GitHub asset size ({expected_size} bytes). Aborting."
                 )
-            downloaded = 0
             chunk_size = 65536
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                out_file.write(chunk)
-                downloaded += len(chunk)
-                progress_cb(downloaded, total or expected_size or 0)
+            with open(part_path, "wb") as out_file:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    try:
+                        out_file.write(chunk)
+                        out_file.flush()
+                    except OSError as e:
+                        raise UpdateError(
+                            "Download interrupted while writing the package "
+                            f"(file removed or locked mid-transfer).\n\n{e}"
+                        ) from e
+                    downloaded += len(chunk)
+                    progress_cb(downloaded, total or expected_size or 0)
+                    # Detect AV deleting the open file on some Windows configs
+                    try:
+                        if not os.path.isfile(part_path):
+                            raise UpdateError(
+                                "Download file disappeared while writing "
+                                "(security software likely quarantined it)."
+                            )
+                    except UpdateError:
+                        raise
+                    except OSError:
+                        pass
     except urllib.error.HTTPError as e:
         raise UpdateError(
             f"Download failed (HTTP {e.code}). "
@@ -498,29 +645,73 @@ def _download_file(
         ) from e
     except urllib.error.URLError as e:
         raise UpdateError(f"Download network error: {e.reason}") from e
-
-    got = os.path.getsize(dest_path)
-    if expected_size and expected_size > 0:
-        # Exact match required — truncated downloads must never be installed
-        if got != expected_size:
-            try:
-                os.remove(dest_path)
-            except OSError:
-                pass
-            raise UpdateError(
-                f"Download incomplete or corrupted.\n"
-                f"Got {got} bytes, GitHub asset is {expected_size} bytes.\n"
-                "Delete any partial file and try Check for Updates again."
-            )
-    if got < 50_000_000 and dest_path.lower().endswith(".exe"):
+    except UpdateError:
         try:
-            os.remove(dest_path)
+            os.remove(part_path)
+        except OSError:
+            pass
+        raise
+    except OSError as e:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        raise UpdateError(
+            f"Could not save update package ({e}).\n"
+            "Tap Try Again — Hammer will re-download automatically."
+        ) from e
+
+    if not os.path.isfile(part_path):
+        raise UpdateError(
+            "Download finished but the package file is missing "
+            "(security software likely removed it)."
+        )
+
+    try:
+        got = os.path.getsize(part_path)
+    except OSError as e:
+        raise UpdateError(f"Could not read downloaded package: {e}") from e
+
+    if expected_size and expected_size > 0 and got != expected_size:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        raise UpdateError(
+            f"Download incomplete or corrupted.\n"
+            f"Got {got} bytes, GitHub asset is {expected_size} bytes.\n"
+            "Tap Try Again — Hammer will re-download automatically."
+        )
+
+    # Bare .exe assets must still be huge; zip packages are also large when frozen.
+    if got < 50_000_000 and (
+        dest_path.lower().endswith(".exe")
+        or dest_path.lower().endswith(".bin" + _DOWNLOAD_SUFFIX)
+        or dest_path.lower().endswith(".bin.hammerdl")
+    ):
+        try:
+            os.remove(part_path)
         except OSError:
             pass
         raise UpdateError(
             f"Downloaded file is only {got / (1024 * 1024):.1f} MB — that is not the "
-            "Windows exe (likely source zip). Need Hammer-stub-package.zip or HammerRuntime.exe."
+            "Windows package (likely source zip). Need Hammer-stub-package.zip or "
+            "HammerRuntime.exe."
         )
+
+    try:
+        os.replace(part_path, dest_path)
+    except OSError as e:
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        raise UpdateError(
+            f"Could not finalize download package ({e}).\n"
+            "Tap Try Again — Hammer will re-download automatically."
+        ) from e
+
+    _unblock_windows_download(dest_path)
 
 
 def _unblock_windows_download(path: str) -> None:
@@ -632,6 +823,9 @@ def _is_onedir_payload(payload_root: str) -> bool:
 
 # Filled by install helpers with path to _hammer_apply_update.bat (Windows).
 _WINDOWS_UPDATE_BAT: list = [None]
+# When set to a stub exe path, relaunch_and_exit uses a silent detached launch
+# (no visible CMD) — preferred for stub-layout pending updates.
+_SILENT_STUB_RELAUNCH: list = [None]
 
 
 def _find_runtime_exe_in_tree(root: str) -> Optional[str]:
@@ -686,38 +880,88 @@ def _validate_runtime_file(path: str) -> None:
 
 
 def _schedule_relaunch_stub(root: str, status_cb: Callable[[str], None], note: str) -> str:
-    """After this process exits, start the stub (which applies pending + launches runtime)."""
+    """
+    After this process exits, start the stub (which applies pending + launches runtime).
+
+    Stub-layout updates use a silent detached relaunch — no visible CMD window.
+    """
     stub = stub_exe_path(root)
-    log_path = update_log_path()
-    if os.name == "nt":
-        if not os.path.isfile(stub):
-            # Legacy fallback: relaunch whatever we are
-            stub = os.path.abspath(sys.executable)
-        bat = _write_windows_update_bat(
-            pid=os.getpid(),
-            exe_path=stub,
-            lines=[
-                _bat_echo_log(log_path, note),
-                _bat_echo_log(log_path, "UPDATE_OK staging done — relaunching stub"),
-                *_windows_relaunch_lines(root, stub, log_path),
-            ],
-        )
-        _WINDOWS_UPDATE_BAT[0] = bat
-        status_cb("Update staged — closing to finish via launcher...")
-    else:
-        status_cb("Update staged.")
+    if not os.path.isfile(stub):
+        stub = os.path.abspath(sys.executable)
+
+    # Preferred professional path: silent relaunch (stub applies .pending.bin).
+    # No visible CMD — legacy one-file replace still uses the bat helpers.
+    if os.path.isfile(stub):
+        _WINDOWS_UPDATE_BAT[0] = None
+        _SILENT_STUB_RELAUNCH[0] = stub
+        status_cb("Update ready — restarting…")
+        return root
+
+    status_cb("Update staged.")
     return root
 
 
 def _stage_runtime_pending(downloaded_runtime: str, status_cb: Callable[[str], None]) -> str:
-    """Copy new runtime beside the live one as .pending; stub applies it on next start."""
+    """
+    Stage new runtime as HammerRuntime.pending.bin (non-.exe name).
+
+    The stub applies it on next start. Keeping a non-.exe extension while the
+    file sits on disk reduces security-software false positives mid-update.
+    """
     root = app_root()
     os.makedirs(hammer_app_dir(root), exist_ok=True)
-    pending = pending_runtime_path(root)
-    status_cb("Staging new runtime (no replace while running)...")
-    shutil.copy2(downloaded_runtime, pending)
-    _unblock_windows_download(pending)
-    _validate_runtime_file(pending)
+    writing = pending_runtime_bin_path(root)
+    # Clear legacy *.exe.pending if present so stub prefers the bin name
+    legacy = pending_runtime_path(root)
+
+    for path in (writing, writing + ".writing", legacy):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    tmp = writing + ".writing"
+    try:
+        # If the download already landed on the pending path, just validate.
+        if os.path.abspath(downloaded_runtime) == os.path.abspath(writing):
+            _unblock_windows_download(writing)
+            _validate_runtime_file(writing)
+        elif os.path.abspath(downloaded_runtime) == os.path.abspath(tmp):
+            _validate_runtime_file(tmp)
+            os.replace(tmp, writing)
+            _unblock_windows_download(writing)
+            _validate_runtime_file(writing)
+        else:
+            status_cb("Preparing update…")
+            _copy_file_with_progress(
+                downloaded_runtime, tmp, status_cb, label="Preparing update"
+            )
+            _unblock_windows_download(tmp)
+            _validate_runtime_file(tmp)
+            os.replace(tmp, writing)
+            _unblock_windows_download(writing)
+            _validate_runtime_file(writing)
+    except OSError as e:
+        for path in (tmp, writing):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        raise UpdateError(
+            f"Could not stage the new runtime ({e}).\n"
+            "Tap Try Again — Hammer will re-download automatically."
+        ) from e
+    except UpdateError:
+        for path in (tmp, writing):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        raise
+
     return _schedule_relaunch_stub(root, status_cb, "Pending runtime ready")
 
 
@@ -909,9 +1153,8 @@ def read_pending_update_message() -> Optional[str]:
             "The last Check for Updates could not replace the .exe.\n\n"
             "Details (_hammer_update.log):\n"
             f"{text}\n\n"
-            "Fix: close all Hammer windows, download Hammer-stub-package.zip from GitHub "
-            "Releases (or the large HammerCandleBacktestDashboard.exe bridge build), "
-            "replace/extract next to your data/ folder, then double-click the launcher."
+            "Open Help → Check for Updates… and tap Try Again — Hammer will "
+            "clean up and re-download automatically. Your data/ folder is safe."
         )
     if "UPDATE_OK" in text:
         return None
@@ -1281,11 +1524,20 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
     python_exe = sys.executable
     main_script = os.path.join(root, "main.py")
 
+    # Stub-layout pending update: silent detached relaunch (no CMD flash).
+    silent_stub = _SILENT_STUB_RELAUNCH[0]
+    if silent_stub and os.path.isfile(silent_stub):
+        _SILENT_STUB_RELAUNCH[0] = None
+        time.sleep(0.35)
+        _spawn_frozen_relaunch(silent_stub, root)
+        time.sleep(0.2)
+        os._exit(0)
+
     update_bat = _WINDOWS_UPDATE_BAT[0]
     if update_bat and os.path.isfile(update_bat):
         _spawn_detached(["cmd", "/c", update_bat])
-        # Give the visible CMD a moment to start before we kill this process
-        time.sleep(1.0)
+        # Give the helper a moment to start before we kill this process
+        time.sleep(0.6)
         os._exit(0)
 
     # Prefer stub so pending runtime is applied before UI start
@@ -1320,12 +1572,140 @@ def relaunch_and_exit(root: Optional[str] = None) -> None:
     os._exit(0)
 
 
+def _zip_find_stub_runtime_members(
+    zf: zipfile.ZipFile,
+) -> tuple[Optional[zipfile.ZipInfo], Optional[zipfile.ZipInfo]]:
+    """Locate small stub + large runtime members inside a release zip."""
+    runtime_info: Optional[zipfile.ZipInfo] = None
+    stub_info: Optional[zipfile.ZipInfo] = None
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        base = info.filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if base == RUNTIME_EXE_NAME.lower() and info.file_size >= MIN_RUNTIME_BYTES:
+            runtime_info = info
+        elif (
+            base == STUB_EXE_NAME.lower()
+            and info.file_size > 0
+            and info.file_size < MIN_RUNTIME_BYTES
+        ):
+            # Prefer the smaller launcher if multiple matches exist
+            if stub_info is None or info.file_size < stub_info.file_size:
+                stub_info = info
+    return stub_info, runtime_info
+
+
+def _stream_zip_member_to_file(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    dest: str,
+    status_cb: Callable[[str], None],
+    *,
+    label: str,
+) -> None:
+    total = int(info.file_size or 0)
+    copied = 0
+    last_pct = -1
+    chunk = 1024 * 1024
+    with zf.open(info, "r") as src, open(dest, "wb") as out:
+        while True:
+            buf = src.read(chunk)
+            if not buf:
+                break
+            out.write(buf)
+            copied += len(buf)
+            if total > 0:
+                pct = int(copied * 100 / total)
+                if pct != last_pct and (pct % 5 == 0 or pct >= 99):
+                    last_pct = pct
+                    status_cb(
+                        f"{label}… {copied / (1024 * 1024):.0f} / "
+                        f"{total / (1024 * 1024):.0f} MB"
+                    )
+    got = os.path.getsize(dest)
+    if total and got != total:
+        raise UpdateError(
+            f"Extract incomplete ({got} of {total} bytes). Tap Try Again."
+        )
+
+
+def _install_stub_package_from_zip_fast(
+    asset_path: str,
+    status_cb: Callable[[str], None],
+) -> Optional[str]:
+    """
+    Fast path for stub-layout installs: stream only runtime (+ stub) from the zip
+    into place — no full extract tree / double copy of ~430 MB.
+    Returns install root on success, or None to fall back to full extract.
+    """
+    if not (is_running_as_runtime() or is_stub_layout(app_root())):
+        return None
+
+    root = app_root()
+    try:
+        with zipfile.ZipFile(asset_path, "r") as zf:
+            stub_info, runtime_info = _zip_find_stub_runtime_members(zf)
+            if runtime_info is None:
+                return None
+
+            os.makedirs(hammer_app_dir(root), exist_ok=True)
+            writing = pending_runtime_bin_path(root)
+            tmp = writing + ".writing"
+            for path in (writing, tmp, pending_runtime_path(root)):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+
+            status_cb("Installing update…")
+            _stream_zip_member_to_file(
+                zf, runtime_info, tmp, status_cb, label="Installing update"
+            )
+            _unblock_windows_download(tmp)
+            _validate_runtime_file(tmp)
+            os.replace(tmp, writing)
+            _unblock_windows_download(writing)
+            _validate_runtime_file(writing)
+
+            if stub_info is not None and not is_running_as_legacy_onefile():
+                status_cb("Updating launcher…")
+                stub_tmp = stub_exe_path(root) + ".new"
+                _stream_zip_member_to_file(
+                    zf, stub_info, stub_tmp, status_cb, label="Updating launcher"
+                )
+                _unblock_windows_download(stub_tmp)
+                dest_stub = stub_exe_path(root)
+                try:
+                    if os.path.isfile(dest_stub):
+                        os.replace(dest_stub, dest_stub + ".old")
+                    os.replace(stub_tmp, dest_stub)
+                    try:
+                        os.remove(dest_stub + ".old")
+                    except OSError:
+                        pass
+                except OSError:
+                    pass
+
+            return _schedule_relaunch_stub(root, status_cb, "Pending runtime ready (fast zip)")
+    except UpdateError:
+        raise
+    except Exception:
+        # Corrupt zip / unexpected layout — fall back to full extract
+        return None
+
+
 def _install_from_zip(
     asset_path: str,
     status_cb: Callable[[str], None],
 ) -> str:
     """Install a release .zip — source tree (dev) or Windows onedir/exe payload (frozen)."""
-    status_cb("Extracting update...")
+    if getattr(sys, "frozen", False):
+        fast = _install_stub_package_from_zip_fast(asset_path, status_cb)
+        if fast is not None:
+            return fast
+
+    status_cb("Extracting update…")
     extract_parent = os.path.join(app_root(), "_hammer_update_extract")
     if os.path.isdir(extract_parent):
         shutil.rmtree(extract_parent, ignore_errors=True)
@@ -1366,7 +1746,7 @@ def _install_from_zip(
                 if _is_onedir_payload(payload_root):
                     if os.name == "nt":
                         return _schedule_windows_onedir_update(payload_root, status_cb)
-                    status_cb("Installing update...")
+                    status_cb("Installing update…")
                     _copy_over_app(payload_root, app_root())
                     status_cb("Update installed.")
                     return app_root()
@@ -1376,7 +1756,7 @@ def _install_from_zip(
                 "the release zip."
             )
 
-        status_cb("Installing update...")
+        status_cb("Installing update…")
         root = app_root()
         _copy_over_app(source_root, root)
         status_cb("Update installed.")
@@ -1393,22 +1773,68 @@ def download_and_install(
     """
     Blocking: download → install into app folder.
     Returns app_root for the caller to relaunch.
+
+    Downloads into <install>/_hammer_update_cache as a non-.exe package and
+    auto-retries when security software deletes/locks the file mid-transfer.
     """
-    status_cb(f"Downloading {release.asset_name}...")
-    tmp_dir = tempfile.mkdtemp(prefix="hammer_update_")
-    try:
-        asset_path = os.path.join(tmp_dir, release.asset_name)
-        _download_file(
-            release.download_url,
-            asset_path,
-            progress_cb,
-            expected_size=release.asset_size or None,
-        )
-        _unblock_windows_download(asset_path)
+    last_err: Optional[BaseException] = None
+    cache_dir = _update_cache_dir()
+    asset_path = os.path.join(cache_dir, _safe_download_name(release.asset_name))
 
-        if release.asset_kind == "exe" or release.asset_name.lower().endswith(".exe"):
-            return _install_exe(asset_path, status_cb)
+    for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+        cleanup_broken_update_files()
+        try:
+            if attempt == 1:
+                status_cb(f"Downloading {release.asset_name}...")
+            else:
+                status_cb(
+                    f"Security software interrupted the transfer — "
+                    f"retrying automatically ({attempt}/{_DOWNLOAD_ATTEMPTS})..."
+                )
+                time.sleep(1.2 * attempt)
 
-        return _install_from_zip(asset_path, status_cb)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+            _download_file(
+                release.download_url,
+                asset_path,
+                progress_cb,
+                expected_size=release.asset_size or None,
+            )
+            _unblock_windows_download(asset_path)
+
+            # Prefer treating by kind; .hammerdl names keep the original zip/exe identity
+            # via release.asset_kind / original asset_name.
+            name_low = (release.asset_name or "").lower()
+            if release.asset_kind == "exe" or name_low.endswith(".exe"):
+                root = _install_exe(asset_path, status_cb)
+            else:
+                root = _install_from_zip(asset_path, status_cb)
+
+            # Success — drop the bulky cache package
+            try:
+                if os.path.isfile(asset_path):
+                    os.remove(asset_path)
+            except OSError:
+                pass
+            return root
+        except UpdateError as e:
+            last_err = e
+            for path in (asset_path, asset_path + ".part"):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+            if attempt >= _DOWNLOAD_ATTEMPTS or not _looks_like_av_interference(e):
+                break
+        except OSError as e:
+            last_err = e
+            if attempt >= _DOWNLOAD_ATTEMPTS or not _looks_like_av_interference(e):
+                break
+
+    detail = str(last_err) if last_err else "unknown error"
+    raise UpdateError(
+        "Update could not finish after automatic retries.\n\n"
+        f"{detail}\n\n"
+        "Tap Try Again in this window — Hammer will clean up and re-download. "
+        "Your data/ folder is never touched."
+    ) from last_err

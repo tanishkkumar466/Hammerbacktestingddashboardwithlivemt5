@@ -36,14 +36,39 @@ class DownloadInstallWorker(QThread):
     def __init__(self, release: updater.ReleaseInfo, parent=None):
         super().__init__(parent)
         self.release = release
+        self._cancel = False
+
+    def request_cancel(self) -> None:
+        self._cancel = True
 
     def run(self):
         try:
+            def _progress(done: int, total: int) -> None:
+                if self._cancel:
+                    raise updater.UpdateError("Update cancelled.")
+                self.progress.emit(done, total)
+
+            def _status(text: str) -> None:
+                if self._cancel:
+                    raise updater.UpdateError("Update cancelled.")
+                self.status.emit(text)
+
             app_root = updater.download_and_install(
                 self.release,
-                progress_cb=lambda done, total: self.progress.emit(done, total),
-                status_cb=lambda text: self.status.emit(text),
+                progress_cb=_progress,
+                status_cb=_status,
             )
+            if self._cancel:
+                updater.cleanup_broken_update_files()
+                self.failed.emit("Update cancelled.")
+                return
             self.finished_ok.emit(app_root)
         except Exception as e:  # noqa: BLE001
-            self.failed.emit(str(e))
+            try:
+                updater.cleanup_broken_update_files()
+            except Exception:
+                pass
+            if self._cancel:
+                self.failed.emit("Update cancelled.")
+            else:
+                self.failed.emit(str(e))

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import traceback
+from typing import Optional
 
 from update.paths import (
     INSTALL_ROOT_ENV,
@@ -22,6 +23,7 @@ from update.paths import (
     STUB_EXE_NAME,
     app_dir,
     install_root,
+    pending_runtime_bin_path,
     pending_runtime_path,
     runtime_exe_path,
     stub_exe_path,
@@ -75,16 +77,35 @@ def _unblock(path: str) -> None:
 
 
 def _apply_pending(root: str) -> None:
-    pending = pending_runtime_path(root)
+    """
+    Swap staged runtime into place before launching the UI.
+
+    Prefers HammerRuntime.pending.bin (non-.exe name) over *.exe.pending so
+    security software is less likely to quarantine a half-applied update.
+    """
     current = runtime_exe_path(root)
-    if not os.path.isfile(pending):
-        return
-    try:
-        size = os.path.getsize(pending)
-    except OSError:
-        return
-    if size < MIN_RUNTIME_BYTES:
-        _log(root, f"pending too small ({size}); leaving in place")
+    bin_pending = pending_runtime_bin_path(root)
+    exe_pending = pending_runtime_path(root)
+
+    source: Optional[str] = None
+    for candidate in (bin_pending, exe_pending):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            size = os.path.getsize(candidate)
+        except OSError:
+            continue
+        if size < MIN_RUNTIME_BYTES:
+            _log(root, f"pending too small ({size}); removing {os.path.basename(candidate)}")
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+            continue
+        source = candidate
+        break
+
+    if not source:
         return
 
     os.makedirs(app_dir(root), exist_ok=True)
@@ -97,21 +118,33 @@ def _apply_pending(root: str) -> None:
                 old = current + f".old.{os.getpid()}"
         if os.path.isfile(current):
             os.replace(current, old)
-        os.replace(pending, current)
+        os.replace(source, current)
         _unblock(current)
-        _log(root, "applied pending runtime")
+        _log(root, f"applied pending runtime from {os.path.basename(source)}")
+        # Drop the alternate pending name if both somehow existed
+        for leftover in (bin_pending, exe_pending):
+            if leftover != source and os.path.isfile(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
         try:
             os.remove(old)
         except OSError:
             pass
     except OSError as exc:
         _log(root, f"pending apply failed: {exc}")
-        # Try to restore
         try:
             if os.path.isfile(old) and not os.path.isfile(current):
                 os.replace(old, current)
         except OSError:
             pass
+        if os.path.isfile(source):
+            try:
+                if os.path.getsize(source) < MIN_RUNTIME_BYTES:
+                    os.remove(source)
+            except OSError:
+                pass
 
 
 def _message_box(title: str, text: str) -> None:

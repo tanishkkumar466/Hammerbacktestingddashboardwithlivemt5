@@ -138,9 +138,26 @@ def test_stage_runtime_pending(tmp_path, monkeypatch):
     notes = []
     root = updater._stage_runtime_pending(str(src), notes.append)
     assert root == str(tmp_path)
-    pending = tmp_path / "app" / "HammerRuntime.exe.pending"
+    pending = tmp_path / "app" / "HammerRuntime.pending.bin"
     assert pending.is_file()
     assert pending.stat().st_size >= 1024
+    # Must not leave a .exe.pending name (AV bait)
+    assert not (tmp_path / "app" / "HammerRuntime.exe.pending").exists()
+
+
+def test_schedule_relaunch_stub_is_silent(tmp_path, monkeypatch):
+    monkeypatch.setattr(updater, "app_root", lambda: str(tmp_path))
+    stub = tmp_path / "HammerCandleBacktestDashboard.exe"
+    stub.write_bytes(b"stub")
+    monkeypatch.setattr(updater, "stub_exe_path", lambda root=None: str(stub))
+    notes = []
+    updater._WINDOWS_UPDATE_BAT[0] = "should-clear.bat"
+    updater._SILENT_STUB_RELAUNCH[0] = None
+    root = updater._schedule_relaunch_stub(str(tmp_path), notes.append, "note")
+    assert root == str(tmp_path)
+    assert updater._WINDOWS_UPDATE_BAT[0] is None
+    assert updater._SILENT_STUB_RELAUNCH[0] == str(stub)
+    assert any("restarting" in n.lower() for n in notes)
 
 
 def test_find_embedded_stub(tmp_path, monkeypatch):
@@ -215,20 +232,51 @@ def test_windows_update_bat_is_bounded_and_uses_ping(tmp_path, monkeypatch):
     assert "sidecar" in text.lower() or "-updated.exe" in text
 
 
-def test_install_stub_package_accepts_positional_args():
-    """Regression: *,_stub typo made all params keyword-only (TypeError on zip install)."""
-    import inspect
+def test_safe_download_name_strips_exe():
+    assert updater._safe_download_name("HammerRuntime.exe") == "HammerRuntime.bin.hammerdl"
+    assert updater._safe_download_name("Hammer-stub-package.zip") == (
+        "Hammer-stub-package.zip.hammerdl"
+    )
+    assert not updater._safe_download_name("foo.EXE").lower().endswith(".exe")
 
-    sig = inspect.signature(updater._install_stub_package)
-    params = list(sig.parameters.values())
-    assert [p.name for p in params] == ["next_stub", "next_runtime", "status_cb"]
-    assert all(p.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
-    # Positional call must not raise TypeError about argument count
+
+def test_looks_like_av_interference():
+    assert updater._looks_like_av_interference(PermissionError("denied"))
+    assert updater._looks_like_av_interference(
+        updater.UpdateError("Download file disappeared while writing")
+    )
+    assert not updater._looks_like_av_interference(
+        updater.UpdateError("GitHub returned 404")
+    )
+
+
+def test_download_and_install_retries_then_raises(monkeypatch, tmp_path):
+    """AV-style failures should auto-retry, then surface a Try Again message."""
+    monkeypatch.setattr(updater, "app_root", lambda: str(tmp_path))
+    monkeypatch.setattr(updater, "_DOWNLOAD_ATTEMPTS", 2)
+    calls = {"n": 0}
+
+    def boom(*_a, **_k):
+        calls["n"] += 1
+        raise updater.UpdateError(
+            "Download file disappeared while writing "
+            "(security software likely quarantined it)."
+        )
+
+    monkeypatch.setattr(updater, "_download_file", boom)
+    release = updater.ReleaseInfo(
+        tag="v9.9.9",
+        version="9.9.9",
+        notes="",
+        download_url="https://example/x",
+        asset_name="Hammer-stub-package.zip",
+        asset_size=400_000_000,
+        asset_kind="zip",
+    )
     try:
-        updater._install_stub_package("/no/stub.exe", "/no/runtime.exe", lambda _s: None)
-    except TypeError as exc:
-        raise AssertionError(f"positional call rejected: {exc}") from exc
-    except Exception:
-        # Missing files / not frozen — expected; only TypeError is a regression
-        pass
+        updater.download_and_install(release, lambda *_: None, lambda *_: None)
+        raise AssertionError("expected UpdateError")
+    except updater.UpdateError as exc:
+        assert "Try Again" in str(exc)
+    assert calls["n"] == 2
 

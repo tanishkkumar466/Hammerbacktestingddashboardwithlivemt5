@@ -63,6 +63,11 @@ def pending_runtime_path(root: str | None = None) -> str:
     return runtime_exe_path(root) + PENDING_SUFFIX
 
 
+def pending_runtime_bin_path(root: str | None = None) -> str:
+    """Non-.exe staging name — preferred while bytes are on disk (AV-friendlier)."""
+    return os.path.join(app_dir(root), "HammerRuntime.pending.bin")
+
+
 def is_stub_layout(root: str | None = None) -> bool:
     root = root or install_root()
     try:

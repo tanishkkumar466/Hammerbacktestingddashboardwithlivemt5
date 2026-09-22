@@ -91,8 +91,11 @@ def test_still_open_blocks_later_signal_when_overlap_disabled():
     assert not (datetime(2026, 1, 2) < open_until[ExitModel.WORST_CASE])
 
 
-def test_market_entry_bar_sl_is_visible_to_resolver():
-    """Entry-bar scan (start=fill_idx) catches same-bar SL after open entry."""
+def test_market_entry_bar_skipped_for_hwc_baseline():
+    """
+    Plain Hammer with candles (market / next-open) must NOT scan the entry bar —
+    matches pre-1.0.29 and client baselines. Pullback fills still include fill bar.
+    """
     sl, tp = 90.0, 120.0
     # Entry bar: open 100, low tags SL; next bar would hit TP
     highs = np.array([101.0, 125.0])
@@ -101,18 +104,30 @@ def test_market_entry_bar_sl_is_visible_to_resolver():
     closes = np.array([95.0, 124.0])
     ts = [datetime(2026, 1, 1, 10, 0), datetime(2026, 1, 1, 10, 3)]
 
-    skipped = resolve_all_exit_models_for_trade(
+    # Market path (fill_idx+1): skip entry bar → WIN on next bar
+    market = resolve_all_exit_models_for_trade(
         direction=TradeDirection.BUY, sl=sl, target=tp,
         future_high=highs[1:], future_low=lows[1:],
         future_open=opens[1:], future_close=closes[1:],
         future_timestamps=ts[1:], max_scan=10,
     )
-    assert skipped[ExitModel.WORST_CASE][0] == TradeOutcome.WIN
+    assert market[ExitModel.WORST_CASE][0] == TradeOutcome.WIN
 
-    fixed = resolve_all_exit_models_for_trade(
+    # Pullback path (fill_idx): include fill/entry bar → LOSS
+    pullback = resolve_all_exit_models_for_trade(
         direction=TradeDirection.BUY, sl=sl, target=tp,
         future_high=highs, future_low=lows,
         future_open=opens, future_close=closes,
         future_timestamps=ts, max_scan=10,
     )
-    assert fixed[ExitModel.WORST_CASE][0] == TradeOutcome.LOSS
+    assert pullback[ExitModel.WORST_CASE][0] == TradeOutcome.LOSS
+
+
+def test_exit_scan_start_depends_on_await_limit():
+    """Simulator index: await_limit → fill bar; market → next bar."""
+    from types import SimpleNamespace
+    from backtest import _exit_scan_start_index
+
+    assert _exit_scan_start_index(SimpleNamespace(await_limit_fill=True), 5) == 5
+    assert _exit_scan_start_index(SimpleNamespace(await_limit_fill=False), 5) == 6
+    assert _exit_scan_start_index(SimpleNamespace(), 5) == 6
