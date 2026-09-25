@@ -19,6 +19,12 @@ presets/
 run_history.db
 *.db-journal
 
+# API Accounts Manager (logins; passwords never stored — still keep local)
+API/accounts.json
+API/bindings.json
+API/engine/build/
+API/terminals/
+
 # Live trading logs (may include account hints)
 # (lives under output/live/ — covered by output/)
 

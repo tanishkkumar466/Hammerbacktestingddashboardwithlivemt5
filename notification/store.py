@@ -35,6 +35,8 @@ def bot_from_dict(row: Dict[str, Any]) -> NotificationBot:
         mode=_normalize_mode(row.get("mode")),
         account_ids=[str(a).strip() for a in accounts if str(a).strip()],
         timeframes=[str(t).strip() for t in timeframes if str(t).strip()],
+        notify_start_hhmm=str(row.get("notify_start_hhmm") or "").strip(),
+        notify_end_hhmm=str(row.get("notify_end_hhmm") or "").strip(),
     )
 
 
@@ -48,6 +50,8 @@ def bot_to_dict(bot: NotificationBot) -> Dict[str, Any]:
         "mode": bot.mode,
         "account_ids": list(bot.account_ids),
         "timeframes": list(bot.timeframes),
+        "notify_start_hhmm": str(bot.notify_start_hhmm or "").strip(),
+        "notify_end_hhmm": str(bot.notify_end_hhmm or "").strip(),
     }
 
 

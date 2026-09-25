@@ -26,6 +26,48 @@ MODE_DRY_RUN = "dry_run"
 MODE_BOTH = "both"
 
 
+def _parse_hhmm_minutes(raw: str, default: int) -> int:
+    text = (raw or "").strip()
+    if not text:
+        return int(default) % (24 * 60)
+    try:
+        if ":" in text:
+            hh_s, mm_s = text.split(":", 1)
+            hh, mm = int(hh_s), int(mm_s.split()[0] if mm_s else 0)
+        else:
+            hh, mm = int(text), 0
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return int(default) % (24 * 60)
+        return hh * 60 + mm
+    except (TypeError, ValueError):
+        return int(default) % (24 * 60)
+
+
+def in_notify_hours(
+    start_hhmm: str,
+    end_hhmm: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """
+    True if local clock is inside the client's Telegram notify window.
+
+    Empty start and end → always notify (bots keep trading either way).
+    Overnight windows supported (e.g. 22:00–07:00).
+    """
+    start_raw = (start_hhmm or "").strip()
+    end_raw = (end_hhmm or "").strip()
+    if not start_raw and not end_raw:
+        return True
+    start = _parse_hhmm_minutes(start_raw, 0)
+    end = _parse_hhmm_minutes(end_raw, 23 * 60 + 59)
+    local = now or datetime.now()
+    cur = local.hour * 60 + local.minute
+    if start <= end:
+        return start <= cur <= end
+    return cur >= start or cur <= end
+
+
 @dataclass
 class NotificationBot:
     id: str
@@ -36,6 +78,9 @@ class NotificationBot:
     mode: str = MODE_BOTH  # live | dry_run | both
     account_ids: List[str] = field(default_factory=list)  # empty = all accounts
     timeframes: List[str] = field(default_factory=list)  # empty = all TFs
+    # Local HH:MM window for Telegram delivery; empty = anytime
+    notify_start_hhmm: str = ""
+    notify_end_hhmm: str = ""
 
     def matches(
         self,
@@ -43,6 +88,8 @@ class NotificationBot:
         dry_run: bool,
         account_id: str = "",
         timeframe: str = "",
+        now: Optional[datetime] = None,
+        check_notify_hours: bool = True,
     ) -> bool:
         if not self.enabled:
             return False
@@ -61,6 +108,12 @@ class NotificationBot:
             tf = (timeframe or "").strip()
             if tf and tf not in self.timeframes:
                 return False
+        if check_notify_hours and not in_notify_hours(
+            self.notify_start_hhmm,
+            self.notify_end_hhmm,
+            now=now,
+        ):
+            return False
         return True
 
 
@@ -125,11 +178,17 @@ class NotificationManager:
         dry_run: bool,
         account_id: str = "",
         timeframe: str = "",
+        now: Optional[datetime] = None,
     ) -> List[NotificationBot]:
         with self._lock:
             return [
                 b for b in self._bots
-                if b.matches(dry_run=dry_run, account_id=account_id, timeframe=timeframe)
+                if b.matches(
+                    dry_run=dry_run,
+                    account_id=account_id,
+                    timeframe=timeframe,
+                    now=now,
+                )
             ]
 
     def to_snapshot(self) -> List[Dict[str, Any]]:
@@ -145,6 +204,8 @@ class NotificationManager:
                     "mode": b.mode,
                     "account_ids": list(b.account_ids),
                     "timeframes": list(b.timeframes),
+                    "notify_start_hhmm": b.notify_start_hhmm,
+                    "notify_end_hhmm": b.notify_end_hhmm,
                 }
                 for b in self._bots
             ]
@@ -219,12 +280,37 @@ class NotificationManager:
             return
         # Failures / safety blocks follow the dry_run flag of the attempt
         is_dry = bool(dry_run) or event == "DRY_RUN"
+        now = datetime.now()
         targets = self.matching_bots(
             dry_run=is_dry,
             account_id=account_id,
             timeframe=timeframe,
+            now=now,
         )
         if not targets:
+            # Bot still trading — only Telegram is muted outside the notify window
+            with self._lock:
+                routed = [
+                    b for b in self._bots
+                    if b.matches(
+                        dry_run=is_dry,
+                        account_id=account_id,
+                        timeframe=timeframe,
+                        check_notify_hours=False,
+                    )
+                ]
+            muted = [
+                b for b in routed
+                if not in_notify_hours(b.notify_start_hhmm, b.notify_end_hhmm, now=now)
+            ]
+            if muted:
+                b0 = muted[0]
+                start = (b0.notify_start_hhmm or "00:00").strip() or "00:00"
+                end = (b0.notify_end_hhmm or "23:59").strip() or "23:59"
+                self._log(
+                    f"[TELEGRAM] Alert muted — outside notify hours "
+                    f"{start}–{end} (local). Bot keeps running."
+                )
             return
         common = dict(
             symbol=symbol,

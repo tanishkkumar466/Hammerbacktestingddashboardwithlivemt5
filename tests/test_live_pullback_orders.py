@@ -40,7 +40,7 @@ def test_reanchor_keeps_absolute_sl_tp_for_pullback():
     assert tp == 4030.0
 
 
-def test_reanchor_shifts_sl_tp_for_normal_market_fill():
+def test_reanchor_shifts_tp_keeps_sl_for_normal_market_fill():
     sig = logic.TradeSignal(
         direction=logic.TradeDirection.BUY,
         hammer_candle=_candle("s", 1, 2, 0, 1.5),
@@ -53,9 +53,10 @@ def test_reanchor_shifts_sl_tp_for_normal_market_fill():
         timeframe="3m",
         await_limit_fill=False,
     )
+    # Fill 2 above signal entry — SL stays buffered; TP from fill×RR
     sl, tp = reanchor_sl_tp_to_fill(sig, fill_price=4012.0)
-    assert abs(sl - 4002.0) < 1e-9
-    assert abs(tp - 4032.0) < 1e-9
+    assert abs(sl - 4000.0) < 1e-9
+    assert abs(tp - 4036.0) < 1e-9  # risk 12 → TP = 4012 + 24
 
 
 def _pullback_engine(broker, order_mode: str, **cfg_extra) -> LiveTradingEngine:
@@ -98,11 +99,12 @@ def test_resolve_live_order_market_mode_uses_market_on_pullback():
     )
     resolved = engine._resolve_live_order(sig, "XAUUSD")
     assert resolved is not None
-    mode, limit_px, sl, tp = resolved
+    mode, limit_px, sl, tp, exec_entry = resolved
     assert mode == "market"
     assert limit_px is None
     assert sl == 4000.0
     assert tp == 4030.0
+    assert exec_entry == 4010.0
 
 
 def test_resolve_live_order_limit_mode_keeps_pullback_limit():
@@ -127,9 +129,10 @@ def test_resolve_live_order_limit_mode_keeps_pullback_limit():
     )
     resolved = engine._resolve_live_order(sig, "XAUUSD")
     assert resolved is not None
-    mode, limit_px, sl, tp = resolved
+    mode, limit_px, sl, tp, exec_entry = resolved
     assert mode == "limit_entry"
     assert limit_px == 4006.5
+    assert exec_entry == 4006.5
     assert sl == 4000.0
     assert tp == 4030.0
 
@@ -156,9 +159,10 @@ def test_resolve_live_order_pullback_ignores_limit_offset_mode():
         timeframe="3m",
         await_limit_fill=True,
     )
-    mode, limit_px, sl, tp = engine._resolve_live_order(sig, "XAUUSD")
+    mode, limit_px, sl, tp, exec_entry = engine._resolve_live_order(sig, "XAUUSD")
     assert mode == "limit_entry"
     assert limit_px == 4003.5
+    assert exec_entry == 4003.5
     assert sl == 4010.0
     assert tp == 3980.0
     broker.limit_price_with_offset.assert_not_called()

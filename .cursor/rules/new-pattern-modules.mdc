@@ -1,5 +1,5 @@
 ---
-description: New trading patterns must live in their own .py module; never bolt special-case exit/entry logic onto shared backtest paths.
+description: New trading patterns must live in their own .py module under strategy/; never bolt special-case exit/entry logic onto shared backtest paths.
 alwaysApply: true
 ---
 
@@ -7,7 +7,9 @@ alwaysApply: true
 
 When adding a **new pattern** (or a major variant with different entry/exit semantics):
 
-- Create a **new dedicated `.py` file** (same style as `logic.py`, `doji_logic.py`, `hammer_context_logic.py`).
+- Create a **new dedicated `.py` file under `strategy/`** (same style as `strategy/logic.py`, `strategy/doji_logic.py`, `strategy/hammer_with_candles_logic.py`, `strategy/hammer_with_candles_35_logic.py`).
+- **Hammer with candles** and **Hammer with candle 35%** are separate products — never share one `run_strategy` path that can let a pullback/exit fix spill across both.
+- Keep a root-level compatibility shim only if old import paths must keep working.
 - Register it via `pattern_type` / UI label + a clear branch in `backtest.py` / live that calls **that module’s** `run_strategy` / signal builders.
 - Do **not** overload an existing pattern module with divergent entry/exit rules that share one simulator path.
 

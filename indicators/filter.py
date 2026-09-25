@@ -316,6 +316,7 @@ def _mark_ignored(sig: logic.TradeSignal, reason: str) -> logic.TradeSignal:
         await_limit_fill=bool(getattr(sig, "await_limit_fill", False)),
         signal_entry_price=getattr(sig, "signal_entry_price", None),
         entry_pullback_pct=getattr(sig, "entry_pullback_pct", None),
+        entry_rule=getattr(sig, "entry_rule", None),
     )
 
 

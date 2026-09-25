@@ -123,11 +123,85 @@ def test_market_entry_bar_skipped_for_hwc_baseline():
     assert pullback[ExitModel.WORST_CASE][0] == TradeOutcome.LOSS
 
 
-def test_exit_scan_start_depends_on_await_limit():
-    """Simulator index: await_limit → fill bar; market → next bar."""
+def test_exit_scan_starts_on_first_live_bar():
+    """Limit → fill bar; open/signal-candle entries → entry bar; next close → next bar."""
     from types import SimpleNamespace
     from backtest import _exit_scan_start_index
 
+    R = logic.EntryRule
     assert _exit_scan_start_index(SimpleNamespace(await_limit_fill=True), 5) == 5
-    assert _exit_scan_start_index(SimpleNamespace(await_limit_fill=False), 5) == 6
-    assert _exit_scan_start_index(SimpleNamespace(), 5) == 6
+    for rule in (R.NEXT_CANDLE_OPEN, R.HAMMER_CLOSE, R.HAMMER_HIGH, R.HAMMER_LOW):
+        sig = SimpleNamespace(await_limit_fill=False, entry_rule=rule.value)
+        assert _exit_scan_start_index(sig, 5) == 5, rule
+    close_sig = SimpleNamespace(await_limit_fill=False, entry_rule=R.NEXT_CANDLE_CLOSE.value)
+    assert _exit_scan_start_index(close_sig, 5) == 6
+    # Legacy switch reproduces pre-1.0.34 numbers (entry bar ignored)
+    open_sig = SimpleNamespace(await_limit_fill=False, entry_rule=R.NEXT_CANDLE_OPEN.value)
+    assert _exit_scan_start_index(open_sig, 5, legacy_skip_entry_candle=True) == 6
+    limit_sig = SimpleNamespace(await_limit_fill=True)
+    assert _exit_scan_start_index(limit_sig, 5, legacy_skip_entry_candle=True) == 5
+
+
+def _resolve(direction, sl, tp, bars, **kw):
+    arr = np.array(bars, dtype=float)
+    ts = [datetime(2026, 1, 1) + timedelta(hours=i) for i in range(len(bars))]
+    return resolve_all_exit_models_for_trade(
+        direction=direction, sl=sl, target=tp,
+        future_open=arr[:, 0], future_high=arr[:, 1],
+        future_low=arr[:, 2], future_close=arr[:, 3],
+        future_timestamps=ts, max_scan=len(bars), **kw,
+    )
+
+
+def test_gap_open_beyond_sl_exits_at_open_not_sl():
+    # BUY SL 90: bar opens at 85 (gap) → loss priced at 85
+    out = _resolve(TradeDirection.BUY, 90.0, 120.0, [(100, 101, 99, 100), (85, 88, 84, 87)])
+    for m in ExitModel:
+        assert out[m][0] == TradeOutcome.LOSS and out[m][1] == 85.0
+    # SELL SL 110: bar opens at 115 → loss priced at 115
+    out = _resolve(TradeDirection.SELL, 110.0, 80.0, [(100, 101, 99, 100), (115, 116, 113, 114)])
+    for m in ExitModel:
+        assert out[m][0] == TradeOutcome.LOSS and out[m][1] == 115.0
+
+
+def test_gap_open_beyond_target_is_capped_at_target():
+    # Opens at 125 past TP 120 (and the bar later trades through SL): still a WIN, booked at TP
+    out = _resolve(TradeDirection.BUY, 90.0, 120.0, [(100, 101, 99, 100), (125, 126, 80, 81)])
+    for m in ExitModel:
+        assert out[m][0] == TradeOutcome.WIN and out[m][1] == 120.0
+
+
+def test_intrabar_limit_fill_ignores_target_before_fill():
+    # BUY limit 100 filled mid-bar (open 110 > limit); high 125 ≥ TP happened pre-fill
+    bars = [(110, 125, 99, 105), (105, 106, 104, 105)]
+    out = _resolve(TradeDirection.BUY, 90.0, 120.0, bars, prefill_first_bar=True)
+    assert out[ExitModel.BEST_CASE][0] == TradeOutcome.STILL_OPEN
+    # SL beyond the limit on the fill bar is certain after the fill
+    bars_sl = [(110, 111, 89, 95)]
+    out = _resolve(TradeDirection.BUY, 90.0, 120.0, bars_sl, prefill_first_bar=True)
+    for m in ExitModel:
+        assert out[m][0] == TradeOutcome.LOSS and out[m][1] == 90.0
+
+
+def test_fast_and_vectorized_paths_agree():
+    rng = np.random.default_rng(7)
+    for _ in range(200):
+        n = 80  # above SHORT_SCAN_THRESHOLD → vectorized
+        closes = 100 + np.cumsum(rng.normal(0, 1.5, n))
+        opens = np.concatenate(([100.0], closes[:-1] + rng.normal(0, 0.8, n - 1)))
+        highs = np.maximum(opens, closes) + rng.uniform(0, 2, n)
+        lows = np.minimum(opens, closes) - rng.uniform(0, 2, n)
+        bars = list(zip(opens, highs, lows, closes))
+        d = TradeDirection.BUY if rng.random() < 0.5 else TradeDirection.SELL
+        sl, tp = (95.0, 110.0) if d == TradeDirection.BUY else (105.0, 90.0)
+        pre = bool(rng.random() < 0.3)
+        vec = _resolve(d, sl, tp, bars, prefill_first_bar=pre)
+        # Force the loop path by chunking into a short window when resolved early
+        from backtest import _resolve_short_scan
+        arr = np.array(bars)
+        ts = [datetime(2026, 1, 1) + timedelta(hours=i) for i in range(n)]
+        loop = _resolve_short_scan(
+            d, sl, tp, arr[:, 1], arr[:, 2], arr[:, 0], arr[:, 3], ts, n,
+            prefill_first_bar=pre,
+        )
+        assert vec == loop

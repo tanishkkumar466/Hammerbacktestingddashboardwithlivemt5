@@ -22,8 +22,10 @@ import polars as pl
 import doji_logic
 import hammer_context_logic
 import logic
+from strategy import hammer_with_candles_35_logic as hwc35_logic
+from strategy import hammer_with_candles_logic as hwc_logic
 import sessions
-import telegram_notify
+from notification import telegram as telegram_notify
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
@@ -131,15 +133,40 @@ def reanchor_sl_tp_to_fill(
     fill_price: float,
 ) -> Tuple[float, float]:
     """
-    Keep the same $ risk/reward distances as the signal, anchored to the actual fill price.
+    Levels to send with a live fill/pending price.
 
-    Pullback-limit signals (await_limit_fill): SL and TP stay absolute — TP was set from
-    the signal entry × RR and must not move when we fill closer to the stop.
+    Pattern-agnostic (hammer / doji / Hammer with candles / 35%): every Live order
+    goes through this helper. Candle-extreme SL (+ buffer) stays absolute.
+
+    Pullback-limit signals (await_limit_fill): SL and TP stay absolute — TP was set
+    from the signal entry × RR and must not move when we fill closer to the stop.
+
+    Normal signals: keep stop_loss absolute (candle extreme + flat/% buffer).
+    Rebuild TP from the actual fill so RR matches Live fill without sliding the
+    buffered SL by entry_offset (that was logging/placing SL ~offset away).
     """
+    sl = float(sig.stop_loss)
     if getattr(sig, "await_limit_fill", False):
-        return float(sig.stop_loss), float(sig.target)
-    delta = float(fill_price) - float(sig.entry_price)
-    return float(sig.stop_loss) + delta, float(sig.target) + delta
+        return sl, float(sig.target)
+
+    fill = float(fill_price)
+    try:
+        rr = float(getattr(sig, "rr_multiple", 0) or 0)
+    except (TypeError, ValueError):
+        rr = 0.0
+    if rr <= 0:
+        return sl, float(sig.target)
+
+    if sig.direction == logic.TradeDirection.BUY:
+        risk = fill - sl
+        if risk <= 0:
+            return sl, float(sig.target)
+        return sl, fill + rr * risk
+
+    risk = sl - fill
+    if risk <= 0:
+        return sl, float(sig.target)
+    return sl, fill - rr * risk
 
 
 def validate_risk_config(cfg: LiveRunConfig, *, real_money: bool) -> Optional[str]:
@@ -308,11 +335,14 @@ def find_bar_signal_outcome(
         signals = doji_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
-    elif hammer_context_logic.is_context_pattern_type(pattern_type):
-        strategy_config = hammer_context_logic.apply_pullback_for_pattern_type(
-            strategy_config, pattern_type,
+    elif hwc35_logic.is_pattern_type(pattern_type):
+        strategy_config = hwc35_logic.prepare_config(strategy_config)
+        signals = hwc35_logic.run_strategy(
+            extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
-        signals = hammer_context_logic.run_strategy(
+    elif hwc_logic.is_pattern_type(pattern_type):
+        strategy_config = hwc_logic.prepare_config(strategy_config)
+        signals = hwc_logic.run_strategy(
             extended, timeframe=timeframe_logic_label, config=strategy_config,
         )
     else:
@@ -365,6 +395,7 @@ def find_bar_signal_outcome(
                     await_limit_fill=bool(getattr(sig, "await_limit_fill", False)),
                     signal_entry_price=getattr(sig, "signal_entry_price", None),
                     entry_pullback_pct=getattr(sig, "entry_pullback_pct", None),
+                    entry_rule=getattr(sig, "entry_rule", None),
                 )
                 ignored_match = sig
                 continue
@@ -593,6 +624,39 @@ class LiveTradingEngine:
         except Exception:
             pass
 
+    def update_runtime_safety(
+        self,
+        *,
+        max_spread_points: Optional[float] = None,
+        min_minutes_between_trades: Optional[float] = None,
+        max_daily_trades: Optional[int] = None,
+        max_daily_loss_usd: Optional[float] = None,
+        max_lot_size: Optional[float] = None,
+        demo_accounts_only: Optional[bool] = None,
+    ) -> None:
+        """Hot-reload safety limits — no Stop/Start required."""
+        parts = []
+        if max_spread_points is not None:
+            self.live_config.max_spread_points = float(max_spread_points)
+            parts.append(f"spread≤{self.live_config.max_spread_points:g} pts")
+        if min_minutes_between_trades is not None:
+            self.live_config.min_minutes_between_trades = float(min_minutes_between_trades)
+            parts.append(f"cooldown={self.live_config.min_minutes_between_trades:g}m")
+        if max_daily_trades is not None:
+            self.live_config.max_daily_trades = int(max_daily_trades)
+            parts.append(f"max_trades/day={self.live_config.max_daily_trades}")
+        if max_daily_loss_usd is not None:
+            self.live_config.max_daily_loss_usd = float(max_daily_loss_usd)
+            parts.append(f"max_loss=${self.live_config.max_daily_loss_usd:g}")
+        if max_lot_size is not None:
+            self.live_config.max_lot_size = float(max_lot_size)
+            parts.append(f"lot_cap={self.live_config.max_lot_size:g}")
+        if demo_accounts_only is not None:
+            self.live_config.demo_accounts_only = bool(demo_accounts_only)
+            parts.append(f"demo_only={self.live_config.demo_accounts_only}")
+        if parts:
+            self.log("[SAFETY] Updated live — " + ", ".join(parts))
+
     def update_telegram_settings(
         self,
         *,
@@ -654,21 +718,62 @@ class LiveTradingEngine:
     def _record_trade_event(
         self,
         event: str,
-        sig: logic.TradeSignal,
+        sig: Optional[logic.TradeSignal] = None,
         *,
         volume: float = 0.0,
         dry_run: bool = False,
         mt5_order_id: Optional[int] = None,
         mt5_message: str = "",
+        reason: str = "",
         order_mode: str = "",
         exit_price: Optional[float] = None,
         profit: Optional[float] = None,
         profit_currency: str = "",
         close_reason: str = "",
+        entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        target: Optional[float] = None,
     ) -> None:
-        variant = str(getattr(sig, "pattern_variant", "") or "")
-        signal_bar = str(getattr(getattr(sig, "hammer_candle", None), "timestamp", "") or "")
-        entry_bar = str(getattr(getattr(sig, "entry_candle", None), "timestamp", "") or "")
+        """
+        Append one audit row to this account/slot live_trades.csv.
+
+        Covers executed orders, dry-runs, safety blocks, fails, ignored setups,
+        and infra errors — always with a reason when something did not trade.
+        Telegram still only fires for ORDER_EVENTS; CSV always gets the row.
+        """
+        why = (reason or mt5_message or close_reason or "").strip()
+        variant = str(getattr(sig, "pattern_variant", "") or "") if sig else ""
+        signal_bar = ""
+        entry_bar = ""
+        direction = ""
+        strat_entry = strat_sl = strat_tp = ""
+        log_entry = log_sl = log_tp = 0.0
+        log_risk = 0.0
+        rr = 0.0
+        if sig is not None:
+            signal_bar = str(getattr(getattr(sig, "hammer_candle", None), "timestamp", "") or "")
+            entry_bar = str(getattr(getattr(sig, "entry_candle", None), "timestamp", "") or "")
+            direction = sig.direction.value
+            # ORDER/EXIT must log prices that were actually used — not a stale strategy
+            # entry while SL/TP were sent at different levels.
+            log_entry = float(sig.entry_price if entry_price is None else entry_price)
+            log_sl = float(sig.stop_loss if stop_loss is None else stop_loss)
+            log_tp = float(sig.target if target is None else target)
+            try:
+                log_risk = abs(log_entry - log_sl)
+            except (TypeError, ValueError):
+                log_risk = float(getattr(sig, "risk", 0) or 0)
+            rr = float(getattr(sig, "rr_multiple", 0) or 0)
+            strat_entry = round(float(sig.entry_price), 5)
+            strat_sl = round(float(sig.stop_loss), 5)
+            strat_tp = round(float(sig.target), 5)
+        elif entry_price is not None:
+            log_entry = float(entry_price)
+            log_sl = float(stop_loss or 0.0)
+            log_tp = float(target or 0.0)
+            log_risk = abs(log_entry - log_sl)
+
+        msg_for_row = mt5_message or why
         append_trade_row(
             self._journal_dir,
             {
@@ -678,30 +783,36 @@ class LiveTradingEngine:
                 "timeframe": self.live_config.timeframe_label,
                 "pattern": self.pattern_label,
                 "pattern_variant": variant,
-                "direction": sig.direction.value,
+                "direction": direction,
                 "volume": volume,
-                "entry_price": round(sig.entry_price, 5),
-                "stop_loss": round(sig.stop_loss, 5),
-                "target": round(sig.target, 5),
-                "risk": round(sig.risk, 5),
-                "rr_multiple": round(float(getattr(sig, "rr_multiple", 0) or 0), 4),
+                "entry_price": round(log_entry, 5) if sig is not None or entry_price is not None else "",
+                "stop_loss": round(log_sl, 5) if sig is not None or stop_loss is not None else "",
+                "target": round(log_tp, 5) if sig is not None or target is not None else "",
+                "risk": round(log_risk, 5) if (sig is not None or entry_price is not None) else "",
+                "rr_multiple": round(rr, 4) if rr else "",
                 "dry_run": "yes" if dry_run else "no",
                 "order_mode": order_mode or self.live_config.order_mode,
                 "magic": self.live_config.magic,
                 "mt5_order_id": mt5_order_id or "",
-                "mt5_message": mt5_message,
+                "mt5_message": msg_for_row,
+                "reason": why,
                 "signal_bar_time": signal_bar,
                 "entry_bar_time": entry_bar,
                 "exit_price": exit_price if exit_price is not None else "",
                 "profit": profit if profit is not None else "",
                 "close_reason": close_reason,
                 "slot": getattr(self.live_config, "slot_name", "") or "",
+                "strategy_entry": strat_entry,
+                "strategy_sl": strat_sl,
+                "strategy_tp": strat_tp,
             },
         )
-        # Per-slot Notification Manager toggle — journal still records
+        # Per-slot Notification Manager toggle — journal still records above
         if not bool(getattr(self.live_config, "notify_enabled", True)):
-            if event == "ORDER" and not dry_run:
+            if event == "ORDER" and not dry_run and sig is not None:
                 self._refresh_tracked_from_broker(sig, volume=volume)
+            return
+        if sig is None:
             return
         self._telegram.notify_order_event(
             event,
@@ -710,17 +821,17 @@ class LiveTradingEngine:
             pattern=self.pattern_label,
             direction=sig.direction.value,
             volume=volume,
-            entry_price=sig.entry_price,
-            stop_loss=sig.stop_loss,
-            target=sig.target,
+            entry_price=log_entry,
+            stop_loss=log_sl,
+            target=log_tp,
             dry_run=dry_run,
             order_mode=order_mode or self.live_config.order_mode,
             mt5_order_id=mt5_order_id,
-            mt5_message=mt5_message,
+            mt5_message=msg_for_row,
             account_id=getattr(self.live_config, "account_id", "") or "",
             account_name=getattr(self.live_config, "account_name", "") or "",
-            risk=float(getattr(sig, "risk", 0) or 0),
-            rr_multiple=float(getattr(sig, "rr_multiple", 0) or 0),
+            risk=log_risk,
+            rr_multiple=rr,
             magic=int(self.live_config.magic),
             pattern_variant=variant,
             signal_bar_time=signal_bar,
@@ -728,10 +839,28 @@ class LiveTradingEngine:
             exit_price=exit_price,
             profit=profit,
             profit_currency=profit_currency,
-            close_reason=close_reason,
+            close_reason=close_reason or why,
         )
         if event == "ORDER" and not dry_run:
             self._refresh_tracked_from_broker(sig, volume=volume)
+
+    def _record_skip(
+        self,
+        event: str,
+        reason: str,
+        sig: Optional[logic.TradeSignal] = None,
+        *,
+        volume: float = 0.0,
+    ) -> None:
+        """CSV-only audit for not-traded / error outcomes (with why)."""
+        self._record_trade_event(
+            event,
+            sig,
+            volume=volume if volume else float(getattr(self.live_config, "volume", 0) or 0),
+            dry_run=bool(getattr(self.live_config, "dry_run", False)),
+            reason=reason,
+            mt5_message=reason,
+        )
 
     def _track_open_position(
         self,
@@ -910,23 +1039,29 @@ class LiveTradingEngine:
     def _run_impl(self):
         cfg = self.live_config
         if cfg.timeframe_label not in TIMEFRAME_MT5_MAP:
-            self.log(f"[ERROR] Unknown live timeframe label: {cfg.timeframe_label}")
+            why = f"Unknown live timeframe label: {cfg.timeframe_label}"
+            self.log(f"[ERROR] {why}")
+            self._record_skip("STARTUP_FAIL", why)
             return
 
         if not self.broker.is_connected:
-            self.log("[ERROR] MT5 not connected — connect in Live panel before Start.")
+            why = "MT5 not connected — connect in Live panel before Start."
+            self.log(f"[ERROR] {why}")
+            self._record_skip("STARTUP_FAIL", why)
             return
 
         with self._broker_lock:
             ok_term, term_msg = self.broker.terminal_allows_trading()
         if not ok_term:
             self.log(f"[ERROR] {term_msg}")
+            self._record_skip("STARTUP_FAIL", term_msg)
             return
 
         with self._broker_lock:
             ok, msg, resolved = self.broker.resolve_and_ensure_symbol(cfg.symbol)
         if not ok:
             self.log(f"[ERROR] {msg}")
+            self._record_skip("STARTUP_FAIL", msg)
             return
         self._active_symbol = resolved
         if resolved != (cfg.symbol or "").strip():
@@ -937,12 +1072,15 @@ class LiveTradingEngine:
         real_money = is_demo is False
 
         if cfg.demo_accounts_only and real_money:
-            self.log("[SAFETY] Demo-only mode is on — refusing to run on a LIVE/real account.")
+            why = "Demo-only mode is on — refusing to run on a LIVE/real account."
+            self.log(f"[SAFETY] {why}")
+            self._record_skip("STARTUP_FAIL", why)
             return
 
         risk_err = validate_risk_config(cfg, real_money=real_money)
         if risk_err and not cfg.dry_run:
             self.log(f"[SAFETY] {risk_err}")
+            self._record_skip("STARTUP_FAIL", risk_err)
             return
 
         if real_money and not cfg.dry_run:
@@ -1033,9 +1171,13 @@ class LiveTradingEngine:
                 self._consecutive_errors = 0
             except Exception as e:
                 self._consecutive_errors += 1
-                self.log(f"[ERROR] Poll failed ({self._consecutive_errors}): {e}")
+                why = f"Poll failed ({self._consecutive_errors}): {e}"
+                self.log(f"[ERROR] {why}")
+                self._record_skip("ERROR", why)
                 if self._consecutive_errors >= MAX_CONSECUTIVE_POLL_ERRORS:
-                    self.log("[FATAL] Too many consecutive errors — stopping live loop to protect the app.")
+                    fatal = "Too many consecutive errors — stopping live loop to protect the app."
+                    self.log(f"[FATAL] {fatal}")
+                    self._record_skip("ERROR", fatal)
                     break
             time.sleep(max(0.5, cfg.poll_interval_sec))
 
@@ -1129,18 +1271,54 @@ class LiveTradingEngine:
         sig, _ignored = self._compute_signal_outcome(closed, forming, logic_tf)
         return sig
 
+    def _configured_entry_offset_abs(self, sig: logic.TradeSignal) -> float:
+        """Absolute $ entry_offset for this signal's side (classic vs inverted)."""
+        cfg = getattr(self, "strategy_config", None)
+        if cfg is None:
+            return 0.0
+        try:
+            if sig.direction == logic.TradeDirection.SELL:
+                raw = getattr(cfg, "inverted_entry_offset", None)
+                if raw is None:
+                    raw = getattr(cfg, "entry_offset", 0.0)
+            else:
+                raw = getattr(cfg, "entry_offset", 0.0)
+            return abs(float(raw or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _configured_sl_buffer_note(self, sig: logic.TradeSignal) -> str:
+        """Short note for logs: how SL buffer was applied (never moves entry)."""
+        cfg = getattr(self, "strategy_config", None)
+        if cfg is None:
+            return ""
+        try:
+            sell = sig.direction == logic.TradeDirection.SELL
+            mode = getattr(cfg, "inverted_buffer_mode" if sell else "buffer_mode", None)
+            mode_s = str(getattr(mode, "value", mode) or "").upper()
+            if "FLAT" in mode_s:
+                flat = getattr(cfg, "inverted_sl_buffer_flat" if sell else "sl_buffer_flat", 0.0)
+                return f"SL buffer flat ${float(flat or 0):g}"
+            if "PERCENT" in mode_s:
+                pct = getattr(cfg, "inverted_sl_buffer_pct" if sell else "sl_buffer_pct", 0.0)
+                return f"SL buffer {float(pct or 0):g}%"
+            return ""
+        except (TypeError, ValueError):
+            return ""
+
     def _resolve_live_order(
         self,
         sig: logic.TradeSignal,
         sym: str,
-    ) -> Optional[Tuple[str, Optional[float], float, float]]:
+    ) -> Optional[Tuple[str, Optional[float], float, float, float]]:
         """
-        Returns (order_mode, limit_price_or_none, sl, tp) for MT5.
+        Returns (order_mode, limit_price_or_none, sl, tp, exec_entry) for MT5.
 
-        Pullback signals (await_limit_fill): respect Live Order type —
-        market → instant ask/bid; limit_entry / limit_offset → resting limit at
-        the pullback entry (never offset-from-market, so the wait matches backtest).
-        Max-deviation never forces market on a pullback limit.
+        exec_entry is the price used for the order (market ask/bid or pending price) —
+        journal/Telegram must log this, not a mismatched strategy entry.
+
+        Pullback: Order type Market → ask/bid; Limit → pending at pullback entry.
+        Flat SL buffer only affects stop_loss in the signal — never entry.
         """
         cfg = self.live_config
         with self._broker_lock:
@@ -1156,6 +1334,9 @@ class LiveTradingEngine:
         pt = point or 0.01
         dev_pts = abs(strat_entry - market) / pt
         order_mode = (cfg.order_mode or "market").strip().lower()
+        entry_offset_abs = self._configured_entry_offset_abs(sig)
+        buf_note = self._configured_sl_buffer_note(sig)
+        offset_note = f"entry offset ${entry_offset_abs:g}" if entry_offset_abs > 1e-9 else "entry offset $0"
 
         # ---- Hammer with candle 35% (and any await_limit_fill signal) ----
         if getattr(sig, "await_limit_fill", False):
@@ -1175,23 +1356,22 @@ class LiveTradingEngine:
                     pass
 
             if order_mode == "market":
-                # Instant market at ask/bid — Order type Market wins over pullback wait.
                 sl, tp = reanchor_sl_tp_to_fill(sig, market)
                 self.log(
                     f"[LIVE] Pullback signal + Order type Market → MARKET @ {side} "
                     f"{market:.2f} (pullback level was {strat_entry:.2f}; "
-                    f"SL={sl:.2f} TP={tp:.2f} absolute)."
+                    f"SL={sl:.2f} TP={tp:.2f} absolute — candle extreme ± buffer)."
                 )
-                return "market", None, sl, tp
+                return "market", None, sl, tp, market
 
-            # Limit / limit_offset: resting limit at pullback entry (ignore offset-from-market).
             sl, tp = reanchor_sl_tp_to_fill(sig, strat_entry)
             self.log(
                 f"[LIVE] Pullback limit @ {strat_entry:.2f} "
                 f"(toward SL {float(sig.stop_loss):.2f}; TP fixed @ {tp:.2f}). "
-                f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill."
+                f"Tick {side}={market:.2f} ({dev_pts:.0f} pts away) — waiting for fill. "
+                f"SL locked (not slid with fill)."
             )
-            return "limit_entry", strat_entry, sl, tp
+            return "limit_entry", strat_entry, sl, tp, strat_entry
 
         effective_mode = order_mode
         limit_price: Optional[float] = strat_entry
@@ -1207,8 +1387,8 @@ class LiveTradingEngine:
                     f"using MARKET (max deviation {max_dev:.0f} pts)."
                 )
             effective_mode = "market"
-            fill_ref = market
-            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            exec_entry = market
+            sl, tp = reanchor_sl_tp_to_fill(sig, exec_entry)
             limit_price = None
         elif order_mode == "limit_offset":
             base = market if cfg.limit_offset_from_market else strat_entry
@@ -1220,23 +1400,45 @@ class LiveTradingEngine:
                 self.log("[ORDER] Could not compute limit price.")
                 return None
             limit_price = lp
-            fill_ref = limit_price
-            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            exec_entry = float(limit_price)
+            sl, tp = reanchor_sl_tp_to_fill(sig, exec_entry)
             effective_mode = "limit_entry"
         else:
-            fill_ref = strat_entry
-            sl, tp = reanchor_sl_tp_to_fill(sig, fill_ref)
+            exec_entry = strat_entry
+            sl, tp = reanchor_sl_tp_to_fill(sig, exec_entry)
             limit_price = strat_entry
 
         side = "ask" if is_buy else "bid"
+        hammer = getattr(sig, "hammer_candle", None)
+        if hammer is not None:
+            extreme = float(hammer.low) if is_buy else float(hammer.high)
+            extreme_name = "candle low" if is_buy else "candle high"
+        else:
+            extreme = float(sig.stop_loss)
+            extreme_name = "signal SL"
         self.log(
-            f"[LIVE] Tick bid={bid:.2f} ask={ask:.2f} | strategy entry={strat_entry:.2f} | "
-            f"exec @ {side} {market:.2f} → SL={sl:.2f} TP={tp:.2f}"
+            f"[LIVE] Strategy levels: entry={strat_entry:.2f} ({offset_note}) "
+            f"SL={float(sig.stop_loss):.2f}"
+            + (f" ({buf_note})" if buf_note else "")
+            + f" TP={float(sig.target):.2f}"
         )
-        if effective_mode != "market" and limit_price is not None:
-            self.log(f"[LIVE] Limit price {limit_price:.2f} (mode={effective_mode})")
+        self.log(
+            f"[LIVE] Order levels: entry={exec_entry:.2f} SL={sl:.2f} TP={tp:.2f} "
+            f"| tick {side}={market:.2f} mode={effective_mode}"
+        )
+        # Candle-extreme SL must stay put — never slide with fill/entry_offset gap.
+        if abs(sl - float(sig.stop_loss)) > 1e-9:
+            self.log(
+                f"[LIVE][BUG] SL moved off signal ({float(sig.stop_loss):.2f} → {sl:.2f}); "
+                f"expected locked at {extreme_name} {extreme:.2f} ± buffer."
+            )
+        else:
+            self.log(
+                f"[LIVE] SL locked at {sl:.2f} ({extreme_name} {extreme:.2f} ± buffer) "
+                f"— not slid with fill (entry Δ={exec_entry - strat_entry:+.2f})."
+            )
 
-        return effective_mode, limit_price, sl, tp
+        return effective_mode, limit_price, sl, tp, exec_entry
 
     def _fetch_rates_for_live(
         self,
@@ -1368,10 +1570,12 @@ class LiveTradingEngine:
         if sig is None:
             if ignored is not None and ignored.ignore_reason:
                 variant = getattr(ignored, "pattern_variant", None) or "—"
+                why = str(ignored.ignore_reason)
                 self.log(
-                    f"[LIVE] Pattern on signal bar but not traded ({variant}): {ignored.ignore_reason}"
+                    f"[LIVE] Pattern on signal bar but not traded ({variant}): {why}"
                 )
-                reason_l = (ignored.ignore_reason or "").lower()
+                self._record_skip("IGNORED", why, ignored)
+                reason_l = why.lower()
                 if "exceeds max" in reason_l and "sl" in reason_l:
                     tip_key = "_max_sl_tip_logged"
                     if not getattr(self, tip_key, False):
@@ -1439,13 +1643,17 @@ class LiveTradingEngine:
 
         key = _signal_key(sig)
         if key in self._traded_keys:
-            self.log("[LIVE] Signal already acted on — skip.")
+            why = "Signal already acted on — skip."
+            self.log(f"[LIVE] {why}")
+            self._record_skip("SKIP_DUP", why, sig)
             return
 
         with self._broker_lock:
             open_count = self.broker.count_open_positions(sym, cfg.magic)
         if open_count >= cfg.max_open_positions:
-            self.log(f"[LIVE] Max open positions ({cfg.max_open_positions}) — skip.")
+            why = f"Max open positions ({cfg.max_open_positions}) — skip."
+            self.log(f"[LIVE] {why}")
+            self._record_skip("SKIP_MAX_POS", why, sig)
             return
 
         # Hard gate (fail-closed): never send an order if indicators reject this bar.
@@ -1458,12 +1666,12 @@ class LiveTradingEngine:
             self.indicator_stack,
         )
         if not ind_ok:
-            self.log(
-                f"[LIVE] Order blocked on {cfg.timeframe_label} — {ind_reason}"
-            )
+            why = f"Order blocked on {cfg.timeframe_label} — {ind_reason}"
+            self.log(f"[LIVE] {why}")
             allow_snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
             if allow_snapshot:
                 self.log(f"[LIVE] Indicators at signal bar: {allow_snapshot}")
+            self._record_skip("INDICATOR_BLOCK", why, sig)
             return
 
         variant = getattr(sig, "pattern_variant", None) or "—"
@@ -1521,9 +1729,18 @@ class LiveTradingEngine:
                 f"[SIGNAL] Entry/SL row: "
                 f"{logic.entry_rule_label_for_variant(trade_cfg, sl_variant)}"
             )
+        off = self._configured_entry_offset_abs(sig)
+        buf = self._configured_sl_buffer_note(sig)
+        level_bits = [f"entry={sig.entry_price:.2f}"]
+        if off > 1e-9:
+            level_bits.append(f"offset ${off:g}")
+        level_bits.append(f"SL={sig.stop_loss:.2f}")
+        if buf:
+            level_bits.append(f"({buf})")
+        level_bits.append(f"TP={sig.target:.2f}")
         self.log(
             f"[SIGNAL] Entry bar (next candle): {describe_candle(sig.entry_candle)} | "
-            f"entry≈{sig.entry_price:.2f} SL={sig.stop_loss:.2f} TP={sig.target:.2f} TF={sig.timeframe}"
+            f"{' '.join(level_bits)} TF={sig.timeframe}"
         )
         # Record WHY this trade was allowed: indicator values at decision time.
         allow_snapshot = indicator_snapshot_text(closed, forming, self.indicator_stack)
@@ -1533,7 +1750,10 @@ class LiveTradingEngine:
 
         if cfg.dry_run:
             self.log("[DRY RUN] Order not sent (uncheck Dry run on Live panel to place orders).")
-            self._record_trade_event("DRY_RUN", sig, volume=cfg.volume, dry_run=True, mt5_message="dry_run")
+            self._record_trade_event(
+                "DRY_RUN", sig, volume=cfg.volume, dry_run=True,
+                mt5_message="dry_run", reason="Dry run — order not sent",
+            )
             self._traded_keys.add(key)
             return
 
@@ -1541,7 +1761,8 @@ class LiveTradingEngine:
         if block:
             self.log(f"[SAFETY] Order blocked: {block}")
             self._record_trade_event(
-                "SAFETY_BLOCK", sig, volume=cfg.volume, dry_run=False, mt5_message=block,
+                "SAFETY_BLOCK", sig, volume=cfg.volume, dry_run=False,
+                mt5_message=block, reason=block,
             )
             return
 
@@ -1551,10 +1772,19 @@ class LiveTradingEngine:
 
         resolved = self._resolve_live_order(sig, sym)
         if resolved is None:
+            why = "Could not resolve live order (no tick / limit price)."
+            self.log(f"[ORDER FAIL] {why}")
+            self._record_trade_event(
+                "ORDER_FAIL", sig, volume=volume, dry_run=False,
+                mt5_message=why, reason=why,
+            )
             return
-        order_mode, limit_price, sl, tp = resolved
+        order_mode, limit_price, sl, tp, exec_entry = resolved
 
-        self.log(f"[ORDER] Sending {sig.direction.value} {volume} lot(s) via {order_mode} on {sym}…")
+        self.log(
+            f"[ORDER] Sending {sig.direction.value} {volume} lot(s) via {order_mode} on {sym} "
+            f"@ {exec_entry:.2f} SL={sl:.2f} TP={tp:.2f}"
+        )
         with self._broker_lock:
             ok, msg, order_id = self.broker.send_trade_order(
                 sym,
@@ -1564,7 +1794,7 @@ class LiveTradingEngine:
                 tp,
                 cfg.magic,
                 order_mode=order_mode,
-                limit_price=limit_price if limit_price is not None else sig.entry_price,
+                limit_price=limit_price if limit_price is not None else exec_entry,
                 limit_offset_points=cfg.limit_offset_points,
                 comment=cfg.order_comment,
                 deviation=cfg.price_deviation_points,
@@ -1574,6 +1804,8 @@ class LiveTradingEngine:
             self._record_trade_event(
                 "ORDER", sig, volume=volume, dry_run=False,
                 mt5_order_id=order_id, mt5_message=msg, order_mode=order_mode,
+                entry_price=exec_entry, stop_loss=sl, target=tp,
+                reason="Order accepted by broker",
             )
             self._traded_keys.add(key)
             self._trades_today += 1
@@ -1589,7 +1821,8 @@ class LiveTradingEngine:
                 ticks = self.broker.get_tick_prices(sym)
             if not ticks:
                 self._record_trade_event(
-                    "ORDER_FAIL", sig, volume=volume, dry_run=False, mt5_message=msg,
+                    "ORDER_FAIL", sig, volume=volume, dry_run=False,
+                    mt5_message=msg, reason=f"Limit failed and no tick for market fallback: {msg}",
                 )
                 return
             bid, ask = ticks
@@ -1613,6 +1846,9 @@ class LiveTradingEngine:
                 self._record_trade_event(
                     "ORDER", sig, volume=volume, dry_run=False,
                     mt5_order_id=order_id, mt5_message=f"fallback market: {msg}",
+                    order_mode="market",
+                    entry_price=mkt, stop_loss=sl_m, target=tp_m,
+                    reason="Limit failed — market fallback accepted",
                 )
                 self._traded_keys.add(key)
                 self._trades_today += 1
@@ -1620,10 +1856,12 @@ class LiveTradingEngine:
             else:
                 self.log(f"[ORDER FAIL] Market fallback: {msg}")
                 self._record_trade_event(
-                    "ORDER_FAIL", sig, volume=volume, dry_run=False, mt5_message=msg,
+                    "ORDER_FAIL", sig, volume=volume, dry_run=False,
+                    mt5_message=msg, reason=f"Limit and market fallback failed: {msg}",
                 )
         else:
             self.log(f"[ORDER FAIL] {msg}")
             self._record_trade_event(
-                "ORDER_FAIL", sig, volume=volume, dry_run=False, mt5_message=msg,
+                "ORDER_FAIL", sig, volume=volume, dry_run=False,
+                mt5_message=msg, reason=msg,
             )

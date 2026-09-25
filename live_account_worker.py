@@ -42,6 +42,8 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
     broker = MT5Broker()
     slots: Dict[str, Dict[str, Any]] = {}
     stop_all = False
+    fetch_stop = threading.Event()
+    fetch_thread: Optional[threading.Thread] = None
 
     def _account_info() -> Dict[str, Any]:
         try:
@@ -121,15 +123,23 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
             pattern_label=pattern_label,
             strategy_config=strategy_config,
             indicator_stack=indicator_stack,
-            log=log,
+            log=lambda msg, _sid=slot_id: emit("log", message=str(msg), slot_id=_sid),
         )
 
         def _run():
             try:
                 engine.run()
             except Exception as exc:
-                log(f"[CRASH] Slot {slot_id}: {exc}\n{traceback.format_exc()}")
+                emit(
+                    "log",
+                    message=f"[CRASH] Slot {slot_id}: {exc}\n{traceback.format_exc()}",
+                    slot_id=slot_id,
+                )
                 emit("slot_crashed", slot_id=slot_id, message=str(exc))
+                try:
+                    engine._record_skip("ERROR", f"Slot crash: {exc}")
+                except Exception:
+                    pass
             finally:
                 slots.pop(slot_id, None)
                 emit("slot_stopped", slot_id=slot_id)
@@ -143,6 +153,80 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
         th.start()
         emit("slot_started", slot_id=slot_id)
         log(f"Slot {slot_id} started on '{account_name}'.")
+
+    def _on_fetch_job(msg: Dict[str, Any]) -> None:
+        nonlocal fetch_thread
+        if fetch_thread is not None and fetch_thread.is_alive():
+            emit("fetch_failed", message="Fetch already running on this account.")
+            return
+        if not broker.is_connected or broker.raw_mt5 is None:
+            emit(
+                "fetch_failed",
+                message="Not connected — Connect MT5 on this Live account first.",
+            )
+            return
+        # Never open a second MT5 session — reuse Live's connection + lock.
+        job = {
+            "output_root": str(msg.get("output_root") or ""),
+            "symbols": list(msg.get("symbols") or ["XAUUSD"]),
+            "timeframes": list(msg.get("timeframes") or ["1min"]),
+            "update_existing": bool(msg.get("update_existing", True)),
+            "start_date": msg.get("start_date"),
+            "use_mock": False,
+            "market_type": msg.get("market_type"),
+            "auto_detect_market": bool(msg.get("auto_detect_market", True)),
+            "flat_under_root": bool(msg.get("flat_under_root", False)),
+        }
+        if not job["output_root"]:
+            emit("fetch_failed", message="fetch_job missing output_root")
+            return
+
+        fetch_stop.clear()
+
+        def _run_fetch() -> None:
+            try:
+                import fetch as data_fetcher
+
+                result = data_fetcher.run_fetch_job(
+                    output_root=job["output_root"],
+                    symbols=job["symbols"],
+                    timeframes=job["timeframes"],
+                    update_existing=job["update_existing"],
+                    start_date=job.get("start_date"),
+                    use_mock=False,
+                    market_type=job.get("market_type"),
+                    auto_detect_market=job["auto_detect_market"],
+                    flat_under_root=job["flat_under_root"],
+                    mt5_module=broker.raw_mt5,
+                    own_connection=False,
+                    api_lock=getattr(broker, "api_lock", None),
+                    log=lambda m: emit("fetch_log", message=str(m)),
+                    should_stop=lambda: fetch_stop.is_set() or stop_all,
+                )
+                emit("fetch_done", result=result if isinstance(result, dict) else {})
+            except Exception as exc:
+                emit(
+                    "fetch_failed",
+                    message=f"{exc}\n{traceback.format_exc()}",
+                )
+
+        fetch_thread = threading.Thread(
+            target=_run_fetch,
+            name=f"fetch-{account_id}",
+            daemon=True,
+        )
+        fetch_thread.start()
+        emit(
+            "fetch_log",
+            message=(
+                f"[INFO] Fetch via Live worker for '{account_name}' "
+                "(shared MT5 — Live keeps running)."
+            ),
+        )
+
+    def _on_fetch_stop() -> None:
+        fetch_stop.set()
+        emit("fetch_log", message="[STOP] Stop requested — finishing current chunk…")
 
     def _on_emergency(msg: Dict[str, Any]) -> None:
         magics = [int(m) for m in (msg.get("magics") or [])]
@@ -245,10 +329,48 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
                     except Exception as exc:
                         log(f"[STRATEGY] update failed: {exc}\n{traceback.format_exc()}")
                         emit("error", message=f"update_strategy failed: {exc}")
+            elif cmd == "update_safety":
+                sid = str(msg.get("slot_id") or "")
+                targets = []
+                if sid:
+                    entry = slots.get(sid)
+                    if entry:
+                        targets = [entry]
+                else:
+                    targets = list(slots.values())
+                for entry in targets:
+                    eng = entry.get("engine") if entry else None
+                    if eng is None or not hasattr(eng, "update_runtime_safety"):
+                        continue
+                    try:
+                        kwargs = {}
+                        if "max_spread_points" in msg:
+                            kwargs["max_spread_points"] = float(msg["max_spread_points"])
+                        if "min_minutes_between_trades" in msg:
+                            kwargs["min_minutes_between_trades"] = float(
+                                msg["min_minutes_between_trades"]
+                            )
+                        if "max_daily_trades" in msg:
+                            kwargs["max_daily_trades"] = int(msg["max_daily_trades"])
+                        if "max_daily_loss_usd" in msg:
+                            kwargs["max_daily_loss_usd"] = float(msg["max_daily_loss_usd"])
+                        if "max_lot_size" in msg:
+                            kwargs["max_lot_size"] = float(msg["max_lot_size"])
+                        if "demo_accounts_only" in msg:
+                            kwargs["demo_accounts_only"] = bool(msg["demo_accounts_only"])
+                        if kwargs:
+                            eng.update_runtime_safety(**kwargs)
+                    except Exception as exc:
+                        log(f"[SAFETY] update failed: {exc}")
+            elif cmd == "fetch_job":
+                _on_fetch_job(msg)
+            elif cmd == "fetch_stop":
+                _on_fetch_stop()
             elif cmd == "ping":
                 emit("pong")
             elif cmd == "shutdown":
                 stop_all = True
+                fetch_stop.set()
             else:
                 emit("error", message=f"Unknown cmd: {cmd}")
         except Exception as exc:

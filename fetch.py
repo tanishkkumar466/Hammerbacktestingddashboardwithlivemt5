@@ -186,14 +186,28 @@ def resolve_write_root(
     market_type: Optional[str],
     *,
     prefer_legacy_spot: bool = True,
+    flat_under_root: bool = False,
 ) -> str:
     """
     Folder that should contain <symbol>/<timeframe>/ for this fetch.
+
+    flat_under_root=True (per Live account): write directly under output_root
+        data/<account_slug>/<symbol>/…
+    without nesting spot/futures.
 
     Spot + prefer_legacy_spot: if legacy data/<symbol> exists and
     data/spot/<symbol> does not, keep writing into the legacy folder so
     existing client data updates in place. New installs use data/spot/.
     """
+    if flat_under_root:
+        root = os.path.normpath(_root(output_root))
+        # Peel accidental …/spot or …/futures so account roots stay flat
+        base = os.path.basename(root).lower()
+        if base in MARKET_TYPES:
+            root = os.path.dirname(root) or root
+        ensure_dir(root)
+        return root
+
     mt = normalize_market_type(market_type)
     preferred = market_data_root(output_root, mt)
     preferred_sym = os.path.join(preferred, symbol)
@@ -1114,6 +1128,7 @@ def run_fetch_job(
     server: str = "",
     market_type: Optional[str] = None,
     auto_detect_market: bool = True,
+    flat_under_root: bool = False,
     mt5_module=None,
     own_connection: Optional[bool] = None,
     api_lock=None,
@@ -1128,16 +1143,18 @@ def run_fetch_job(
         <output_root>/futures/<symbol>/…
     Legacy <output_root>/<symbol>/… is treated as spot for updates.
 
+    flat_under_root=True (per Live account history):
+        <output_root>/<symbol>/<timeframe>/…  e.g. data/ic_markets/XAUUSD/1hour
+
     market_type: "spot" | "futures" | None (auto from MT5 / name).
 
     Connection safety (critical):
-      - Pass mt5_module= from an already-connected Live MT5Broker and set
-        own_connection=False so Fetch never initialize()/shutdown() a second
-        terminal and never kills Live. Pass api_lock=broker.api_lock so Live
-        and Fetch serialize MT5 calls and can run at the same time.
-      - Otherwise Fetch opens ONE connection with the same path/login/server
-        as Live Settings and shuts it down when done (safe alongside remote
-        Live workers in other processes).
+      - Prefer mt5_module= from Live (own_connection=False + api_lock) so Fetch
+        never initialize()/shutdown() a second terminal and never kills Live.
+      - When Live runs in an account worker process, the dashboard routes Fetch
+        into that worker (same shared MT5) — Live keeps polling while history downloads.
+      - Otherwise Fetch opens ONE connection and shuts it down when done (only when
+        Live is not using that account).
     """
     _log = log or (lambda msg: print(msg))
     stop = should_stop or (lambda: False)
@@ -1237,9 +1254,14 @@ def run_fetch_job(
                     if mt5 else classify_market_type(symbol)
                 )
 
-            write_root = resolve_write_root(root, symbol, sym_market)
+            write_root = resolve_write_root(
+                root, symbol, sym_market, flat_under_root=flat_under_root,
+            )
             write_roots_used.add(write_root)
-            _log(f"\n=== {symbol} → {sym_market.upper()} @ {write_root} ===")
+            if flat_under_root:
+                _log(f"\n=== {symbol} → account folder @ {write_root} ===")
+            else:
+                _log(f"\n=== {symbol} → {sym_market.upper()} @ {write_root} ===")
             if mt5_symbol != symbol:
                 _log(f"MT5 symbol: {mt5_symbol}")
 

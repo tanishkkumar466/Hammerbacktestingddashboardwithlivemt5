@@ -292,6 +292,35 @@ def test_lookback_ignores_bars_beyond_n():
     assert "below hammer low" in fail
 
 
+def test_lookback_one_vs_two_changes_trades():
+    """
+    Client concern: lookback 1 and 2 must not be identical when the older prior
+    violates close-vs-hammer-low. (Deep-wick hammers often still look the same
+    on real data — that is geometry, not a wiring bug.)
+    """
+    from strategy import hammer_with_candles_logic as hwc
+
+    signal = _classic_green("s")  # low = 90
+    candles = [
+        _pad("older", 89.0),   # below hammer low — fails lookback=2 only
+        _pad("near", 95.0),    # ok for lookback=1
+        signal,
+        Candle("n", 102.0, 103.0, 101.0, 102.5),
+    ]
+    cfg1 = hwc.HammerContextConfig(
+        lookback_candles=1, enable_sell=False, enable_risk_limit=False,
+    )
+    cfg2 = hwc.HammerContextConfig(
+        lookback_candles=2, enable_sell=False, enable_risk_limit=False,
+    )
+    s1 = [s for s in hwc.run_strategy(candles, "3m", cfg1) if not s.ignored]
+    s2 = [s for s in hwc.run_strategy(candles, "3m", cfg2) if not s.ignored]
+    assert len(s1) == 1
+    assert len(s2) == 0
+    # prepare_config must not wipe lookback
+    assert hwc.prepare_config(cfg2).lookback_candles == 2
+
+
 def test_body_only_rejects_doji_prev_and_wrong_prev_color():
     ratios = HammerRatioConfig(body_pct=10.0, body_tol=25.0)
     buy_cfg = hc.HammerContextConfig(
@@ -414,20 +443,21 @@ def test_pullback_keeps_signal_rr_target():
     assert abs(sig.target - 4030.0) < 1e-9
 
 
-def test_resolve_pullback_pct_for_35_never_stays_zero():
-    assert hc.resolve_entry_pullback_pct(0, for_35_pattern=True) == 35.0
+def test_resolve_pullback_pct_for_35_blank_defaults_explicit_zero_honored():
+    assert hc.resolve_entry_pullback_pct(0, for_35_pattern=True) == 0.0
+    assert hc.resolve_entry_pullback_pct("0", for_35_pattern=True) == 0.0
     assert hc.resolve_entry_pullback_pct(None, for_35_pattern=True) == 35.0
     assert hc.resolve_entry_pullback_pct("", for_35_pattern=True) == 35.0
+    assert hc.resolve_entry_pullback_pct("abc", for_35_pattern=True) == 35.0
     assert hc.resolve_entry_pullback_pct(20, for_35_pattern=True) == 20.0
     assert hc.resolve_entry_pullback_pct(50, for_35_pattern=False) == 0.0
     assert hc.resolve_entry_pullback_pct(35, for_35_pattern=False) == 0.0
 
 
-def test_apply_pullback_for_35_pattern_type_mutates_zero():
+def test_apply_pullback_for_35_pattern_type_keeps_zero_and_copies():
     cfg = hc.HammerContextConfig(entry_pullback_pct=0.0)
     out = hc.apply_pullback_for_pattern_type(cfg, hc.PATTERN_TYPE_35)
-    assert out.entry_pullback_pct == 35.0
-    # Original must stay 0 — multi-config runs share strategy objects
+    assert out.entry_pullback_pct == 0.0
     assert cfg.entry_pullback_pct == 0.0
     plain = hc.HammerContextConfig(entry_pullback_pct=35.0)
     out2 = hc.apply_pullback_for_pattern_type(plain, hc.PATTERN_TYPE)
@@ -459,43 +489,48 @@ def test_variable_pullback_pct_changes_limit_price():
     assert abs(entries[35.0] - 4006.5) < 1e-9
 
 
-def test_backtest_35_pattern_coerces_zero_pullback():
-    """pattern_type hammer_with_candles_35 with pct=0 must still await a 35% limit."""
-    from datetime import datetime
-    from backtest import BacktestConfig, simulate_timeframe_outcomes, PositionSizingMode
+def test_35_pattern_zero_pullback_matches_plain_hwc_signals():
+    """Client: HWC 35% with pullback 0 must equal Hammer with candles exactly."""
+    import logic
+    from strategy import hammer_with_candles_35_logic as hwc35
+    from strategy import hammer_with_candles_logic as hwc
 
-    cfg0 = hc.HammerContextConfig(
+    candles = [
+        _pad("p0", 95.0), _pad("p1", 94.0),
+        _classic_green("s1"),
+        Candle("n1", 102.0, 103.0, 101.0, 102.5),
+        _pad_red("p2", 101.0),
+        _inverted_red("s2"),
+        Candle("n2", 100.0, 100.5, 98.0, 98.5),
+        Candle("n3", 98.5, 99.0, 97.0, 97.5),
+    ]
+    cfg = hc.HammerContextConfig(
+        lookback_candles=1,
         entry_pullback_pct=0.0,
-        timeframe_settings={"1h": TimeframeSetting(2.0, 50.0)},
-        enable_risk_limit=True,
-        lookback_candles=5,
-        buffer_mode=__import__("logic").BufferMode.NONE,
-        sl_buffer_pct=0.0,
-        inverted_buffer_mode=__import__("logic").BufferMode.NONE,
-        inverted_sl_buffer_pct=0.0,
+        entry_offset=0.30,
+        buffer_mode=logic.BufferMode.FLAT_AMOUNT,
+        sl_buffer_flat=0.50,
+        inverted_buffer_mode=logic.BufferMode.FLAT_AMOUNT,
+        inverted_sl_buffer_flat=0.50,
+        enable_risk_limit=False,
+        timeframe_settings={"3m": TimeframeSetting(2.0, 500.0)},
     )
-    bt = BacktestConfig(
-        strategy_config=cfg0,
-        pattern_type=hc.PATTERN_TYPE_35,
-        symbol="XAUUSD",
-        data_root="data",
-        start_date=datetime(2025, 1, 1),
-        end_date=datetime(2025, 2, 1),
-        timeframes_to_test=["1hour"],
-        max_forward_candles=100,
-        position_sizing_mode=PositionSizingMode.FIXED_RISK_USD,
-        fixed_risk_usd=100.0,
-        starting_capital=10000.0,
-        allow_overlapping_trades=True,
-        sessions_enabled={"Asian": True, "London": True, "US": True},
+    a = hwc.run_strategy(candles, "3m", cfg)
+    b = hwc35.run_strategy(candles, "3m", cfg)
+    assert a, "fixture should produce at least one signal"
+    key = lambda s: (
+        s.hammer_candle.timestamp, s.direction, s.ignored,
+        round(s.entry_price, 9), round(s.stop_loss, 9), round(s.target, 9),
+        bool(s.await_limit_fill),
     )
-    outcomes, ignored = simulate_timeframe_outcomes("1hour", bt)
-    assert bt.strategy_config.entry_pullback_pct == 35.0
-    em = list(outcomes.keys())[0]
-    rows = outcomes[em]
-    assert any(getattr(item[0], "await_limit_fill", False) for item in rows) or any(
-        "Limit not filled" in (s.ignore_reason or "") for s in ignored
-    )
+    assert [key(s) for s in a] == [key(s) for s in b]
+    assert not any(s.await_limit_fill for s in b)
+
+
+def test_35_pattern_blank_pullback_defaults_to_35():
+    from strategy import hammer_with_candles_35_logic as hwc35
+
+    assert hwc35.prepare_config(None).entry_pullback_pct == 35.0
 
 
 def test_find_limit_fill_index_buy():
@@ -553,12 +588,13 @@ if __name__ == "__main__":
     test_sell_requires_prior_closes_not_above_hammer_high()
     test_lookback_count_configurable()
     test_lookback_zero_skips_prior_close_check()
+    test_lookback_ignores_bars_beyond_n()
+    test_lookback_one_vs_two_changes_trades()
     test_separate_entry_rules()
     test_asymmetric_buy_body_bounds()
     test_body_only_ignores_wick_shape()
     test_body_only_sell_red_ignores_lower_wick()
     test_body_only_live_pipeline_matches_backtest()
-    test_lookback_ignores_bars_beyond_n()
     test_body_only_rejects_doji_prev_and_wrong_prev_color()
     test_extreme_lower_wick_fails_hammer_but_passes_body_only()
     test_body_only_zero_pct_cap_is_not_replaced_with_ten()
@@ -566,8 +602,10 @@ if __name__ == "__main__":
     test_pullback_entry_buy_and_sell()
     test_signal_applies_pullback_and_awaits_limit()
     test_pullback_keeps_signal_rr_target()
-    test_resolve_pullback_pct_for_35_never_stays_zero()
-    test_apply_pullback_for_35_pattern_type_mutates_zero()
+    test_resolve_pullback_pct_for_35_blank_defaults_explicit_zero_honored()
+    test_apply_pullback_for_35_pattern_type_keeps_zero_and_copies()
+    test_35_pattern_zero_pullback_matches_plain_hwc_signals()
+    test_35_pattern_blank_pullback_defaults_to_35()
     test_variable_pullback_pct_changes_limit_price()
     test_find_limit_fill_index_buy()
     test_pullback_same_bar_sl_counted_as_loss()

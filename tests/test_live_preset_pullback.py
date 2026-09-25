@@ -74,9 +74,22 @@ def test_preset_builds_await_limit_signal_for_live():
     assert sl == 4000.0 and tp == 4030.0
 
 
-def test_live_apply_pullback_forces_35_when_preset_missing_pct():
-    cfg = hc.HammerContextConfig(entry_pullback_pct=0.0)
-    out = hc.apply_pullback_for_pattern_type(cfg, hc.PATTERN_TYPE_35)
-    assert out.entry_pullback_pct == 35.0
-    buy_e, _ = pullback_entry_price(TradeDirection.BUY, 4010.0, 4000.0, out.entry_pullback_pct)
+def test_live_preset_missing_pct_defaults_to_35():
+    data = dict(_load_preset())
+    fields = dict(data.get("fields") or {})
+    fields.pop("entry_pullback_pct", None)
+    data["fields"] = fields
+    cfg = _cfg_from_preset_fields(data)
+    assert cfg.entry_pullback_pct == 35.0
+    buy_e, _ = pullback_entry_price(TradeDirection.BUY, 4010.0, 4000.0, cfg.entry_pullback_pct)
     assert abs(buy_e - 4006.5) < 1e-9
+
+
+def test_live_preset_explicit_zero_pct_is_market_entry():
+    data = dict(_load_preset())
+    fields = dict(data.get("fields") or {})
+    fields["entry_pullback_pct"] = "0"
+    data["fields"] = fields
+    cfg = _cfg_from_preset_fields(data)
+    cfg = hc.apply_pullback_for_pattern_type(cfg, hc.PATTERN_TYPE_35)
+    assert cfg.entry_pullback_pct == 0.0

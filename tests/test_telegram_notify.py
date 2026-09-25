@@ -3,7 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
-import telegram_notify as tg
+from notification import telegram as tg
 
 
 def test_format_order_alert_order():

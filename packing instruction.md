@@ -1,5 +1,27 @@
 # Packaging HammerCandleBacktestDashboard as a Windows .exe
 
+## Current release: v1.0.34
+
+Bump `version.py` → commit → tag `v1.0.34` → push tag. GitHub Actions
+(`release-windows-exe.yml`) builds the Windows package on that tag.
+
+### v1.0.34 — what changed (client QA)
+
+**Must verify on Live (all patterns: Hammer, Doji, HWC, HWC 35%):**
+- SL stays on candle **low** (BUY) / **high** (SELL) ± buffer
+- Buffer **widens** the stop (BUY: low − flat; SELL: high + flat)
+- Entry offset may move entry; it must **not** slide/shrink SL on fill
+- Live log: `SL locked at … (candle low/high ± buffer) — not slid with fill`
+
+Also good to smoke:
+- Fetch while Live is running (must not kill Live)
+- HWC vs HWC 35% are separate (pullback only on 35%)
+- Live audit CSV (executed / skipped / errors + reason)
+
+**Do not QA SL on old 1.0.33 builds** — that release still slid SL with fill.
+
+---
+
 ## The one thing that matters most
 PyInstaller does **not** cross-compile. Building on macOS produces a Mac
 app; building on Windows produces a `.exe`. Since your client needs
@@ -18,15 +40,22 @@ for you to set up.
 
 ## Option A: GitHub Actions (no Windows machine needed)
 
-1. Put `dashboard.py` (Qt UI entry point), `logic.py`, `doji_logic.py`,
-   `hammer_context_logic.py`, `backtest.py`, `plotting.py`, `live.py`,
-   `broker.py`, `live_journal.py`, `indicators/`, and `main.py` in a folder
-   together (leave `fetch.py` out if you want — live uses `broker.py`).
+1. Keep the app sources in the repo. Pattern engines live under
+   `strategy/` (`logic.py`, `doji_logic.py`, `hammer_context_core.py`,
+   `hammer_with_candles_logic.py`, `hammer_with_candles_35_logic.py`).
+   Root-level `logic.py` / `doji_logic.py` / `hammer_context_logic.py`
+   (and HWC shims) are thin import compatibility shims — still required
+   for the frozen exe. Also include `dashboard.py`, `backtest.py`,
+   `plotting.py`, `live.py`, `broker.py`, `live_journal.py`,
+   `indicators/`, `notification/`, `update/`, and `main.py`.
 2. Copy the `.github/workflows/build-windows-exe.yml` file and
    `HammerCandleBacktestDashboard.spec` (included alongside this guide)
    into that same folder, keeping the `.github/workflows/` path structure.
    Put your Windows icon at **`logo.ico`** in the repo root (or keep
    `app_icon.ico` as fallback). Both are bundled into the exe.
+   For client releases, prefer tagging `v*` so
+   `.github/workflows/release-windows-exe.yml` attaches the artifact to
+   the GitHub Release (updater picks that up).
 3. Create a new GitHub repository (private is fine -- Actions works
    the same either way) and push this folder to it:
    ```
@@ -38,9 +67,12 @@ for you to set up.
    ```
 4. On GitHub, open the repo -> **Actions** tab -> **Build Windows EXE**
    -> **Run workflow**.
+   Or for a release: push tag `v1.0.34` (must match `version.py`) and wait
+   for **Release Windows EXE**.
 5. Wait a few minutes. Open the finished run, scroll down to
    **Artifacts**, download **HammerCandleBacktestDashboard-windows**.
-   Unzip it -- that's your `.exe`.
+   Unzip it -- that's your `.exe`. For tagged releases, also check the
+   GitHub **Releases** page for the stub package zip.
 
 From then on, every time you push a change, a fresh `.exe` builds
 automatically -- you don't have to repeat these steps.
@@ -52,41 +84,22 @@ automatically -- you don't have to repeat these steps.
 On the Windows machine, with Python 3.11+ installed:
 
 ```
-pip install PySide6 matplotlib polars numpy pillow openpyxl pyinstaller
+pip install -r requirements-build.txt
 
-pyinstaller --onefile --windowed ^
-  --name "HammerCandleBacktestDashboard" ^
-  --collect-all PySide6 ^
-  --collect-data matplotlib ^
-  --hidden-import openpyxl ^
-  --hidden-import openpyxl.styles ^
-  dashboard.py
+pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 ```
 
-(That `^` is a line-continuation for Windows `cmd`. In PowerShell use
-a backtick `` ` `` instead, or just put it all on one line.)
+Prefer the `.spec` (bundles `strategy/`, Ray, MT5, stub migration). Ad-hoc
+one-liners can miss hidden imports.
 
-The finished `.exe` will be in `dist\HammerCandleBacktestDashboard.exe`.
-
-### What each flag does
-- `--onefile` -- bundles everything into a single `.exe`.
-- `--windowed` -- hides the console/terminal window, so it looks like a
-  normal desktop app instead of a script.
-- `--collect-all PySide6` -- makes sure Qt's platform plugins are
-  included. Without this, the built exe can fail to open at all with
-  an error like *"could not find or load the Qt platform plugin
-  windows"*.
-- `--collect-data matplotlib` -- bundles matplotlib's font/data files,
-  needed for the chart images to render correctly once frozen.
-- `--hidden-import openpyxl` / `openpyxl.styles` -- the Excel export
-  feature does `import openpyxl` inside a function rather than at the
-  top of the file. PyInstaller's scanner usually catches this on its
-  own, but this makes sure it isn't missed.
+The finished runtime will be under `dist\` (see the release workflow for
+the stub + `app/HammerRuntime.exe` layout handed to clients).
 
 ### Optional: a custom icon
 Add `--icon=your_icon.ico` to the command (needs to be a `.ico` file,
 not `.png` -- there are free online PNG-to-ICO converters if you only
-have a logo image).
+have a logo image). The release `.spec` already picks `logo.ico` /
+`app_icon.ico` when present.
 
 ---
 
@@ -98,6 +111,9 @@ HammerCandleBacktestDashboard/
     HammerCandleBacktestDashboard.exe
     data/              <- their price CSVs go here
 ```
+Prefer the release artifact layout (stub + `app/HammerRuntime.exe`) when
+shipping updates via the in-app updater.
+
 `output/` and `plots/` folders get created automatically next to the
 exe the first time it runs -- no need to include them.
 
@@ -111,6 +127,9 @@ nothing is secretly depending on your dev machine's Python. Check that:
 - A run saves to the History tab, and running the same config twice
   correctly skips as a duplicate
 - Export to Excel produces a working `.xlsx`
+- **Live:** one paper/tiny-lot trade per pattern; confirm SL = candle
+  extreme ± buffer and does not shrink when entry offset / market fill
+  differ from strategy entry
 
 ## One thing to warn the client about in advance
 Since this `.exe` isn't code-signed, Windows will very likely show a

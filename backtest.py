@@ -85,6 +85,8 @@ import polars as pl
 import logic  # hammer pattern rules
 import doji_logic
 import hammer_context_logic
+from strategy import hammer_with_candles_35_logic as hwc35_logic
+from strategy import hammer_with_candles_logic as hwc_logic
 import sessions
 from indicators.config import IndicatorStackConfig
 from indicators.filter import apply_indicator_filters
@@ -200,6 +202,12 @@ class BacktestConfig:
 
     # ---- overlap handling ----
     allow_overlapping_trades: bool = False
+
+    # ---- exit scan ----
+    # False (correct): SL/TP are checked from the first bar the position is live
+    # (entry bar for open/signal-candle entries, next bar for NEXT_CANDLE_CLOSE).
+    # True restores the pre-1.0.34 scan start that ignored the entry bar for market entries.
+    legacy_skip_entry_candle: bool = False
 
     # ---- session / time-of-day filter ----
     # Subset of sessions.SESSION_ORDER; default all three = no session filter.
@@ -674,11 +682,19 @@ def resolve_all_exit_models_for_trade(
     future_close: np.ndarray,
     future_timestamps: List[datetime],
     max_scan: int,
+    prefill_first_bar: bool = False,
 ) -> Dict[ExitModel, Tuple[TradeOutcome, Optional[float], Optional[datetime], Optional[int]]]:
     """
     Computes the outcome under ALL THREE exit models for one trade in a
     single vectorized pass (the cummin/cummax/argmax work is shared;
     only the final ambiguous-candle tiebreak differs per model).
+
+    Bar 0 must be the first bar on which the position is live.
+    - A bar that OPENS beyond SL (or target) exits at that open — the level
+      itself never traded, so it cannot be the fill price.
+    - prefill_first_bar: bar 0 is a limit fill that happened mid-bar (open was
+      on the far side of the limit). Its open and any target touch may predate
+      the fill, so only the SL (which lies beyond the limit) counts on bar 0.
 
     PERFORMANCE NOTE: NumPy's vectorized boolean masking + argmax has
     real per-call overhead (allocating temporary arrays) that only pays
@@ -704,13 +720,13 @@ def resolve_all_exit_models_for_trade(
 
     if n <= SHORT_SCAN_THRESHOLD:
         return _resolve_short_scan(direction, sl, target, future_high, future_low,
-                                    future_open, future_close, future_timestamps, n)
+                                    future_open, future_close, future_timestamps, n,
+                                    prefill_first_bar=prefill_first_bar)
 
     # ---- VECTORIZED PATH: long scan windows -- NumPy wins here ----
     high = future_high[:n]
     low = future_low[:n]
     op = future_open[:n]
-    cl = future_close[:n]
 
     if direction == logic.TradeDirection.BUY:
         sl_mask = low <= sl
@@ -718,63 +734,63 @@ def resolve_all_exit_models_for_trade(
     else:
         sl_mask = high >= sl
         target_mask = low <= target
+    if prefill_first_bar:
+        target_mask[0] = False
 
-    sl_hit_any = bool(sl_mask.any())
-    target_hit_any = bool(target_mask.any())
-
-    sl_idx = int(np.argmax(sl_mask)) if sl_hit_any else None
-    target_idx = int(np.argmax(target_mask)) if target_hit_any else None
-
-    def _make_result(outcome: TradeOutcome, idx: Optional[int], exit_price: Optional[float]):
-        if idx is None:
-            return (outcome, None, None, None)
-        return (outcome, exit_price, future_timestamps[idx], idx + 1)
-
-    # ---- case: neither ever hit ----
-    if sl_idx is None and target_idx is None:
+    event_mask = sl_mask | target_mask
+    if not bool(event_mask.any()):
         result = (TradeOutcome.STILL_OPEN, None, None, None)
         return {m: result for m in ALL_EXIT_MODELS}
 
-    # ---- case: only target hit ----
-    if sl_idx is None:
-        result = _make_result(TradeOutcome.WIN, target_idx, target)
-        return {m: result for m in ALL_EXIT_MODELS}
+    i = int(np.argmax(event_mask))
+    return _decide_exit_bar(
+        direction, sl, target,
+        float(op[i]), float(future_close[i]),
+        bool(sl_mask[i]), bool(target_mask[i]),
+        future_timestamps[i], i,
+        open_is_live=not (prefill_first_bar and i == 0),
+    )
 
-    # ---- case: only SL hit ----
-    if target_idx is None:
-        result = _make_result(TradeOutcome.LOSS, sl_idx, sl)
-        return {m: result for m in ALL_EXIT_MODELS}
 
-    # ---- case: SL hit strictly before target ----
-    if sl_idx < target_idx:
-        result = _make_result(TradeOutcome.LOSS, sl_idx, sl)
-        return {m: result for m in ALL_EXIT_MODELS}
+def _decide_exit_bar(
+    direction: "logic.TradeDirection",
+    sl: float,
+    target: float,
+    o: float,
+    c: float,
+    hit_sl: bool,
+    hit_target: bool,
+    ts,
+    i: int,
+    *,
+    open_is_live: bool,
+) -> Dict[ExitModel, Tuple[TradeOutcome, Optional[float], Optional[datetime], Optional[int]]]:
+    """Outcome on the first bar that touches SL and/or target (all exit models)."""
+    is_buy = direction == logic.TradeDirection.BUY
+    if open_is_live:
+        opened_past_sl = (o <= sl) if is_buy else (o >= sl)
+        opened_past_target = (o >= target) if is_buy else (o <= target)
+        if opened_past_sl:
+            result = (TradeOutcome.LOSS, o, ts, i + 1)
+            return {m: result for m in ALL_EXIT_MODELS}
+        if opened_past_target:
+            # A gap through TP is credited at TP: never book more than the planned RR.
+            result = (TradeOutcome.WIN, target, ts, i + 1)
+            return {m: result for m in ALL_EXIT_MODELS}
 
-    # ---- case: target hit strictly before SL ----
-    if target_idx < sl_idx:
-        result = _make_result(TradeOutcome.WIN, target_idx, target)
-        return {m: result for m in ALL_EXIT_MODELS}
-
-    # ---- case: SAME candle -- genuinely ambiguous, resolve per model ----
-    idx = sl_idx  # == target_idx
-    candle_is_green = bool(cl[idx] > op[idx])
-
-    results: Dict[ExitModel, Tuple] = {}
-    results[ExitModel.WORST_CASE] = _make_result(TradeOutcome.LOSS, idx, sl)
-    results[ExitModel.BEST_CASE] = _make_result(TradeOutcome.WIN, idx, target)
-
-    if direction == logic.TradeDirection.BUY:
-        if candle_is_green:
-            results[ExitModel.CANDLE_BIAS] = _make_result(TradeOutcome.WIN, idx, target)
-        else:
-            results[ExitModel.CANDLE_BIAS] = _make_result(TradeOutcome.LOSS, idx, sl)
-    else:  # SELL
-        if not candle_is_green:  # red candle
-            results[ExitModel.CANDLE_BIAS] = _make_result(TradeOutcome.WIN, idx, target)
-        else:
-            results[ExitModel.CANDLE_BIAS] = _make_result(TradeOutcome.LOSS, idx, sl)
-
-    return results
+    loss = (TradeOutcome.LOSS, sl, ts, i + 1)
+    win = (TradeOutcome.WIN, target, ts, i + 1)
+    if hit_sl and hit_target:
+        candle_is_green = bool(c > o)
+        bias_win = candle_is_green if is_buy else not candle_is_green
+        return {
+            ExitModel.WORST_CASE: loss,
+            ExitModel.BEST_CASE: win,
+            ExitModel.CANDLE_BIAS: win if bias_win else loss,
+        }
+    if hit_sl:
+        return {m: loss for m in ALL_EXIT_MODELS}
+    return {m: win for m in ALL_EXIT_MODELS}
 
 
 def _resolve_short_scan(
@@ -787,6 +803,8 @@ def _resolve_short_scan(
     future_close: np.ndarray,
     future_timestamps: List[datetime],
     n: int,
+    *,
+    prefill_first_bar: bool = False,
 ) -> Dict[ExitModel, Tuple[TradeOutcome, Optional[float], Optional[datetime], Optional[int]]]:
     """
     Plain-loop fast path for short scan windows (see SHORT_SCAN_THRESHOLD
@@ -795,41 +813,20 @@ def _resolve_short_scan(
     small n, not a different algorithm. Verified against the vectorized
     path in tests.
     """
+    is_buy = direction == logic.TradeDirection.BUY
     for i in range(n):
-        h, l, o, c = future_high[i], future_low[i], future_open[i], future_close[i]
-
-        if direction == logic.TradeDirection.BUY:
-            hit_sl = l <= sl
-            hit_target = h >= target
-        else:
-            hit_sl = h >= sl
-            hit_target = l <= target
-
-        if hit_sl and hit_target:
-            candle_is_green = bool(c > o)
-            results: Dict[ExitModel, Tuple] = {
-                ExitModel.WORST_CASE: (TradeOutcome.LOSS, sl, future_timestamps[i], i + 1),
-                ExitModel.BEST_CASE: (TradeOutcome.WIN, target, future_timestamps[i], i + 1),
-            }
-            if direction == logic.TradeDirection.BUY:
-                results[ExitModel.CANDLE_BIAS] = (
-                    (TradeOutcome.WIN, target, future_timestamps[i], i + 1) if candle_is_green
-                    else (TradeOutcome.LOSS, sl, future_timestamps[i], i + 1)
-                )
-            else:
-                results[ExitModel.CANDLE_BIAS] = (
-                    (TradeOutcome.WIN, target, future_timestamps[i], i + 1) if not candle_is_green
-                    else (TradeOutcome.LOSS, sl, future_timestamps[i], i + 1)
-                )
-            return results
-
-        elif hit_sl:
-            result = (TradeOutcome.LOSS, sl, future_timestamps[i], i + 1)
-            return {m: result for m in ALL_EXIT_MODELS}
-
-        elif hit_target:
-            result = (TradeOutcome.WIN, target, future_timestamps[i], i + 1)
-            return {m: result for m in ALL_EXIT_MODELS}
+        h, l = float(future_high[i]), float(future_low[i])
+        hit_sl = (l <= sl) if is_buy else (h >= sl)
+        hit_target = (h >= target) if is_buy else (l <= target)
+        if prefill_first_bar and i == 0:
+            hit_target = False
+        if hit_sl or hit_target:
+            return _decide_exit_bar(
+                direction, sl, target,
+                float(future_open[i]), float(future_close[i]),
+                hit_sl, hit_target, future_timestamps[i], i,
+                open_is_live=not (prefill_first_bar and i == 0),
+            )
 
     result = (TradeOutcome.STILL_OPEN, None, None, None)
     return {m: result for m in ALL_EXIT_MODELS}
@@ -968,21 +965,27 @@ def market_preferred_for_config(config: "BacktestConfig") -> str:
     return pref
 
 
-def _exit_scan_start_index(sig, fill_idx: int) -> int:
+def _exit_scan_start_index(
+    sig,
+    fill_idx: int,
+    *,
+    legacy_skip_entry_candle: bool = False,
+) -> int:
     """
-    Index at which SL/TP scanning begins after entry.
+    First bar on which the position is live, i.e. where SL/TP scanning begins.
 
-    Pullback/limit fills (await_limit_fill): include the fill bar so same-bar
-    SL after the limit fill counts — required for Hammer with candle 35%.
-
-    Market / next-open entries (Hammer with candles, classic hammer, doji):
-    start on the *next* bar. Including the entry bar was introduced broadly in
-    1.0.29 for pullbacks and incorrectly shifted plain HWC results vs client
-    baselines on identical data/config.
+    - Limit fills (await_limit_fill): the fill bar.
+    - NEXT_CANDLE_CLOSE: entry happens at the entry bar's close → next bar.
+    - Every other rule (next open, signal close/high/low): the entry bar —
+      its whole range trades after entry.
     """
     if getattr(sig, "await_limit_fill", False):
         return fill_idx
-    return fill_idx + 1
+    if legacy_skip_entry_candle:
+        return fill_idx + 1
+    if getattr(sig, "entry_rule", None) == logic.EntryRule.NEXT_CANDLE_CLOSE.value:
+        return fill_idx + 1
+    return fill_idx
 
 
 def simulate_timeframe_outcomes(
@@ -1029,14 +1032,27 @@ def simulate_timeframe_outcomes(
         all_signals = doji_logic.run_strategy(
             candles, timeframe=logic_label, config=config.strategy_config,
         )
-    elif hammer_context_logic.is_context_pattern_type(config.pattern_type):
-        # Hammer with candle 35%: never silently run at 0% pullback.
-        strat = hammer_context_logic.apply_pullback_for_pattern_type(
-            config.strategy_config, config.pattern_type,
-        )
+    elif hwc35_logic.is_pattern_type(config.pattern_type):
+        # Separate strategy: pullback limit entry (default 35%) — not plain HWC.
+        strat = hwc35_logic.prepare_config(config.strategy_config)
         config.strategy_config = strat
-        all_signals = hammer_context_logic.run_strategy(
+        all_signals = hwc35_logic.run_strategy(
             candles, timeframe=logic_label, config=strat,
+        )
+        print(
+            f"    Pattern: Hammer with candle 35% | lookback={strat.lookback_candles} "
+            f"| pullback={float(strat.entry_pullback_pct or 0):g}%"
+        )
+    elif hwc_logic.is_pattern_type(config.pattern_type):
+        # Plain Hammer with candles: market entry at rule price (pullback forced off).
+        strat = hwc_logic.prepare_config(config.strategy_config)
+        config.strategy_config = strat
+        all_signals = hwc_logic.run_strategy(
+            candles, timeframe=logic_label, config=strat,
+        )
+        print(
+            f"    Pattern: Hammer with candles | lookback={strat.lookback_candles} "
+            f"prior close(s) vs signal low/high"
         )
     else:
         all_signals = logic.run_strategy(
@@ -1095,6 +1111,7 @@ def simulate_timeframe_outcomes(
             continue
 
         fill_idx = entry_idx
+        fill_intrabar = False
         if getattr(sig, "await_limit_fill", False):
             found = hammer_context_logic.find_limit_fill_index(
                 sig.direction,
@@ -1121,10 +1138,12 @@ def simulate_timeframe_outcomes(
             if sig.direction == logic.TradeDirection.BUY:
                 if fill_open <= limit_px and fill_open > sl_px:
                     sig.entry_price = fill_open
+                fill_intrabar = fill_open > limit_px
                 sig.risk = float(sig.entry_price) - sl_px
             else:
                 if fill_open >= limit_px and fill_open < sl_px:
                     sig.entry_price = fill_open
+                fill_intrabar = fill_open < limit_px
                 sig.risk = sl_px - float(sig.entry_price)
             # Align overlap / event timing to the actual fill bar
             try:
@@ -1139,7 +1158,10 @@ def simulate_timeframe_outcomes(
                 pass
 
         # Exit scan start — see _exit_scan_start_index.
-        start = _exit_scan_start_index(sig, fill_idx)
+        start = _exit_scan_start_index(
+            sig, fill_idx,
+            legacy_skip_entry_candle=bool(getattr(config, "legacy_skip_entry_candle", False)),
+        )
         end = min(start + config.max_forward_candles, len(all_high))
         if start >= len(all_high):
             # Entry on the last bar with nowhere to scan — empty window
@@ -1153,6 +1175,7 @@ def simulate_timeframe_outcomes(
             future_open=all_open[start:end], future_close=all_close[start:end],
             future_timestamps=all_timestamps[start:end],
             max_scan=config.max_forward_candles,
+            prefill_first_bar=fill_intrabar and start == fill_idx,
         )
         raw_results.append((sig, raw_outcomes))
 
@@ -1435,7 +1458,12 @@ def _streaks_and_drawdown(sub: pl.DataFrame, starting_capital: float) -> Dict[st
             "ending_capital": starting_capital,
         }
 
-    ordered = sub.sort("entry_time")
+    # Equity only changes when a trade closes — order by exit so overlapping
+    # trades (multi-timeframe / overlap allowed) build the true equity path.
+    if "exit_time" in sub.columns:
+        ordered = sub.sort(["exit_time", "entry_time"], nulls_last=True)
+    else:
+        ordered = sub.sort("entry_time")
     outcomes = ordered["outcome"].to_numpy()
     pnls = ordered["pnl_usd"].to_numpy()
 
@@ -1720,8 +1748,12 @@ def run_backtest_and_export(config: BacktestConfig) -> Dict[str, pl.DataFrame]:
     print(f"Market data: {market_label}")
     if hammer_context_logic.is_context_pattern_type(config.pattern_type):
         try:
-            print(hammer_context_logic.describe_hammer_context_rules(config.strategy_config))
-            print(hammer_context_logic.describe_hammer_context_entry_exit(config.strategy_config))
+            if hwc35_logic.is_pattern_type(config.pattern_type):
+                print(hwc35_logic.describe_rules(config.strategy_config))
+                print(hwc35_logic.describe_entry_exit(config.strategy_config))
+            else:
+                print(hwc_logic.describe_rules(config.strategy_config))
+                print(hwc_logic.describe_entry_exit(config.strategy_config))
         except Exception as e:
             print(f"[WARN] Could not print Hammer-with-candles rules: {e}")
     print(f"Overlap allowed: {config.allow_overlapping_trades} | "

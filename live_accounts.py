@@ -20,6 +20,28 @@ MAGIC_SERIES_SIZE = 100
 LEGACY_MAGIC_MIN = 1_000_000
 
 
+def data_folder_slug(name: str) -> str:
+    """
+    Filesystem-safe folder under data/ for an account, e.g. 'IC Markets' → 'ic_markets'.
+    Layout: data/<slug>/<symbol>/<timeframe>/…
+    """
+    raw = (name or "").strip().lower()
+    if not raw:
+        return "account"
+    out = []
+    prev_us = False
+    for ch in raw:
+        if ch.isalnum():
+            out.append(ch)
+            prev_us = False
+        elif ch in (" ", "-", "_", ".", "/"):
+            if not prev_us and out:
+                out.append("_")
+                prev_us = True
+    slug = "".join(out).strip("_")
+    return slug or "account"
+
+
 def normalize_hhmm(raw: Optional[str]) -> str:
     """Return 'HH:MM' from user text, or '' if empty / invalid."""
     text = (raw or "").strip()
@@ -46,6 +68,8 @@ class LiveAccount:
     server: str = ""
     terminal_path: str = ""
     max_daily_loss_usd: float = 100.0
+    # 0 = use Live Settings global default; >0 = this account only (hot-reloadable)
+    max_spread_points: float = 0.0
     magic_base: int = MAGIC_BASE
     flatten_hhmm: str = ""  # "15:55" local system clock; empty = off
     # Auto Start all / Stop live at local clock (empty = off)
@@ -53,6 +77,8 @@ class LiveAccount:
     schedule_stop_hhmm: str = ""
     # Per-account: do not mirror dry-run across other logins
     dry_run: bool = True
+    # Optional override for data/<folder>/… (empty = derive from name)
+    data_folder: str = ""
     # In-memory only — never written to live_desk.json
     password: str = ""
 
@@ -67,6 +93,10 @@ class LiveAccount:
     def magic_range(self) -> Tuple[int, int]:
         base = int(self.magic_base or MAGIC_BASE)
         return base, base + MAGIC_SERIES_SIZE - 1
+
+    def data_slug(self) -> str:
+        custom = (self.data_folder or "").strip()
+        return data_folder_slug(custom if custom else self.name)
 
 
 @dataclass
@@ -289,11 +319,13 @@ def desk_from_dict(raw: Optional[Dict[str, Any]]) -> LiveDesk:
             server=str(row.get("server") or ""),
             terminal_path=str(row.get("terminal_path") or ""),
             max_daily_loss_usd=float(row.get("max_daily_loss_usd") or 100.0),
+            max_spread_points=float(row.get("max_spread_points") or 0.0),
             magic_base=magic_base,
             flatten_hhmm=normalize_hhmm(str(row.get("flatten_hhmm") or "")),
             schedule_start_hhmm=normalize_hhmm(str(row.get("schedule_start_hhmm") or "")),
             schedule_stop_hhmm=normalize_hhmm(str(row.get("schedule_stop_hhmm") or "")),
             dry_run=bool(row["dry_run"]) if "dry_run" in row else True,
+            data_folder=str(row.get("data_folder") or ""),
         ))
     for row in raw.get("slots") or []:
         try:

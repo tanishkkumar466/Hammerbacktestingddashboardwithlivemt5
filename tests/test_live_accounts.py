@@ -41,6 +41,16 @@ def test_roundtrip_json(tmp_path):
     assert "password" not in json.dumps(raw)
 
 
+def test_account_max_spread_points_roundtrip(tmp_path):
+    desk = la.LiveDesk()
+    desk.ensure_defaults()
+    desk.accounts[0].max_spread_points = 120.0
+    path = str(tmp_path / "desk.json")
+    la.save_desk(path, desk)
+    loaded = la.load_desk(path)
+    assert loaded.accounts[0].max_spread_points == 120.0
+
+
 def test_slot_preset_file_roundtrip(tmp_path):
     desk = la.LiveDesk()
     desk.ensure_defaults()

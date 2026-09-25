@@ -87,23 +87,39 @@ def test_overall_equals_session_timeframe_direction_partitions():
             assert abs(o["profit_factor"] - o["gross_profit"] / abs(o["gross_loss"])) < 1e-6
 
 
+def _pnl_from_exit(row) -> float:
+    sign = 1.0 if row["direction"] == "BUY" else -1.0
+    return sign * (row["exit_price"] - row["entry_price"]) * row["position_size"]
+
+
 def test_fixed_risk_loss_equals_minus_risk_usd():
+    """Stop fills cost exactly 1R; a bar that opens through the stop costs more."""
     df = _run_sample()
     losses = df.filter(
         (pl.col("exit_model") == "worst_case") & (pl.col("outcome") == "LOSS")
     )
     assert losses.height > 0
+    at_stop = 0
     for row in losses.iter_rows(named=True):
-        assert abs(row["pnl_usd"] + row["risk_usd"]) < 1e-6
         assert abs(row["risk_usd"] - 100.0) < 1e-6
+        assert abs(row["pnl_usd"] - _pnl_from_exit(row)) < 1e-6
+        if abs(row["exit_price"] - row["stop_loss"]) < 1e-9:
+            at_stop += 1
+            assert abs(row["pnl_usd"] + row["risk_usd"]) < 1e-6
+        else:
+            assert row["pnl_usd"] < -row["risk_usd"]  # gap through stop
+    assert at_stop > 0
 
 
 def test_fixed_risk_win_equals_risk_times_rr():
+    """Target fills pay exactly RR × risk — including bars that gap past target."""
     df = _run_sample()
     wins = df.filter(
         (pl.col("exit_model") == "worst_case") & (pl.col("outcome") == "WIN")
     )
     assert wins.height > 0
-    for row in wins.head(100).iter_rows(named=True):
+    for row in wins.iter_rows(named=True):
+        assert abs(row["pnl_usd"] - _pnl_from_exit(row)) < 1e-4
+        assert abs(row["exit_price"] - row["target"]) < 1e-9
         expected = row["risk_usd"] * row["rr_multiple_target"]
         assert abs(row["pnl_usd"] - expected) < 1e-4
