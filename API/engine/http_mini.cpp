@@ -1,5 +1,6 @@
 #include "http_mini.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -85,7 +86,12 @@ bool RunHttpServer(const std::string& host, int port, const HttpHandler& handler
         return false;
     }
     int yes = 1;
+#ifdef _WIN32
+    // Windows SO_REUSEADDR lets a second engine share the port; refuse instead.
+    setsockopt(server, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
     setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+#endif
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

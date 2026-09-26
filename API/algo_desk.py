@@ -17,12 +17,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from live_account_ipc import AccountWorkerHandle
+from live_history import entry_offset_ignored_warning
 
 from .accounts import ApiAccount, ApiAccountStore
 from .bindings import BindingStore, StrategyBinding
-from .fleet import DEFAULT_STAGGER_MS, FleetClient, build_fleet_plan_from_stores
-from .paths import portable_terminal_path
+from .fleet import DEFAULT_STAGGER_MS, FleetClient, FleetStartPlan, build_fleet_plan_from_stores
+from .paths import portable_terminal_path, prepare_portable_terminal
 from .runtime import (
+    api_slot_id,
     api_worker_key,
     build_api_trade_start,
     start_slot_kwargs,
@@ -39,7 +41,9 @@ class AlgoStartResult:
     message: str
     started: List[str] = field(default_factory=list)  # account ids
     errors: List[str] = field(default_factory=list)
+    already_running: List[str] = field(default_factory=list)
     fleet_status: Optional[EngineStatus] = None
+    warnings: List[str] = field(default_factory=list)
 
 
 def _primary_binding(store: BindingStore, account_id: str) -> Optional[StrategyBinding]:
@@ -107,10 +111,14 @@ def start_api_trading_parallel(
     stagger_ms: int = DEFAULT_STAGGER_MS,
     settle_sec: float = 1.5,
     log: Optional[LogFn] = None,
+    shared_live_settings: Optional[Dict[str, Any]] = None,
+    ensure_engine: Optional[Callable[[], EngineStatus]] = None,
 ) -> AlgoStartResult:
     """
-    1) C++ staggered fleet launch (isolated portable folders)
-    2) Parallel per-account workers running saved presets
+    1) Validate every account + build its Live payload (nothing launched yet)
+    2) Prepare isolated portable MT5 copies, start the C++ engine if needed
+    3) C++ staggered fleet launch for the valid accounts only
+    4) One worker process per account: connect, then start the strategy slot
     """
     def _log(msg: str) -> None:
         if log:
@@ -128,25 +136,11 @@ def start_api_trading_parallel(
             "No enabled accounts with strategy bindings.",
         )
 
-    client = FleetClient(engine or HeadlessEngineClient())
-    fleet_st = client.connect_fleet(plan)
-    _log(f"[API] C++ fleet: {fleet_st.message}")
-    if not fleet_st.reachable:
-        return AlgoStartResult(
-            False,
-            "C++ API service offline — build/run API/engine (Windows) first.",
-            fleet_status=fleet_st,
-        )
-
-    # Brief settle so portable terminals finish boot before MT5 initialize
-    if settle_sec > 0:
-        time.sleep(min(settle_sec, 5.0))
-
-    started: List[str] = []
     errors: List[str] = []
+    warnings: List[str] = []
+    already_running: List[str] = []
     by_id = {a.id: a for a in accounts.accounts}
 
-    # Start all workers first (parallel processes), then connect/start each.
     jobs = []
     for spec in plan.accounts:
         acc = by_id.get(spec.account_id)
@@ -156,28 +150,99 @@ def start_api_trading_parallel(
         if binding is None:
             errors.append(f"{acc.name}: no strategy binding")
             continue
+        existing = handles.get(api_worker_key(acc.id))
+        if (
+            existing is not None
+            and existing.is_alive()
+            and api_slot_id(binding.id) in existing.running_slots
+        ):
+            already_running.append(acc.id)
+            _log(f"[API] {acc.name}: strategy already running — skipped.")
+            continue
         try:
-            portable = portable_terminal_path(acc.id)
-            # Prefer C++ portable copy; fall back to install path if copy not ready
-            term = portable if portable else (install_terminal_path or acc.terminal_path or "")
+            term = portable_terminal_path(acc.id)
+            source = (spec.terminal_path or "").strip()
+            if source:
+                prepared, note = prepare_portable_terminal(acc.id, source)
+                _log(f"[API] {acc.name}: {note}")
+                if prepared:
+                    term = prepared
             start = build_api_trade_start(
                 acc,
                 binding,
                 presets_dir=presets_dir,
                 terminal_path=term,
                 journal_dir=journal_dir,
+                shared_live_settings=shared_live_settings,
             )
-            handle = ensure_api_handle(handles, acc)
-            jobs.append((acc, binding, start, handle, term))
+            offset_warning = entry_offset_ignored_warning(
+                start.strategy_config,
+                start.pattern_type,
+                start.live_config.order_mode,
+                bool(getattr(start.live_config, "limit_offset_from_market", True)),
+            )
+            if offset_warning:
+                _log(f"[API] {acc.name}: {offset_warning}")
+                warnings.append(f"{acc.name}: {offset_warning}")
+            jobs.append((acc, binding, start, spec))
         except Exception as exc:
             errors.append(f"{acc.name}: {exc}")
 
-    # Connect + start_slot on every worker — each process is isolated (parallel calc)
-    for acc, binding, start, handle, term in jobs:
+    def _result(ok: bool, message: str, started: List[str], fleet_st=None) -> AlgoStartResult:
+        if errors:
+            message += " Issues: " + "; ".join(errors[:4])
+        return AlgoStartResult(
+            ok=ok,
+            message=message,
+            started=started,
+            errors=errors,
+            already_running=already_running,
+            fleet_status=fleet_st,
+            warnings=warnings,
+        )
+
+    if not jobs:
+        if already_running:
+            return _result(True, f"{len(already_running)} account(s) already running.", [])
+        return _result(False, "Nothing started.", [])
+
+    if ensure_engine is not None:
+        eng_st = ensure_engine()
+        if not (eng_st.reachable and eng_st.ok):
+            _log(f"[API] Engine: {eng_st.message}")
+            return _result(False, f"MT5 API engine not available — {eng_st.message}", [], eng_st)
+
+    client = FleetClient(engine or HeadlessEngineClient())
+    job_plan = FleetStartPlan(accounts=[spec for *_rest, spec in jobs], stagger_ms=plan.stagger_ms)
+    fleet_st = client.connect_fleet(job_plan)
+    _log(f"[API] C++ fleet: {fleet_st.message}")
+    if not fleet_st.reachable:
+        return _result(
+            False,
+            "C++ API service offline — the MT5 API engine is not running.",
+            [],
+            fleet_st,
+        )
+    if not fleet_st.ok:
+        rows = fleet_st.results()
+        for (acc, *_rest), row in zip(jobs, rows):
+            if not row.get("ok", True):
+                _log(
+                    f"[API] {acc.name}: engine could not open the terminal "
+                    f"({row.get('message') or 'unknown'}) — the worker will open it directly."
+                )
+
+    # Brief settle so portable terminals finish boot before MT5 initialize
+    if settle_sec > 0:
+        time.sleep(min(settle_sec, 5.0))
+
+    started: List[str] = []
+    for acc, binding, start, _spec in jobs:
         try:
+            handle = ensure_api_handle(handles, acc)
             _log(
                 f"[API] {acc.name}: strategy {binding.preset_file} @ {binding.timeframe} "
-                f"→ portable {term or '(install path)'}"
+                f"→ {start.credentials.terminal_path or '(install path)'}"
             )
             handle.send(
                 "connect",
@@ -185,31 +250,25 @@ def start_api_trading_parallel(
                 login=start.credentials.login,
                 password=start.credentials.password,
                 server=start.credentials.server,
+                portable=start.credentials.portable,
             )
-            # Give connect a moment; events polled by UI
-            time.sleep(0.15)
+            # Worker handles commands in order: start_slot runs after connect finishes.
             handle.send("start_slot", **start_slot_kwargs(start))
             started.append(acc.id)
             _log(
-                f"[API] {acc.name}: trading started "
-                f"({'DRY-RUN' if start.live_config.dry_run else 'LIVE ORDERS'})"
+                f"[API] {acc.name}: start sent "
+                f"({'DRY-RUN' if start.live_config.dry_run else 'LIVE ORDERS'}, "
+                f"order={start.live_config.order_mode}) — waiting for MT5 login."
             )
         except Exception as exc:
             errors.append(f"{acc.name}: start failed — {exc}")
 
-    ok = bool(started) and not errors
-    if started and errors:
-        ok = True  # partial success
-    msg = (
-        f"Started {len(started)}/{len(plan.accounts)} account(s) in parallel "
-        f"(C++ terminals + strategy workers)."
-    )
-    if errors:
-        msg += " Issues: " + "; ".join(errors[:4])
-    return AlgoStartResult(
-        ok=ok or bool(started),
-        message=msg,
-        started=started,
-        errors=errors,
-        fleet_status=fleet_st,
-    )
+    msg = f"Start sent to {len(started)}/{len(plan.accounts)} account(s)."
+    if already_running:
+        msg += f" {len(already_running)} already running."
+    if started:
+        msg += (
+            " Watch the Live log: '[API] Connected …' then 'Strategy running …' "
+            "confirms each account; a login problem shows as an error there."
+        )
+    return _result(bool(started) or bool(already_running), msg, started, fleet_st)

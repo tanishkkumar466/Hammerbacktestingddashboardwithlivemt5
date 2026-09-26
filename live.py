@@ -29,6 +29,7 @@ from notification import telegram as telegram_notify
 from broker import MT5Broker, TIMEFRAME_MT5_MAP
 from indicators.filter import apply_indicator_filters, verify_signal_passes_indicators_at_bar
 from live_journal import append_session_header, append_trade_row, session_log_path, trades_csv_path
+import live_history
 
 
 LogFn = Callable[[str], None]
@@ -126,6 +127,8 @@ class LiveRunConfig:
     notify_enabled: bool = True
     slot_id: str = ""
     slot_name: str = ""
+    # Preset file the slot trades with (shown in History); empty = Parameters panel
+    preset_name: str = ""
 
 
 def reanchor_sl_tp_to_fill(
@@ -733,6 +736,7 @@ class LiveTradingEngine:
         entry_price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         target: Optional[float] = None,
+        breakdown: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Append one audit row to this account/slot live_trades.csv.
@@ -774,9 +778,15 @@ class LiveTradingEngine:
             log_risk = abs(log_entry - log_sl)
 
         msg_for_row = mt5_message or why
+        if breakdown is None:
+            breakdown = self._signal_breakdown(sig) if isinstance(sig, logic.TradeSignal) else {}
         append_trade_row(
             self._journal_dir,
             {
+                "account": getattr(self.live_config, "account_name", "") or "",
+                "preset": getattr(self.live_config, "preset_name", "") or "",
+                "params": self._params_summary(),
+                **breakdown,
                 "logged_at": datetime.now().isoformat(timespec="seconds"),
                 "event": event,
                 "symbol": self._active_symbol or self.live_config.symbol,
@@ -840,9 +850,24 @@ class LiveTradingEngine:
             profit=profit,
             profit_currency=profit_currency,
             close_reason=close_reason or why,
+            preset_name=getattr(self.live_config, "preset_name", "") or "",
         )
         if event == "ORDER" and not dry_run:
             self._refresh_tracked_from_broker(sig, volume=volume)
+
+    def _signal_breakdown(self, sig: logic.TradeSignal) -> Dict[str, Any]:
+        try:
+            return live_history.signal_breakdown(sig, self.strategy_config, self.pattern_type)
+        except Exception:
+            return {}
+
+    def _params_summary(self) -> str:
+        try:
+            return summarize_strategy_params(
+                self.strategy_config, self.live_config.timeframe_label, self.pattern_type,
+            )
+        except Exception:
+            return ""
 
     def _record_skip(
         self,
@@ -888,6 +913,11 @@ class LiveTradingEngine:
             "signal_bar_time": str(getattr(getattr(sig, "hammer_candle", None), "timestamp", "") or ""),
             "entry_bar_time": str(getattr(getattr(sig, "entry_candle", None), "timestamp", "") or ""),
             "dry_run": False,
+            "breakdown": {
+                **self._signal_breakdown(sig),
+                "preset": getattr(self.live_config, "preset_name", "") or "",
+                "params": self._params_summary(),
+            },
         }
 
     def _refresh_tracked_from_broker(
@@ -1011,6 +1041,7 @@ class LiveTradingEngine:
                 profit=profit,
                 profit_currency=currency,
                 close_reason=reason,
+                breakdown=snap.get("breakdown") or {},
             )
 
     def touch_heartbeat(self):
@@ -1272,39 +1303,35 @@ class LiveTradingEngine:
         return sig
 
     def _configured_entry_offset_abs(self, sig: logic.TradeSignal) -> float:
-        """Absolute $ entry_offset for this signal's side (classic vs inverted)."""
-        cfg = getattr(self, "strategy_config", None)
-        if cfg is None:
-            return 0.0
+        """Absolute $ entry_offset for this signal's side (per-pattern classic vs inverted row)."""
         try:
-            if sig.direction == logic.TradeDirection.SELL:
-                raw = getattr(cfg, "inverted_entry_offset", None)
-                if raw is None:
-                    raw = getattr(cfg, "entry_offset", 0.0)
-            else:
-                raw = getattr(cfg, "entry_offset", 0.0)
-            return abs(float(raw or 0.0))
-        except (TypeError, ValueError):
+            p = live_history.side_params(
+                getattr(self, "strategy_config", None), getattr(self, "pattern_type", "hammer"), sig,
+            )
+        except Exception:
             return 0.0
+        return abs(p.entry_offset) if p is not None else 0.0
+
+    def _log_entry_offset_not_used(self, entry_offset_abs: float, reason: str) -> None:
+        if entry_offset_abs > 1e-9:
+            self.log(
+                f"[LIVE] WARNING: Entry Offset ${entry_offset_abs:g} NOT applied — {reason}. "
+                f"Backtest entry includes it, so results can differ. "
+                f"Use Order type 'Limit — at strategy entry price' to apply it."
+            )
 
     def _configured_sl_buffer_note(self, sig: logic.TradeSignal) -> str:
         """Short note for logs: how SL buffer was applied (never moves entry)."""
-        cfg = getattr(self, "strategy_config", None)
-        if cfg is None:
-            return ""
         try:
-            sell = sig.direction == logic.TradeDirection.SELL
-            mode = getattr(cfg, "inverted_buffer_mode" if sell else "buffer_mode", None)
-            mode_s = str(getattr(mode, "value", mode) or "").upper()
-            if "FLAT" in mode_s:
-                flat = getattr(cfg, "inverted_sl_buffer_flat" if sell else "sl_buffer_flat", 0.0)
-                return f"SL buffer flat ${float(flat or 0):g}"
-            if "PERCENT" in mode_s:
-                pct = getattr(cfg, "inverted_sl_buffer_pct" if sell else "sl_buffer_pct", 0.0)
-                return f"SL buffer {float(pct or 0):g}%"
+            p = live_history.side_params(
+                getattr(self, "strategy_config", None), getattr(self, "pattern_type", "hammer"), sig,
+            )
+        except Exception:
             return ""
-        except (TypeError, ValueError):
+        if p is None:
             return ""
+        text = live_history.buffer_setting_text(p)
+        return "" if text == "none" else f"SL buffer {text}"
 
     def _resolve_live_order(
         self,
@@ -1362,6 +1389,7 @@ class LiveTradingEngine:
                     f"{market:.2f} (pullback level was {strat_entry:.2f}; "
                     f"SL={sl:.2f} TP={tp:.2f} absolute — candle extreme ± buffer)."
                 )
+                self._log_entry_offset_not_used(entry_offset_abs, "Order type Market fills at ask/bid")
                 return "market", None, sl, tp, market
 
             sl, tp = reanchor_sl_tp_to_fill(sig, strat_entry)
@@ -1390,8 +1418,17 @@ class LiveTradingEngine:
             exec_entry = market
             sl, tp = reanchor_sl_tp_to_fill(sig, exec_entry)
             limit_price = None
+            self._log_entry_offset_not_used(
+                entry_offset_abs,
+                "Order type Market fills at ask/bid" if order_mode == "market"
+                else "switched to MARKET (max deviation)",
+            )
         elif order_mode == "limit_offset":
             base = market if cfg.limit_offset_from_market else strat_entry
+            if cfg.limit_offset_from_market:
+                self._log_entry_offset_not_used(
+                    entry_offset_abs, "Limit ± offset is placed from the current bid/ask",
+                )
             with self._broker_lock:
                 lp, _resolved = self.broker.limit_price_with_offset(
                     sym, sig.direction, base, cfg.limit_offset_points,
@@ -1699,6 +1736,8 @@ class LiveTradingEngine:
                     if not getattr(ctx_cfg, "buy_require_wick", True)
                     else "classic wick required"
                 )
+                if getattr(ctx_cfg, "buy_min_lower_wick_enabled", False):
+                    wick_note += f", lower wick ≥ {ctx_cfg.buy_min_lower_wick_pct:g}%"
                 self.log(
                     f"[SIGNAL] Context BUY ({wick_note}, body={body_pct:.1f}%): "
                     f"{n} prior close(s) not below hammer low "
@@ -1710,6 +1749,8 @@ class LiveTradingEngine:
                     if not getattr(ctx_cfg, "sell_require_wick", True)
                     else "inverted wick required"
                 )
+                if getattr(ctx_cfg, "sell_min_upper_wick_enabled", False):
+                    wick_note += f", upper wick ≥ {ctx_cfg.sell_min_upper_wick_pct:g}%"
                 self.log(
                     f"[SIGNAL] Context SELL ({wick_note}, body={body_pct:.1f}%): "
                     f"{n} prior close(s) not above hammer high "

@@ -42,6 +42,8 @@ class BrokerCredentials:
     login: int = 0
     password: str = ""
     server: str = ""
+    # API Accounts: attach to / start the isolated /portable copy (Live desk keeps False)
+    portable: bool = False
 
 
 def resolve_mt5_symbol_name(mt5, symbol: str) -> Optional[str]:
@@ -141,7 +143,9 @@ class MT5Broker:
         self.disconnect()
 
         path = (creds.terminal_path or "").strip()
-        if path:
+        if path and creds.portable:
+            ok = mt5.initialize(path=path, portable=True)
+        elif path:
             ok = mt5.initialize(path=path)
         else:
             ok = mt5.initialize()

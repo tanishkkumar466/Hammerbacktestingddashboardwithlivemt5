@@ -79,6 +79,7 @@ def account_worker_main(account_id: str, account_name: str, cmd_q, evt_q) -> Non
             login=int(msg.get("login") or 0),
             password=str(msg.get("password") or ""),
             server=str(msg.get("server") or ""),
+            portable=bool(msg.get("portable", False)),
         )
         log(f"Connecting MT5 for '{account_name}'…")
         ok, text = broker.connect(creds)

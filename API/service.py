@@ -27,6 +27,16 @@ class EngineStatus:
     message: str
     detail: str = ""
     path: str = ""
+    # False when the engine answered but the request failed (HTTP 4xx/5xx or "ok": false)
+    ok: bool = True
+
+    def results(self) -> List[Dict[str, Any]]:
+        """Per-account rows from /fleet/connect (same order as the request)."""
+        try:
+            rows = json.loads(self.detail or "{}").get("results")
+        except (json.JSONDecodeError, AttributeError):
+            return []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
 
 
 def build_connect_payload(
@@ -217,8 +227,9 @@ class HeadlessEngineClient:
                 return EngineStatus(
                     reachable=True,
                     message=msg if ok else f"Engine error: {msg}",
-                    detail=body[:800],
+                    detail=body[:4000],
                     path=path_found,
+                    ok=ok,
                 )
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -226,12 +237,20 @@ class HeadlessEngineClient:
                 detail = exc.read().decode("utf-8", errors="replace")
             except Exception:
                 detail = str(exc)
-            return EngineStatus(False, f"HTTP {exc.code}", detail)
+            msg = f"HTTP {exc.code}"
+            try:
+                parsed = json.loads(detail)
+                if isinstance(parsed, dict) and parsed.get("message"):
+                    msg = f"Engine error: {parsed['message']}"
+            except json.JSONDecodeError:
+                pass
+            return EngineStatus(True, msg, detail[:4000], ok=False)
         except Exception as exc:
             return EngineStatus(
                 False,
                 "API service offline — start the local API service",
                 str(exc),
+                ok=False,
             )
 
     def ping(self) -> EngineStatus:
@@ -243,7 +262,12 @@ class HeadlessEngineClient:
                 False,
                 "API service offline — start the local API service",
                 str(exc),
+                ok=False,
             )
+
+    def health_http(self) -> EngineStatus:
+        """GET /health only — no TCP-ping fallback (tells our engine from other programs)."""
+        return self._http("GET", "/health")
 
     def health(self) -> EngineStatus:
         st = self._http("GET", "/health")
@@ -284,3 +308,7 @@ class HeadlessEngineClient:
 
     def status(self) -> EngineStatus:
         return self._http("GET", "/status")
+
+    def request_stop_all(self) -> EngineStatus:
+        """Close every terminal this engine launched (POST /engine/stop_all)."""
+        return self._http("POST", "/engine/stop_all", {}, timeout=max(5.0, self.timeout_sec))

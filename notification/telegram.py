@@ -7,14 +7,17 @@ so MT5 order flow is never blocked.
 
 from __future__ import annotations
 
+import html as _html
 import json
 import os
+import re
 import ssl
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from typing import Callable, FrozenSet, Optional, Tuple
 
 ORDER_EVENTS: FrozenSet[str] = frozenset({
@@ -104,6 +107,88 @@ def _fmt_price(value: float) -> str:
     return f"{v:.5f}"
 
 
+def _fmt_like(value: float, ref_price) -> str:
+    """Distance (risk) with the same decimals as the instrument's price."""
+    try:
+        v, ref = float(value), abs(float(ref_price or 0))
+    except (TypeError, ValueError):
+        return _fmt_price(value)
+    if ref >= 100 or ref == 0:
+        return f"{v:.2f}"
+    if ref >= 1:
+        return f"{v:.4f}"
+    return f"{v:.5f}"
+
+
+def _fmt_volume(volume) -> str:
+    try:
+        return f"{float(volume):.2f}"
+    except (TypeError, ValueError):
+        return str(volume)
+
+
+_SHORT_STRATEGY_NAMES = {
+    "hammer with candle 35%": "HWC 35%",
+    "hammer with candles": "HWC",
+}
+
+_ORDER_MODE_TEXT = {
+    "market": "Market",
+    "limit_entry": "Limit",
+    "limit_offset": "Limit ± offset",
+}
+
+_SEPARATOR = "━━━━━━━━━━━━━━"
+
+
+def short_strategy_name(pattern: str) -> str:
+    """Hammer with candles → HWC, Hammer with candle 35% → HWC 35%; others unchanged."""
+    name = (pattern or "Strategy").strip() or "Strategy"
+    return _SHORT_STRATEGY_NAMES.get(name.lower(), name)
+
+
+def _preset_label(preset_name: str) -> str:
+    name = os.path.basename(str(preset_name or "").strip().replace("\\", "/"))
+    root, ext = os.path.splitext(name)
+    return root if ext.lower() == ".json" else name
+
+
+def _parse_bar_time(text: str) -> Optional[datetime]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00").replace("T", " "))
+    except ValueError:
+        return None
+
+
+def _bar_times_text(signal_bar: str, entry_bar: str) -> str:
+    """'Signal bar: 26 Sep 10:05 · Entry bar: 10:10' (raw text when not parseable)."""
+    sig_dt, ent_dt = _parse_bar_time(signal_bar), _parse_bar_time(entry_bar)
+    bits = []
+    if signal_bar:
+        bits.append(
+            f"Signal bar: {sig_dt.strftime('%d %b %H:%M')}" if sig_dt else f"Signal bar: {signal_bar}"
+        )
+    if entry_bar:
+        if ent_dt and sig_dt and ent_dt.date() == sig_dt.date():
+            bits.append(f"Entry bar: {ent_dt.strftime('%H:%M')}")
+        elif ent_dt:
+            bits.append(f"Entry bar: {ent_dt.strftime('%d %b %H:%M')}")
+        else:
+            bits.append(f"Entry bar: {entry_bar}")
+    return " · ".join(bits)
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def html_to_plain(text: str) -> str:
+    """Strip our HTML tags for the plain-text fallback."""
+    return _html.unescape(_TAG_RE.sub("", text or ""))
+
+
 def format_order_alert(
     event: str,
     *,
@@ -131,21 +216,24 @@ def format_order_alert(
     profit: Optional[float] = None,
     profit_currency: str = "",
     close_reason: str = "",
+    preset_name: str = "",
 ) -> str:
     """
-    Client-facing trade card for Telegram.
+    Client-facing trade card for Telegram (HTML parse mode — send with parse_mode="HTML").
 
-    Includes strategy, entry/exit, SL/TP, RR, magic, account — enough to monitor
-    without opening the dashboard.
+    Top: strategy + direction, preset, status, then Entry / SL / TP in bold.
+    Bottom (italic): account, magic, bar times, bot, MT5 detail.
     """
     is_dry = bool(dry_run) or event == "DRY_RUN"
     lane = "DRY RUN" if is_dry else "LIVE"
-    title = EVENT_TITLES.get(event, event)
     is_exit = event == "EXIT"
+    e = _html.escape
 
-    strategy = (pattern or "Strategy").strip()
+    strategy = short_strategy_name(pattern)
     if pattern_variant:
-        strategy = f"{strategy} ({pattern_variant})"
+        strategy = f"{strategy} ({str(pattern_variant).strip().title()})"
+    side = (direction or "").strip().upper()
+    ref = entry_price
 
     risk_val = None
     try:
@@ -165,59 +253,106 @@ def format_order_alert(
     except (TypeError, ValueError):
         rr_val = None
 
-    lines = [
-        f"Hammer [{lane}] — {title}",
-        "————————————",
-        f"Strategy: {strategy}",
-        f"{symbol}  ·  {timeframe}  ·  {direction}  ·  {volume:g} lot",
-    ]
+    pnl = None
+    try:
+        pnl = float(profit) if profit is not None else None
+    except (TypeError, ValueError):
+        pnl = None
 
+    # ---- top: strategy, preset, status ----
     if is_exit:
-        lines.append(f"Entry: {_fmt_price(entry_price)}")
-        if exit_price is not None:
-            lines.append(f"Exit:  {_fmt_price(exit_price)}")
-        if profit is not None:
-            cur = f" {profit_currency}" if profit_currency else ""
-            sign = "+" if float(profit) >= 0 else ""
-            lines.append(f"P/L:   {sign}{float(profit):.2f}{cur}")
-        if close_reason:
-            lines.append(f"Close: {close_reason}")
-        lines.append(
-            f"Plan was  SL {_fmt_price(stop_loss)}  ·  TP {_fmt_price(target)}"
-        )
+        outcome = ""
+        if pnl is not None:
+            outcome = " — PROFIT" if pnl > 0 else (" — LOSS" if pnl < 0 else " — BREAKEVEN")
+        head = f"{strategy} — {side} closed{outcome}"
     else:
-        if is_dry or event == "DRY_RUN":
-            lines.append("No order sent — entry conditions only (no exit alert)")
-        lines.append(f"Entry: {_fmt_price(entry_price)}")
-        sl_bit = f"SL {_fmt_price(stop_loss)}"
+        head = f"{strategy} — {side}"
+    lines = [f"<b>{e(head)}</b>"]
+    preset = _preset_label(preset_name)
+    if preset:
+        lines.append(f"Preset: <b>{e(preset)}</b>")
+
+    reason = (mt5_message or "").strip()
+    if event == "ORDER":
+        lines.append(f"ORDER PLACED · {lane}")
+    elif event == "DRY_RUN":
+        lines.append("DRY RUN — not placed (no exit alert)")
+    elif event == "ORDER_FAIL":
+        lines.append(f"ENTRY FAILED · {lane}")
+    elif event == "SAFETY_BLOCK":
+        lines.append(f"ENTRY BLOCKED (safety) · {lane}")
+    elif is_exit:
+        bits = ["EXIT"]
+        if close_reason:
+            bits.append(e(str(close_reason).strip()))
+        bits.append(lane)
+        lines.append(" · ".join(bits))
+    else:
+        lines.append(f"{e(EVENT_TITLES.get(event, event))} · {lane}")
+    if event in ("ORDER_FAIL", "SAFETY_BLOCK") and reason:
+        lines.append(f"Reason: <b>{e(reason)}</b>")
+
+    # ---- main levels (bold) ----
+    lines.append(_SEPARATOR)
+    if is_exit:
+        if pnl is not None:
+            cur = f" {profit_currency}" if profit_currency else ""
+            sign = "+" if pnl >= 0 else ""
+            lines.append(f"<b>P/L:  {sign}{pnl:.2f}{e(cur)}</b>")
+        lines.append(f"<b>Entry:  {_fmt_price(entry_price)}</b>")
+        if exit_price is not None:
+            lines.append(f"<b>Exit:  {_fmt_price(exit_price)}</b>")
+        lines.append(f"Plan was SL {_fmt_price(stop_loss)} · TP {_fmt_price(target)}")
+    else:
+        lines.append(f"<b>Entry:  {_fmt_price(entry_price)}</b>")
+        sl_line = f"<b>SL:  {_fmt_price(stop_loss)}</b>"
         if risk_val is not None:
-            sl_bit += f"  (risk {_fmt_price(risk_val)})"
-        tp_bit = f"TP {_fmt_price(target)}"
+            sl_line += f"   (risk {_fmt_like(risk_val, ref)})"
+        tp_line = f"<b>TP:  {_fmt_price(target)}</b>"
         if rr_val is not None:
-            tp_bit += f"  (RR 1:{rr_val:.2f})"
-        lines.append(sl_bit)
-        lines.append(tp_bit)
+            tp_line += f"   (RR 1:{rr_val:.2f})"
+        lines.append(sl_line)
+        lines.append(tp_line)
 
-    meta_bits = []
-    if order_mode and not is_exit and not is_dry:
-        meta_bits.append(f"Mode {order_mode}")
-    if magic is not None and int(magic) != 0:
-        meta_bits.append(f"Magic {int(magic)}")
-    if mt5_order_id and not is_dry:
-        meta_bits.append(f"Ticket #{int(mt5_order_id)}")
-    if meta_bits:
-        lines.append(" · ".join(meta_bits))
+    # ---- trade details ----
+    lines.append(_SEPARATOR)
+    detail_bits = [e(str(symbol)), e(str(timeframe)), f"{_fmt_volume(volume)} lot"]
+    mode_text = _ORDER_MODE_TEXT.get((order_mode or "").strip().lower(), "")
+    if mode_text and not is_exit and not is_dry:
+        detail_bits.append(mode_text)
+    ticket = f"Ticket #{int(mt5_order_id)}" if mt5_order_id and not is_dry else ""
+    if is_exit and ticket:
+        detail_bits.append(ticket)
+        ticket = ""
+    lines.append(" · ".join(detail_bits))
+    if ticket:
+        lines.append(ticket)
 
+    # ---- less important (italic) ----
+    small: list = []
+    acct_bits = []
     if account_name:
-        lines.append(f"Account: {account_name}")
-    if signal_bar_time:
-        lines.append(f"Signal bar: {signal_bar_time}")
-    if entry_bar_time and not is_exit:
-        lines.append(f"Entry bar:  {entry_bar_time}")
+        acct_bits.append(f"Account: {e(str(account_name))}")
+    try:
+        if magic is not None and int(magic) != 0:
+            acct_bits.append(f"Magic {int(magic)}")
+    except (TypeError, ValueError):
+        pass
+    if acct_bits:
+        small.append(" · ".join(acct_bits))
+    bars = _bar_times_text(signal_bar_time, "" if is_exit else entry_bar_time)
+    if bars:
+        small.append(e(bars))
+    tail_bits = []
     if bot_name:
-        lines.append(f"Channel: {bot_name}")
-    if mt5_message and event != "DRY_RUN":
-        lines.append(f"Detail: {mt5_message}")
+        tail_bits.append(f"Bot: {e(str(bot_name))}")
+    if reason and event in ("ORDER", "EXIT") and reason != str(close_reason or "").strip():
+        tail_bits.append(f"MT5: {e(reason)}")
+    if tail_bits:
+        small.append(" · ".join(tail_bits))
+    if small:
+        lines.append(_SEPARATOR)
+        lines.extend(f"<i>{s}</i>" for s in small)
     return "\n".join(lines)
 
 
@@ -229,6 +364,7 @@ def send_message(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
+    parse_mode: str = "",
 ) -> Tuple[bool, str]:
     """
     POST to Telegram sendMessage with retries. Returns (success, detail).
@@ -236,7 +372,33 @@ def send_message(
     Uses certifi CA bundle when available. If SSL verify still fails
     (common with Windows AV MITM / frozen exe), retries once with an
     unverified context so Notification Manager tests remain usable.
+
+    parse_mode="HTML": if Telegram rejects the markup, the alert is re-sent as plain text.
     """
+    opts = dict(max_retries=max_retries, retry_delay_sec=retry_delay_sec, timeout_sec=timeout_sec)
+    ok, detail = _send(bot_token, chat_id, text, parse_mode=parse_mode, **opts)
+    if ok or not parse_mode or not _is_parse_error(detail):
+        return ok, detail
+    ok, plain_detail = _send(bot_token, chat_id, html_to_plain(text), parse_mode="", **opts)
+    if ok:
+        return True, f"sent as plain text (formatting rejected: {detail})"
+    return False, plain_detail
+
+
+def _is_parse_error(detail: str) -> bool:
+    return "can't parse entities" in str(detail or "").lower()
+
+
+def _send(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    *,
+    max_retries: int,
+    retry_delay_sec: float,
+    timeout_sec: float,
+    parse_mode: str,
+) -> Tuple[bool, str]:
     token = (bot_token or "").strip()
     cid = (chat_id or "").strip()
     if not token:
@@ -247,11 +409,14 @@ def send_message(
         return False, "Message text is empty"
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    body = urllib.parse.urlencode({
+    fields = {
         "chat_id": cid,
         "text": text,
         "disable_web_page_preview": "true",
-    }).encode("utf-8")
+    }
+    if parse_mode:
+        fields["parse_mode"] = parse_mode
+    body = urllib.parse.urlencode(fields).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=body,
@@ -334,6 +499,8 @@ def send_message(
                 except Exception as e2:
                     last_err = str(e2)
 
+        if parse_mode and _is_parse_error(last_err):
+            break
         if attempt < attempts:
             time.sleep(retry_delay_sec)
 
@@ -431,6 +598,7 @@ class TelegramNotifier:
         profit: Optional[float] = None,
         profit_currency: str = "",
         close_reason: str = "",
+        preset_name: str = "",
     ) -> None:
         with self._lock:
             enabled = self.enabled
@@ -463,6 +631,7 @@ class TelegramNotifier:
             profit=profit,
             profit_currency=profit_currency,
             close_reason=close_reason,
+            preset_name=preset_name,
         )
         threading.Thread(
             target=self._send_and_log,
@@ -484,6 +653,7 @@ class TelegramNotifier:
             text,
             max_retries=max_retries,
             retry_delay_sec=retry_delay,
+            parse_mode="HTML",
         )
         label = f"/{bot_name}" if bot_name else ""
         if ok:

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .telegram import ORDER_EVENTS, TelegramNotifier, format_order_alert
+from .telegram import ORDER_EVENTS, TelegramNotifier
 
 LogFn = Callable[[str], None]
 
@@ -275,6 +275,7 @@ class NotificationManager:
         profit: Optional[float] = None,
         profit_currency: str = "",
         close_reason: str = "",
+        preset_name: str = "",
     ) -> None:
         if event not in ORDER_EVENTS:
             return
@@ -336,13 +337,9 @@ class NotificationManager:
             profit=profit,
             profit_currency=profit_currency,
             close_reason=close_reason,
+            preset_name=preset_name,
         )
         for bot in targets:
-            text = format_order_alert(
-                event,
-                bot_name=bot.name,
-                **common,
-            )
             ev = NotificationEvent(
                 id=uuid.uuid4().hex[:12],
                 ts=datetime.now().isoformat(timespec="seconds"),
@@ -366,7 +363,6 @@ class NotificationManager:
                 bot_name=bot.name,
             )
             notifier.notify_order_event(event, **common)
-            _ = text
 
     def update_from_legacy_single(
         self,

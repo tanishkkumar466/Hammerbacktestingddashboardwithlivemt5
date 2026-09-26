@@ -78,7 +78,7 @@ from PySide6.QtWidgets import (
     QDockWidget, QInputDialog, QPlainTextEdit, QFormLayout,
     QAbstractItemView, QDialogButtonBox, QButtonGroup, QColorDialog, QRadioButton,
     QFileDialog, QTimeEdit, QTextBrowser, QToolButton, QToolTip,
-    QStackedWidget, QSpinBox, QListWidget, QListWidgetItem,
+    QStackedWidget, QSpinBox, QListWidget, QListWidgetItem, QTabBar,
 )
 
 import logic
@@ -121,7 +121,10 @@ from API.bindings import (
 )
 from API.fleet import DEFAULT_STAGGER_MS, FleetClient, build_fleet_plan_from_stores
 from API.algo_desk import start_api_trading_parallel, stop_api_trading
+from API.engine_process import EngineProcess
+from API.paths import prepare_portable_terminal
 from API.preset_meta import enabled_timeframes_from_preset, read_preset_file
+from API.runtime import shared_live_settings_from
 from API.service import HeadlessEngineClient, build_connect_payload, discover_mt5_path_windows
 
 try:
@@ -142,6 +145,9 @@ from live_journal import (
 )
 import live_accounts
 from live_account_ipc import AccountWorkerHandle, apply_worker_event
+import live_history
+from live_history_view import LiveHistoryDialog
+import session_state
 
 
 # ============================================================================
@@ -1131,11 +1137,25 @@ SELL_WICK_REQUIRE_FIELDS = [
     ("sell_require_wick", "Require wick shape?", FIELD_TYPE_CHECK, None),
 ]
 
+BUY_MIN_WICK_FIELDS = [
+    ("buy_min_lower_wick_enabled", "Min lower wick filter?", FIELD_TYPE_CHECK, None),
+    ("buy_min_lower_wick_pct", "Min lower wick % of range", FIELD_TYPE_TEXT, None),
+]
+SELL_MIN_WICK_FIELDS = [
+    ("sell_min_upper_wick_enabled", "Min upper wick filter?", FIELD_TYPE_CHECK, None),
+    ("sell_min_upper_wick_pct", "Min upper wick % of range", FIELD_TYPE_TEXT, None),
+]
+MIN_WICK_FIELD_PAIRS = (
+    ("buy_min_lower_wick_enabled", "buy_min_lower_wick_pct"),
+    ("sell_min_upper_wick_enabled", "sell_min_upper_wick_pct"),
+)
+
 HAMMER_WITH_CANDLES_SHAPE_FIELD_NAMES = {
     f[0] for f in (
         BUY_CONTEXT_BODY_FIELDS + SELL_CONTEXT_BODY_FIELDS
         + BUY_CONTEXT_WICK_FIELDS + SELL_CONTEXT_WICK_FIELDS
         + BUY_WICK_REQUIRE_FIELDS + SELL_WICK_REQUIRE_FIELDS
+        + BUY_MIN_WICK_FIELDS + SELL_MIN_WICK_FIELDS
     )
 }
 
@@ -1620,6 +1640,24 @@ FIELD_HELP: Dict[str, str] = {
         "On (default): SELL needs an inverted hammer (long upper wick) that closes red.\n"
         "Off: ignore wick shape AND signal candle color. SELL when the previous candle is GREEN "
         "and the signal body is at most Body % of range (e.g. Body % = 10)."
+    ),
+    "buy_min_lower_wick_enabled": (
+        "Extra BUY filter (off by default). On: the signal candle's LOWER wick must be at "
+        "least 'Min lower wick %' of the candle range (High − Low), otherwise the BUY is skipped.\n"
+        "Works with Require wick shape on or off. Used by Hammer with candles and Hammer with candle 35%."
+    ),
+    "buy_min_lower_wick_pct": (
+        "Minimum lower wick as % of range for BUY (e.g. 35 or 40). "
+        "Example: High 110, Low 100, body bottom 104 → lower wick 4 = 40% → passes at 35, fails at 45."
+    ),
+    "sell_min_upper_wick_enabled": (
+        "Extra SELL filter (off by default). On: the signal candle's UPPER wick must be at "
+        "least 'Min upper wick %' of the candle range (High − Low), otherwise the SELL is skipped.\n"
+        "Works with Require wick shape on or off. Used by Hammer with candles and Hammer with candle 35%."
+    ),
+    "sell_min_upper_wick_pct": (
+        "Minimum upper wick as % of range for SELL (e.g. 35 or 40). "
+        "Example: High 110, Low 100, body top 106 → upper wick 4 = 40% → passes at 35, fails at 45."
     ),
     "classic_red": "When a CLASSIC hammer (long lower wick) closes red: BUY, SELL, or NO (skip).",
     "inverted_green": "When an INVERTED hammer (long upper wick) closes green: BUY, SELL, or NO (skip).",
@@ -4466,6 +4504,16 @@ class ApiAccountDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def accept(self) -> None:
+        login = self.login_edit.text().strip()
+        if login and not login.isdigit():
+            QMessageBox.warning(
+                self, "Add account", "Login must be the numeric MT5 account number (digits only).",
+            )
+            self.login_edit.setFocus()
+            return
+        super().accept()
+
     def values(self) -> ApiAccount:
         base = self._account or ApiAccount.new()
         return ApiAccount(
@@ -4520,6 +4568,21 @@ class ApiStrategyAssignDialog(QDialog):
         self.magic_spin.setRange(1, 2_000_000_000)
         self.magic_spin.setValue(int(binding.magic) if binding else 1100)
         self.volume_edit = QLineEdit((binding.volume if binding else "") or "0.01")
+        self.order_mode_combo = QComboBox()
+        for mode_id, label in LIVE_ORDER_MODES:
+            self.order_mode_combo.addItem(label, mode_id)
+        saved_mode = str(getattr(binding, "order_mode", "market") or "market") if binding else "market"
+        mode_idx = self.order_mode_combo.findData(saved_mode)
+        self.order_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self.order_mode_combo.setToolTip(
+            "How this account enters when the strategy signals — same choices as the Live tab."
+        )
+        self.limit_offset_edit = QLineEdit(
+            f"{float(getattr(binding, 'limit_offset_points', 0.0) or 0.0):g}" if binding else "0"
+        )
+        self.limit_offset_edit.setToolTip("Points added to the limit price (Limit ± offset only).")
+        self.order_mode_combo.currentIndexChanged.connect(self._sync_offset_enabled)
+        self._sync_offset_enabled()
         self.enabled_cb = QCheckBox("Enabled")
         self.enabled_cb.setChecked(True if binding is None else bool(binding.enabled))
         self.dry_run_cb = QCheckBox("Dry-run (no real orders)")
@@ -4534,6 +4597,8 @@ class ApiStrategyAssignDialog(QDialog):
         form.addRow("Symbol", self.symbol_edit)
         form.addRow("Magic", self.magic_spin)
         form.addRow("Volume", self.volume_edit)
+        form.addRow("Order type", self.order_mode_combo)
+        form.addRow("Limit offset (points)", self.limit_offset_edit)
         form.addRow("", self.enabled_cb)
         form.addRow("", self.dry_run_cb)
         layout.addLayout(form)
@@ -4553,6 +4618,36 @@ class ApiStrategyAssignDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _sync_offset_enabled(self, *_args) -> None:
+        self.limit_offset_edit.setEnabled(self.order_mode_combo.currentData() == "limit_offset")
+
+    def _limit_offset_value(self) -> Optional[float]:
+        try:
+            return float(self.limit_offset_edit.text().strip().replace(",", ".") or "0")
+        except ValueError:
+            return None
+
+    def accept(self) -> None:
+        problem = ""
+        if self.order_mode_combo.currentData() == "limit_offset" and self._limit_offset_value() is None:
+            problem = "Limit offset must be a number of points (e.g. 20)."
+        elif not self.preset_combo.currentData():
+            problem = "Pick a preset (save one from Parameters first)."
+        elif not self.tf_combo.currentData():
+            problem = "This preset has no enabled timeframe — enable one and re-save the preset."
+        else:
+            raw = self.volume_edit.text().strip().replace(",", ".") or "0.01"
+            try:
+                ok = float(raw) > 0
+            except ValueError:
+                ok = False
+            if not ok:
+                problem = "Volume must be a number of lots above 0 (e.g. 0.01)."
+        if problem:
+            QMessageBox.warning(self, "Assign strategy", problem)
+            return
+        super().accept()
 
     def _fill_presets(self) -> None:
         self.preset_combo.clear()
@@ -4608,6 +4703,8 @@ class ApiStrategyAssignDialog(QDialog):
             b.id = base.id
         b.enabled = self.enabled_cb.isChecked()
         b.dry_run = self.dry_run_cb.isChecked()
+        b.order_mode = str(self.order_mode_combo.currentData() or "market")
+        b.limit_offset_points = self._limit_offset_value() or 0.0
         b.preset_saved_at = preset_saved
         return b
 
@@ -5769,6 +5866,11 @@ class BacktestDashboard(QMainWindow):
         self._api_account_store = load_api_accounts(API_ACCOUNTS_PATH)
         self._api_binding_store = load_api_bindings(API_BINDINGS_PATH)
         self._api_engine = HeadlessEngineClient()
+        self._api_engine_process = EngineProcess(
+            self._api_engine,
+            app_dir=APP_DIR,
+            log=lambda m: self._live_log(m, account_id=""),
+        )
         # Isolated strategy workers per API account (keys "api:<id>") — parallel to Live
         self._api_handles: Dict[str, AccountWorkerHandle] = {}
         # Migrate desk from older path under output/live/ if present and new path empty
@@ -5846,6 +5948,13 @@ class BacktestDashboard(QMainWindow):
         # Defer SQLite history fill — not needed for first paint
         QTimer.singleShot(0, self._refresh_run_history_table)
         QTimer.singleShot(0, self._restore_live_settings)
+        # After layout + preset list + post-show dock raise (100 ms) have run
+        self._session_restored = False
+        self._session_last_saved = ""
+        self._session_autosave = QTimer(self)
+        self._session_autosave.setInterval(30_000)
+        self._session_autosave.timeout.connect(lambda: self._save_session_state())
+        QTimer.singleShot(400, self._restore_session_state)
         # Flatten clock only needed once Live is in play; delay first ticks
         QTimer.singleShot(2500, self._flatten_timer.start)
 
@@ -5989,10 +6098,133 @@ class BacktestDashboard(QMainWindow):
                     pass
             QTimer.singleShot(0, self._sanitize_window_and_docks)
 
+    # ------------------------------------------------------------------
+    # LAST SESSION -- reopen where the user left off
+    # ------------------------------------------------------------------
+    def _front_dock_titles(self) -> List[str]:
+        titles = []
+        for bar in self.findChildren(QTabBar):
+            if bar.parent() is self and bar.count() and bar.currentIndex() >= 0:
+                titles.append(bar.tabText(bar.currentIndex()))
+        return titles
+
+    def _collect_session_state(self) -> Dict[str, Any]:
+        preset_combo = getattr(self, "preset_combo", None)
+        results_tabs = getattr(self, "results_tabs", None)
+        param_tabs = getattr(self, "parameter_tabs", None)
+        return {
+            "version": session_state.SESSION_VERSION,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "parameters": self._collect_preset_snapshot(),
+            "preset_file": str(preset_combo.currentData() or "") if preset_combo is not None else "",
+            "ui": {
+                "param_tab": param_tabs.tabText(param_tabs.currentIndex()) if param_tabs is not None else "",
+                "results_tab": results_tabs.tabText(results_tabs.currentIndex()) if results_tabs is not None else "",
+                "front_docks": self._front_dock_titles(),
+            },
+            "last_run": {
+                "output_dir": self.last_output_dir or "",
+                "plots_dir": self.last_plots_dir or "",
+            },
+        }
+
+    def _save_session_state(self, *, force: bool = False) -> None:
+        # Never overwrite the saved session with startup defaults before it was restored.
+        if not getattr(self, "_session_restored", False):
+            return
+        try:
+            state = self._collect_session_state()
+            key = session_state.comparable(state)
+            if not force and key == self._session_last_saved:
+                return
+            session_state.save_session(session_state.session_path(DEFAULT_OUTPUT_DIR), state)
+            self._session_last_saved = key
+        except Exception as e:
+            print(f"[session] save failed: {e}")
+
+    def _restore_session_state(self) -> None:
+        try:
+            data = session_state.load_session(session_state.session_path(DEFAULT_OUTPUT_DIR))
+            if data:
+                self._apply_session_state(data)
+        except Exception as e:
+            print(f"[session] restore failed: {e}")
+        finally:
+            self._session_restored = True
+            try:
+                self._session_last_saved = session_state.comparable(self._collect_session_state())
+            except Exception:
+                self._session_last_saved = ""
+            self._session_autosave.start()
+
+    def _apply_session_state(self, data: Dict[str, Any]) -> None:
+        preset_file = str(data.get("preset_file") or "")
+        combo = getattr(self, "preset_combo", None)
+        if preset_file and combo is not None:
+            idx = combo.findData(preset_file)
+            if idx >= 0:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+
+        params = data.get("parameters")
+        if isinstance(params, dict) and params:
+            try:
+                self._apply_preset_snapshot(params)
+            except Exception as e:
+                print(f"[session] parameters not restored: {e}")
+
+        ui = data.get("ui") or {}
+        param_tabs = getattr(self, "parameter_tabs", None)
+        if param_tabs is not None and ui.get("param_tab"):
+            for i in range(param_tabs.count()):
+                if param_tabs.tabText(i) == ui["param_tab"] and param_tabs.isTabVisible(i):
+                    param_tabs.setCurrentIndex(i)
+                    break
+
+        last_run = data.get("last_run") or {}
+        output_dir = str(last_run.get("output_dir") or "")
+        tables = session_state.load_run_tables(output_dir)
+        if tables is not None:
+            plots_dir = str(last_run.get("plots_dir") or "")
+            self.last_output_dir = output_dir
+            self.last_plots_dir = plots_dir or None
+            self.last_tables = tables
+            self.last_trade_ledger_path = os.path.join(output_dir, "trade_ledger.csv")
+            self.last_backtest_config = session_state.load_run_config(
+                session_state.run_config_path(DEFAULT_OUTPUT_DIR)
+            )
+            self._display_metrics(tables)
+            self._display_charts(plots_dir)
+
+        results_tabs = getattr(self, "results_tabs", None)
+        if results_tabs is not None and ui.get("results_tab"):
+            for i in range(results_tabs.count()):
+                if results_tabs.tabText(i) == ui["results_tab"]:
+                    results_tabs.setCurrentIndex(i)
+                    break
+
+        docks = {d.windowTitle(): d for d in self.findChildren(QDockWidget)}
+        for title in ui.get("front_docks") or []:
+            dock = docks.get(title)
+            if dock is not None and _qt_widget_valid(dock):
+                self._bring_dock_to_front(dock)
+
+        saved_at = str(data.get("saved_at") or "").replace("T", " ")
+        run_note = " and last backtest results" if tables is not None else ""
+        self._set_app_status(f"Restored your last session{run_note} (saved {saved_at}).")
+
     def closeEvent(self, event):
+        self._save_session_state(force=True)
         self._stop_live_trading()
         try:
             stop_api_trading(getattr(self, "_api_handles", {}))
+        except Exception:
+            pass
+        try:
+            engine_proc = getattr(self, "_api_engine_process", None)
+            if engine_proc is not None:
+                engine_proc.stop()
         except Exception:
             pass
         for handle in list(self._account_handles.values()):
@@ -6485,6 +6717,50 @@ class BacktestDashboard(QMainWindow):
         open_data.triggered.connect(self._open_data_folder_menu)
         fetch_menu.addAction(open_data)
 
+    def _build_history_menu(self):
+        """Top-level History menu — every Live trade with its entry / SL / TP breakdown."""
+        menu_bar = self.menuBar()
+        history_menu = menu_bar.addMenu("History")
+        open_hist = QAction("Live trade history…", self)
+        open_hist.setShortcut(QKeySequence("Ctrl+Shift+H"))
+        open_hist.setShortcutContext(Qt.ApplicationShortcut)
+        open_hist.setToolTip(
+            "All Live orders, exits, dry runs, errors and skipped setups per account/slot, "
+            "with how entry and SL (candle low/high ± buffer) came from the preset."
+        )
+        open_hist.triggered.connect(self._open_live_history)
+        history_menu.addAction(open_hist)
+        export_hist = QAction("Export Live history to Excel…", self)
+        export_hist.setToolTip("Opens Live trade history and exports the listed rows to .xlsx.")
+        export_hist.triggered.connect(self._export_live_history_from_menu)
+        history_menu.addAction(export_hist)
+        history_menu.addSeparator()
+        open_logs = QAction("Open logs folder", self)
+        open_logs.triggered.connect(self._open_logs_folder)
+        history_menu.addAction(open_logs)
+
+    def _open_live_history(self):
+        dlg = getattr(self, "_live_history_dialog", None)
+        if dlg is None or not _qt_widget_valid(dlg):
+            dlg = LiveHistoryDialog(
+                self,
+                APP_DIR,
+                open_logs=self._open_logs_folder,
+                open_folder=self._open_folder,
+                export_dir=DEFAULT_OUTPUT_DIR,
+                settings=getattr(self, "_settings", None),
+            )
+            self._live_history_dialog = dlg
+        else:
+            dlg.reload()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _export_live_history_from_menu(self):
+        self._open_live_history()
+        self._live_history_dialog.export_to_excel()
+
     def _open_fetch_data_dialog(self):
         dlg = FetchDataDialog(self)
         dlg.exec()
@@ -6638,6 +6914,7 @@ class BacktestDashboard(QMainWindow):
         self._build_live_menu()
         self._build_notifications_menu()
         self._build_fetch_menu()
+        self._build_history_menu()
         run_menu = menu_bar.addMenu("Run")
 
         run_action = QAction("Run Backtest", self)
@@ -6756,6 +7033,7 @@ class BacktestDashboard(QMainWindow):
             "F9   Toggle Live Trading panel\n"
             "Notifications → Notification Manager   Telegram + per-slot alerts\n"
             "Fetch → Fetch / update data from MT5   History CSVs\n"
+            "Ctrl+Shift+H   History → Live trade history (entry / SL + buffer / errors per trade)\n"
             "Live → Performance   Dry run, thread pool, Ray (advanced)\n"
             "F1   This help\n\n"
             "Help → Parameter Guide — which tabs affect signals vs backtest sizing vs live.\n\n"
@@ -7255,7 +7533,10 @@ class BacktestDashboard(QMainWindow):
             "Only Body % counts. Signal color does not matter. "
             "Previous candle: red → BUY, green → SELL.\n"
             "Checked (default): classic long lower wick for BUY, inverted long upper wick for SELL "
-            "(that is when the 60% ± 18% band applies).",
+            "(that is when the 60% ± 18% band applies).\n"
+            "Min wick filter (optional, off by default): BUY lower wick / SELL upper wick must be "
+            "at least the % you set (e.g. 35 or 40) of the candle range. Works with wick shape on or off. "
+            "Applies to Hammer with candles and Hammer with candle 35%.",
             label="How Wicks works (Hammer with candles)",
         )
         layout.addWidget(self._hwc_wicks_hint)
@@ -7266,7 +7547,8 @@ class BacktestDashboard(QMainWindow):
         buy_grid.setHorizontalSpacing(20)
         buy_grid.setVerticalSpacing(10)
         self._add_fields_to_grid(
-            buy_grid, BUY_WICK_REQUIRE_FIELDS + BUY_CONTEXT_WICK_FIELDS, defaults_context,
+            buy_grid, BUY_MIN_WICK_FIELDS + BUY_WICK_REQUIRE_FIELDS + BUY_CONTEXT_WICK_FIELDS,
+            defaults_context,
             live_preview=True, columns_per_row=2,
         )
         layout.addWidget(buy_box)
@@ -7278,7 +7560,8 @@ class BacktestDashboard(QMainWindow):
         sell_grid.setHorizontalSpacing(20)
         sell_grid.setVerticalSpacing(10)
         self._add_fields_to_grid(
-            sell_grid, SELL_WICK_REQUIRE_FIELDS + SELL_CONTEXT_WICK_FIELDS, defaults_context,
+            sell_grid, SELL_MIN_WICK_FIELDS + SELL_WICK_REQUIRE_FIELDS + SELL_CONTEXT_WICK_FIELDS,
+            defaults_context,
             live_preview=True, columns_per_row=2,
         )
         layout.addWidget(sell_box)
@@ -7345,8 +7628,14 @@ class BacktestDashboard(QMainWindow):
         if getattr(self, "_wick_req_wired", False):
             for side in ("buy", "sell"):
                 self._refresh_side_wick_fields_enabled(side)
+            self._refresh_min_wick_fields_enabled()
             return
         self._wick_req_wired = True
+        for chk_name, _pct_name in MIN_WICK_FIELD_PAIRS:
+            chk = self.field_widgets.get(chk_name)
+            if chk is not None:
+                chk.stateChanged.connect(lambda _state: self._refresh_min_wick_fields_enabled())
+        self._refresh_min_wick_fields_enabled()
         for side in ("buy", "sell"):
             chk = self.field_widgets.get(f"{side}_require_wick")
             if chk is None:
@@ -7356,6 +7645,14 @@ class BacktestDashboard(QMainWindow):
             )
             chk.stateChanged.connect(self._redraw_candle_preview)
             self._refresh_side_wick_fields_enabled(side)
+
+    def _refresh_min_wick_fields_enabled(self):
+        for chk_name, pct_name in MIN_WICK_FIELD_PAIRS:
+            chk = self.field_widgets.get(chk_name)
+            on = chk is not None and chk.isChecked()
+            for widget in (self.field_widgets.get(pct_name), self.field_labels.get(pct_name)):
+                if widget is not None:
+                    widget.setEnabled(on)
 
     def _refresh_side_wick_fields_enabled(self, side: str):
         chk = self.field_widgets.get(f"{side}_require_wick")
@@ -7631,6 +7928,10 @@ class BacktestDashboard(QMainWindow):
             self.field_labels[name] = label
 
             if ftype == FIELD_TYPE_TEXT:
+                # Context-tab pullback: start at 35 so Hammer with candle 35% never
+                # silently runs as a market entry (plain HWC forces 0 in its builder).
+                if name == "entry_pullback_pct":
+                    default_val = hammer_context_logic.DEFAULT_PULLBACK_PCT_35
                 widget = QLineEdit(str(default_val))
                 widget.setToolTip(help_text)
                 if live_preview:
@@ -9684,6 +9985,9 @@ class BacktestDashboard(QMainWindow):
             bind = self._primary_binding_for_account(acc.id)
             strat = (bind.preset_file if bind else "") or "—"
             tf = (bind.timeframe if bind else "") or "—"
+            if bind is not None:
+                order_label = {"market": "Market", "limit_entry": "Limit", "limit_offset": "Limit±offset"}
+                tf = f"{tf} · {order_label.get(bind.order_mode, 'Market')}"
             for col, text in enumerate(
                 [
                     acc.name,
@@ -9827,12 +10131,20 @@ class BacktestDashboard(QMainWindow):
             engine=getattr(self, "_api_engine", None) or HeadlessEngineClient(),
             stagger_ms=DEFAULT_STAGGER_MS,
             log=lambda m: self._live_log(m, account_id=""),
+            shared_live_settings=shared_live_settings_from(self._build_live_run_config()),
+            ensure_engine=self._api_engine_process.ensure_running,
         )
         self._on_api_engine_ping()
         # Poll API worker events with Live workers
         if hasattr(self, "_live_health_timer") and not self._live_health_timer.isActive():
             self._live_health_timer.start()
-        QMessageBox.information(self, "API Accounts", result.message)
+        if result.ok and not result.warnings:
+            QMessageBox.information(self, "API Accounts", result.message)
+        else:
+            body = result.message
+            if result.warnings:
+                body += "\n\n" + "\n\n".join(result.warnings)
+            QMessageBox.warning(self, "API Accounts", body)
         self._set_app_status(result.message)
 
     def _on_stop_api_trading(self) -> None:
@@ -9898,14 +10210,15 @@ class BacktestDashboard(QMainWindow):
         label = getattr(self, "api_engine_status", None)
         client = getattr(self, "_api_engine", None) or HeadlessEngineClient()
         status = client.health()
+        online = status.reachable and status.ok
         if label is not None and _qt_widget_valid(label):
-            if status.reachable:
+            if online:
                 msg = "API service: online"
             else:
-                msg = "API service: offline — start the local API service, then Connect"
+                msg = "API service: starts automatically when you Connect or Start trading"
             label.setText(msg)
             label.setToolTip(status.detail or status.message)
-            label.setProperty("tone", "connected" if status.reachable else "idle")
+            label.setProperty("tone", "connected" if online else "idle")
         return status
 
     def _on_connect_api_account(self) -> None:
@@ -9942,6 +10255,15 @@ class BacktestDashboard(QMainWindow):
             return
         # Normalize legacy cloud rows to broker API on connect.
         acc.kind = KIND_HEADLESS
+        eng_st = self._api_engine_process.ensure_running()
+        if not (eng_st.reachable and eng_st.ok):
+            self._on_api_engine_ping()
+            QMessageBox.warning(
+                self, "API Accounts", f"MT5 API engine not available.\n{eng_st.message}",
+            )
+            return
+        _portable, note = prepare_portable_terminal(acc.id, runtime_path)
+        self._live_log(f"[API] {acc.name}: {note}", account_id="")
         payload = build_connect_payload(
             account_id=acc.id,
             name=acc.name,
@@ -9952,18 +10274,18 @@ class BacktestDashboard(QMainWindow):
         )
         status = client.request_connect_account(payload)
         self._on_api_engine_ping()
-        if status.reachable and "false" not in (status.detail or "").lower()[:40]:
+        if status.reachable and status.ok:
             QMessageBox.information(
                 self,
                 "API Accounts",
-                f"Connected: {acc.name}\n{acc.display_target()}",
+                f"Terminal opened for {acc.name}\n{acc.display_target()}\n"
+                "Start trading logs in and runs the assigned strategy.",
             )
         else:
-            QMessageBox.information(
+            QMessageBox.warning(
                 self,
                 "API Accounts",
-                "Could not connect this account.\n"
-                "Make sure the local API service is running, then try again.",
+                f"Could not open the terminal for this account.\n{status.message}",
             )
 
     def _on_disconnect_api_account(self) -> None:
@@ -11490,15 +11812,19 @@ class BacktestDashboard(QMainWindow):
                         buy_shape = (
                             f"body ≤ {buy_hi:g}% (color ignored; prev red → BUY)"
                         )
+                    if getattr(cfg, "buy_min_lower_wick_enabled", False):
+                        buy_shape += f" + lower wick ≥ {cfg.buy_min_lower_wick_pct:g}%"
                     rows.append(("BUY setup", f"{buy_shape} + {buy_ctx}"))
                 if getattr(cfg, "enable_sell", True):
                     if getattr(cfg, "sell_require_wick", True):
                         sell_shape = "inverted red hammer"
                     else:
-                        sell_hi = hammer_context_logic.body_only_max_pct(cfg.sell_hammer_limits)
+                        sell_hi = hammer_context_logic.body_only_max_pct(cfg.sell_hammer_ratios)
                         sell_shape = (
                             f"body ≤ {sell_hi:g}% (color ignored; prev green → SELL)"
                         )
+                    if getattr(cfg, "sell_min_upper_wick_enabled", False):
+                        sell_shape += f" + upper wick ≥ {cfg.sell_min_upper_wick_pct:g}%"
                     rows.append(("SELL setup", f"{sell_shape} + {sell_ctx}"))
 
                 c_rule = logic.coerce_entry_rule(cfg.entry_rule)
@@ -13154,6 +13480,7 @@ class BacktestDashboard(QMainWindow):
                 notify_enabled=bool(getattr(slot, "notify_enabled", True)),
                 slot_id=str(slot.id),
                 slot_name=str(slot.name or ""),
+                preset_name=str(getattr(slot, "preset_file", "") or "") or "Parameters panel",
                 account_id=str(slot.account_id or getattr(live_cfg, "account_id", "") or ""),
                 account_name=(
                     acc.name if acc is not None else getattr(live_cfg, "account_name", "") or ""
@@ -13287,6 +13614,15 @@ class BacktestDashboard(QMainWindow):
                 "WARNING: Entry uses NEXT_CANDLE_CLOSE — live evaluates the forming bar "
                 "(close not final). Prefer NEXT_CANDLE_OPEN for live/backtest parity."
             )
+        offset_warning = live_history.entry_offset_ignored_warning(
+            strategy_config,
+            pattern_type,
+            live_cfg.order_mode,
+            bool(getattr(live_cfg, "limit_offset_from_market", True)),
+        )
+        if offset_warning:
+            preflight.insert(0, offset_warning + "\n")
+            self._live_log(f"[Start] {slot.name}: {offset_warning}")
 
         if pattern_type == "hammer":
             preflight.append(f"Direction: {logic.describe_hammer_direction_matrix(strategy_config)}")
@@ -14494,6 +14830,8 @@ class BacktestDashboard(QMainWindow):
                 "sell_require_wick", defaults.sell_require_wick, FIELD_TYPE_CHECK,
             ),
         }
+        for name, _, ftype, _ in BUY_MIN_WICK_FIELDS + SELL_MIN_WICK_FIELDS:
+            kwargs[name] = self._read_ui_field(name, getattr(defaults, name), ftype)
 
         for name, _, ftype, _ in CONTEXT_PATTERN_FIELDS:
             attr = CONTEXT_UI_ATTR_OVERRIDES.get(name, name)
@@ -14745,17 +15083,39 @@ class BacktestDashboard(QMainWindow):
             f"Done. {db_summary}",
             tooltip=f"Output: {output_dir}\n{db_detail}",
         )
-        if hasattr(self, "results_tabs"):
-            # Metrics first so clients see numbers before charts / equity curves
+        self._show_results_metrics()
+        # Again after queued UI work so nothing lands on top of Results → Metrics.
+        QTimer.singleShot(0, self._show_results_metrics)
+        if self.last_backtest_config is not None:
+            session_state.save_run_config(
+                session_state.run_config_path(DEFAULT_OUTPUT_DIR), self.last_backtest_config,
+            )
+        QTimer.singleShot(0, lambda: self._save_session_state(force=True))
+
+    def _show_results_metrics(self) -> None:
+        """Results panel in front, Metrics tab selected (numbers before charts)."""
+        if hasattr(self, "results_tabs") and _qt_widget_valid(self.results_tabs):
             for i in range(self.results_tabs.count()):
                 if self.results_tabs.tabText(i) == "Metrics":
                     self.results_tabs.setCurrentIndex(i)
                     break
             else:
                 self.results_tabs.setCurrentIndex(0)
-        if hasattr(self, "results_dock"):
-            self.results_dock.show()
-            self.results_dock.raise_()
+        if hasattr(self, "results_dock") and _qt_widget_valid(self.results_dock):
+            self._bring_dock_to_front(self.results_dock)
+
+    def _bring_dock_to_front(self, dock: QDockWidget) -> None:
+        """raise_() alone does not switch tabbed docks on every platform — select its tab too."""
+        dock.show()
+        dock.raise_()
+        title = dock.windowTitle()
+        for bar in self.findChildren(QTabBar):
+            if bar.parent() is not self:
+                continue
+            for i in range(bar.count()):
+                if bar.tabText(i) == title:
+                    bar.setCurrentIndex(i)
+                    return
 
     def _save_run_to_database(self, tables, output_dir: str, plots_dir: str):
         """Returns (short_summary_for_status_bar, full_detail_for_tooltip)."""
@@ -16116,6 +16476,10 @@ class BacktestDashboard(QMainWindow):
                 "enable_sell": cfg.enable_sell,
                 "buy_require_wick": cfg.buy_require_wick,
                 "sell_require_wick": cfg.sell_require_wick,
+                "buy_min_lower_wick_enabled": cfg.buy_min_lower_wick_enabled,
+                "buy_min_lower_wick_pct": cfg.buy_min_lower_wick_pct,
+                "sell_min_upper_wick_enabled": cfg.sell_min_upper_wick_enabled,
+                "sell_min_upper_wick_pct": cfg.sell_min_upper_wick_pct,
                 "entry_pullback_pct": cfg.entry_pullback_pct,
                 "buy_body_pct": buy.body_pct,
                 "buy_dominant_wick_pct": buy.dominant_wick_pct,

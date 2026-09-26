@@ -15,6 +15,21 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
+ORDER_MODES = ("market", "limit_entry", "limit_offset")
+
+
+def coerce_order_mode(raw: Any) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in ORDER_MODES else "market"
+
+
+def _float_or(raw: Any, default: float) -> float:
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -36,6 +51,9 @@ class StrategyBinding:
     volume: str = "0.01"
     enabled: bool = True
     dry_run: bool = True  # paper by default; uncheck when ready for real orders
+    # Same choices as the Live tab Order type: market | limit_entry | limit_offset
+    order_mode: str = "market"
+    limit_offset_points: float = 0.0
     notes: str = ""
     # When this binding was last saved / assigned
     updated_at: str = ""
@@ -112,6 +130,8 @@ def binding_to_dict(b: StrategyBinding) -> Dict[str, Any]:
         "volume": b.volume,
         "enabled": bool(b.enabled),
         "dry_run": bool(getattr(b, "dry_run", True)),
+        "order_mode": coerce_order_mode(b.order_mode),
+        "limit_offset_points": float(b.limit_offset_points or 0.0),
         "notes": b.notes,
         "updated_at": b.updated_at,
         "preset_saved_at": b.preset_saved_at,
@@ -129,6 +149,8 @@ def binding_from_dict(row: Dict[str, Any]) -> StrategyBinding:
         volume=str(row.get("volume") or "0.01"),
         enabled=bool(row.get("enabled", True)),
         dry_run=bool(row["dry_run"]) if "dry_run" in row else True,
+        order_mode=coerce_order_mode(row.get("order_mode")),
+        limit_offset_points=_float_or(row.get("limit_offset_points"), 0.0),
         notes=str(row.get("notes") or "").strip(),
         updated_at=str(row.get("updated_at") or "").strip(),
         preset_saved_at=str(row.get("preset_saved_at") or "").strip(),

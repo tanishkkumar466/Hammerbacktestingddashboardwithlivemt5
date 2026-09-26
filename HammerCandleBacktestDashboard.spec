@@ -50,6 +50,17 @@ else:
     except OSError as exc:
         print(f"[spec] could not write embed marker: {exc}")
 
+# C++ MT5 API engine (API Accounts desk). CI builds it with CMake before this spec
+# and sets HAMMER_REQUIRE_ENGINE=1 so a release can never ship without it.
+_engine_exe = ROOT / "API" / "engine" / "build" / "Release" / "hammer_mt5_engine.exe"
+if _engine_exe.is_file():
+    datas.append((str(_engine_exe), "API/engine"))
+    print(f"[spec] bundling MT5 API engine: {_engine_exe} ({_engine_exe.stat().st_size} bytes)")
+elif os.environ.get("HAMMER_REQUIRE_ENGINE") == "1":
+    raise SystemExit(f"[spec] FATAL: {_engine_exe} missing — build API/engine first")
+else:
+    print("[spec] WARNING: hammer_mt5_engine.exe not built — API Accounts cannot start trading")
+
 # Every pip package — keep in sync with requirements-build.txt
 # NOTE: do NOT collect_all("google") — pulls conflicting native DLLs and breaks startup.
 _ALL_PACKAGES = (
@@ -85,12 +96,12 @@ hiddenimports = [
     # --- app modules ---
     "dashboard", "backtest", "plotting", "logic", "doji_logic", "broker",     "live",
     "live_accounts", "live_account_ipc", "live_account_worker",
-    "live_journal", "fetch", "sessions", "hammer_context_logic",
+    "live_journal", "live_history", "live_history_view", "session_state", "fetch", "sessions", "hammer_context_logic",
     "strategy", "strategy.logic", "strategy.doji_logic",
     "strategy.hammer_context_logic", "strategy.hammer_context_core",
     "strategy.hammer_with_candles_logic", "strategy.hammer_with_candles_35_logic",
     "hammer_with_candles_logic", "hammer_with_candles_35_logic",
-    "API", "API.accounts", "API.algo_desk", "API.bindings", "API.fleet", "API.paths",
+    "API", "API.accounts", "API.algo_desk", "API.bindings", "API.engine_process", "API.fleet", "API.paths",
     "API.preset_meta", "API.runtime", "API.service",
     "notification", "notification.telegram", "notification.workers",
     "notification.manager", "notification.store",

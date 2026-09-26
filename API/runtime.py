@@ -12,10 +12,12 @@ API Accounts reuse Live’s worker + engine; they do NOT use C++ /orders/batch f
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+import doji_logic
 import hammer_context_logic as hc
 import live as live_trading
 import logic
@@ -30,7 +32,8 @@ from indicators.config import (
 )
 
 from .accounts import ApiAccount
-from .bindings import StrategyBinding
+from .bindings import StrategyBinding, coerce_order_mode
+from .paths import is_isolated_terminal_path
 from .preset_meta import read_preset_file
 
 
@@ -163,6 +166,10 @@ def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
         enable_sell=_bool(_f(fields, "context_enable_sell"), True),
         buy_require_wick=_bool(_f(fields, "buy_require_wick"), True),
         sell_require_wick=_bool(_f(fields, "sell_require_wick"), True),
+        buy_min_lower_wick_enabled=_bool(_f(fields, "buy_min_lower_wick_enabled"), False),
+        buy_min_lower_wick_pct=_float(_f(fields, "buy_min_lower_wick_pct"), 35.0),
+        sell_min_upper_wick_enabled=_bool(_f(fields, "sell_min_upper_wick_enabled"), False),
+        sell_min_upper_wick_pct=_float(_f(fields, "sell_min_upper_wick_pct"), 35.0),
         entry_rule=logic.coerce_entry_rule(_f(fields, "entry_rule", "NEXT_CANDLE_OPEN")),
         entry_offset=_float(_f(fields, "entry_offset"), 0.0),
         entry_pullback_pct=pull,
@@ -190,6 +197,49 @@ def build_hammer_context_strategy(data: dict) -> hc.HammerContextConfig:
     )
 
 
+def _enum(enum_cls, raw, default):
+    try:
+        return enum_cls(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def build_doji_strategy(data: dict) -> doji_logic.DojiStrategyConfig:
+    fields = data.get("fields") or {}
+    rd = doji_logic.DojiRatioConfig()
+    ratios = doji_logic.DojiRatioConfig(**{
+        f.name: _float(_f(fields, f"doji_{f.name}"), getattr(rd, f.name))
+        for f in dataclasses.fields(doji_logic.DojiRatioConfig)
+    })
+    d = doji_logic.DojiStrategyConfig()
+    return doji_logic.DojiStrategyConfig(
+        doji_ratios=ratios,
+        doji_style=_enum(doji_logic.DojiStyle, _f(fields, "doji_style"), d.doji_style),
+        doji_direction_mode=_enum(
+            doji_logic.DojiDirectionMode, _f(fields, "doji_direction_mode"), d.doji_direction_mode,
+        ),
+        fallback_direction=_enum(
+            logic.TradeDirection, _f(fields, "doji_fallback_direction"), d.fallback_direction,
+        ),
+        green_direction=_enum(logic.TradeDirection, _f(fields, "doji_green_direction"), d.green_direction),
+        red_direction=_enum(logic.TradeDirection, _f(fields, "doji_red_direction"), d.red_direction),
+        allow_green_trades=_bool(_f(fields, "doji_allow_green_trades"), d.allow_green_trades),
+        allow_red_trades=_bool(_f(fields, "doji_allow_red_trades"), d.allow_red_trades),
+        entry_rule=_enum(logic.EntryRule, _f(fields, "entry_rule"), d.entry_rule),
+        entry_offset=_float(_f(fields, "entry_offset"), d.entry_offset),
+        sl_mode=_enum(logic.StopLossMode, _f(fields, "sl_mode"), d.sl_mode),
+        sl_fixed_distance=_float(_f(fields, "sl_fixed_distance"), d.sl_fixed_distance),
+        buffer_mode=_enum(logic.BufferMode, _f(fields, "buffer_mode"), d.buffer_mode),
+        sl_buffer_pct=_float(_f(fields, "sl_buffer_pct"), d.sl_buffer_pct),
+        sl_buffer_flat=_float(_f(fields, "sl_buffer_flat"), d.sl_buffer_flat),
+        timeframe_settings=_timeframes_from_preset(data),
+        enable_risk_limit=_bool(_f(fields, "enable_risk_limit"), d.enable_risk_limit),
+        reject_zero_or_negative_risk=_bool(
+            _f(fields, "reject_zero_or_negative_risk"), d.reject_zero_or_negative_risk,
+        ),
+    )
+
+
 def build_indicator_stack(data: dict) -> IndicatorStackConfig:
     fields = data.get("fields") or {}
     inds = data.get("indicators") or {}
@@ -198,6 +248,9 @@ def build_indicator_stack(data: dict) -> IndicatorStackConfig:
     rv = inds.get("rolling_vwap") or {}
     rsi = inds.get("rsi") or {}
     added = set(data.get("indicators_added") or [])
+    from indicators.rolling_vwap import coerce_rolling_period
+    from indicators.rsi import coerce_rsi_level, coerce_rsi_period
+
     combine = str(
         _f(fields, "indicators_combine_mode", inds.get("combine_mode", "ALL")) or "ALL"
     )
@@ -219,7 +272,9 @@ def build_indicator_stack(data: dict) -> IndicatorStackConfig:
         ),
         rolling_vwap=RollingVWAPConfig(
             enabled="rolling_vwap" in added or _bool(rv.get("enabled"), False),
-            period=_int(_f(fields, "indicators_rolling_vwap_period", rv.get("period")), 20),
+            period=coerce_rolling_period(
+                _int(_f(fields, "indicators_rolling_vwap_period", rv.get("period")), 20)
+            ),
             apply_trade_filter=_bool(
                 _f(fields, "indicators_rolling_vwap_apply_filter", rv.get("apply_trade_filter")),
                 True,
@@ -227,9 +282,13 @@ def build_indicator_stack(data: dict) -> IndicatorStackConfig:
         ),
         rsi=RSIConfig(
             enabled="rsi" in added or _bool(rsi.get("enabled"), False),
-            period=_int(_f(fields, "indicators_rsi_period", rsi.get("period")), 14),
-            buy_above=_float(_f(fields, "indicators_rsi_buy_above", rsi.get("buy_above")), 50.0),
-            sell_below=_float(_f(fields, "indicators_rsi_sell_below", rsi.get("sell_below")), 60.0),
+            period=coerce_rsi_period(_int(_f(fields, "indicators_rsi_period", rsi.get("period")), 14)),
+            buy_above=coerce_rsi_level(
+                _float(_f(fields, "indicators_rsi_buy_above", rsi.get("buy_above")), 50.0), 50.0
+            ),
+            sell_below=coerce_rsi_level(
+                _float(_f(fields, "indicators_rsi_sell_below", rsi.get("sell_below")), 60.0), 60.0
+            ),
             apply_trade_filter=_bool(
                 _f(fields, "indicators_rsi_apply_filter", rsi.get("apply_trade_filter")), True
             ),
@@ -244,7 +303,7 @@ def strategy_from_preset(data: dict) -> Tuple[str, str, Any, IndicatorStackConfi
     if hc.is_context_pattern_label(pattern):
         return pattern, hc.pattern_type_for_label(pattern), build_hammer_context_strategy(data), stack
     if pattern == "Doji":
-        raise ValueError("Doji presets are not supported on the API trading desk yet — use Live.")
+        return pattern, "doji", build_doji_strategy(data), stack
     return pattern, "hammer", build_hammer_strategy(data), stack
 
 
@@ -260,7 +319,33 @@ def credentials_for_api_account(
         login=login,
         password=acc.password or "",
         server=(acc.server or "").strip(),
+        portable=is_isolated_terminal_path(path),
     )
+
+
+SHARED_LIVE_SETTING_KEYS = frozenset({
+    "max_open_positions",
+    "max_daily_trades",
+    "max_daily_loss_usd",
+    "min_minutes_between_trades",
+    "max_spread_points",
+    "demo_accounts_only",
+    "max_lot_size",
+    "price_deviation_points",
+    "max_entry_deviation_points",
+    "fallback_to_market_on_limit_fail",
+    "poll_interval_sec",
+    "history_bars",
+    "telegram_enabled",
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "notification_bots",
+})
+
+
+def shared_live_settings_from(live_cfg: Any) -> Dict[str, Any]:
+    """Pick the Live-tab safety + notification settings that API accounts share."""
+    return {k: getattr(live_cfg, k) for k in SHARED_LIVE_SETTING_KEYS if hasattr(live_cfg, k)}
 
 
 @dataclass
@@ -285,13 +370,19 @@ def build_api_trade_start(
     terminal_path: str = "",
     journal_dir: str = "",
     dry_run: Optional[bool] = None,
+    shared_live_settings: Optional[Dict[str, Any]] = None,
 ) -> ApiTradeStart:
     """
     Build a full Live-compatible start payload from an API account + strategy binding.
     Orders will go through MT5Broker.order_send inside the account worker.
+
+    shared_live_settings: safety limits / notifications from the Live tab
+    (keys in SHARED_LIVE_SETTING_KEYS); missing keys keep the defaults below.
     """
     if not (acc.login or "").strip() or not (acc.server or "").strip():
         raise ValueError("API account needs login and server.")
+    if not acc.login.strip().isdigit():
+        raise ValueError(f"Login '{acc.login.strip()}' must be the numeric MT5 account number.")
     if not (acc.password or "").strip():
         raise ValueError("Enter the account password (session) before Start trading.")
     if not (binding.preset_file or "").strip():
@@ -310,10 +401,13 @@ def build_api_trade_start(
         # Still allow start — RR/SL may fall back; warn via caller
         pass
 
+    raw_volume = str(binding.volume or "0.01").strip().replace(",", ".")
     try:
-        volume = float(binding.volume or "0.01")
+        volume = float(raw_volume)
     except (TypeError, ValueError):
-        volume = 0.01
+        raise ValueError(f"Volume '{binding.volume}' is not a number (lots, e.g. 0.01).") from None
+    if not volume > 0:
+        raise ValueError(f"Volume must be above 0 lots (got {binding.volume}).")
 
     sess = data.get("sessions") or {}
     sessions_enabled = [
@@ -339,7 +433,8 @@ def build_api_trade_start(
         use_thread_pool_signal_cpu=True,
         use_ray_if_available=False,
         journal_dir=(journal_dir or "").strip(),
-        order_mode="market",
+        order_mode=coerce_order_mode(getattr(binding, "order_mode", "market")),
+        limit_offset_points=float(getattr(binding, "limit_offset_points", 0.0) or 0.0),
         order_comment=f"API-{acc.name[:12]}"[:31],
         sessions_enabled=sessions_enabled or None,
         session_clock=str(sess.get("session_clock") or "broker"),
@@ -348,10 +443,17 @@ def build_api_trade_start(
         ist_time_end=str(sess.get("ist_time_end") or "23:59"),
         slot_id=api_slot_id(binding.id),
         slot_name=f"{acc.name}/{binding.timeframe}",
+        preset_name=str(binding.preset_file or ""),
         account_id=acc.id,
         account_name=acc.name,
         notify_enabled=True,
     )
+    for key, value in (shared_live_settings or {}).items():
+        if key in SHARED_LIVE_SETTING_KEYS:
+            setattr(live_cfg, key, value)
+    risk_err = live_trading.validate_risk_config(live_cfg, real_money=not use_dry)
+    if risk_err:
+        raise ValueError(f"{risk_err} (Live tab safety limits apply to API accounts.)")
 
     return ApiTradeStart(
         worker_key=api_worker_key(acc.id),

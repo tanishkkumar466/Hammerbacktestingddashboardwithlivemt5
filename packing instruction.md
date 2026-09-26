@@ -1,9 +1,28 @@
 # Packaging HammerCandleBacktestDashboard as a Windows .exe
 
-## Current release: v1.0.34
+## Current release: v1.0.35
 
-Bump `version.py` → commit → tag `v1.0.34` → push tag. GitHub Actions
+Bump `version.py` → commit → tag `v1.0.35` → push tag. GitHub Actions
 (`release-windows-exe.yml`) builds the Windows package on that tag.
+
+### v1.0.35 — what changed (client QA)
+
+**Must verify on Windows:**
+- **API Accounts:** the C++ MT5 engine is bundled and starts by itself — no manual
+  `hammer_mt5_engine.exe`. Start Algo on a demo account; per-account Order type
+  (default Market) is respected.
+- **Entry Offset warning:** a preset with Entry Offset ≠ 0 and Order type *Market*
+  shows a warning on Live Start and API Start (Market ignores the offset).
+- **Telegram alerts:** new layout — strategy first (HWC / HWC 35%), preset name,
+  bold Entry / SL / TP, details below, no emojis.
+- **Session restore:** run a backtest, close and reopen the app — parameters, open tabs
+  and the last run's results come back.
+- **HWC / HWC 35% min-wick filter:** off by default; when on, small wicks are rejected
+  (backtest and Live agree).
+- **Live history:** history dialog explains each signal with the settings row that built it.
+
+Tests: `pytest tests` (458) + `python3.11 scripts/mutation_check.py --jobs 6`
+(74/74 injected bugs caught).
 
 ### v1.0.34 — what changed (client QA)
 
@@ -67,7 +86,7 @@ for you to set up.
    ```
 4. On GitHub, open the repo -> **Actions** tab -> **Build Windows EXE**
    -> **Run workflow**.
-   Or for a release: push tag `v1.0.34` (must match `version.py`) and wait
+   Or for a release: push tag `v1.0.35` (must match `version.py`) and wait
    for **Release Windows EXE**.
 5. Wait a few minutes. Open the finished run, scroll down to
    **Artifacts**, download **HammerCandleBacktestDashboard-windows**.

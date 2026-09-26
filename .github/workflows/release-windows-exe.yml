@@ -55,6 +55,48 @@ jobs:
       - name: Unit tests (updater + paths)
         run: python -m pytest tests/test_updater.py tests/test_logs_layout.py -q --tb=short
 
+      # API Accounts desk needs the C++ engine bundled inside HammerRuntime.exe.
+      - name: Build C++ MT5 API engine (hammer_mt5_engine.exe)
+        shell: pwsh
+        run: |
+          cmake -S API/engine -B API/engine/build -A x64
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build API/engine/build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+          $exe = "API/engine/build/Release/hammer_mt5_engine.exe"
+          if (-not (Test-Path $exe)) { throw "engine build missing: $exe" }
+          Write-Host "engine built:" (Get-Item $exe).Length "bytes"
+
+      - name: Smoke-test engine (/health, /fleet/connect)
+        shell: pwsh
+        run: |
+          $exe = "API/engine/build/Release/hammer_mt5_engine.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--port","17999" -PassThru -WindowStyle Hidden
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              Start-Sleep -Milliseconds 250
+              try { $r = Invoke-RestMethod "http://127.0.0.1:17999/health" -TimeoutSec 2; if ($r.ok) { $ok = $true; break } } catch {}
+            }
+            if (-not $ok) { throw "engine /health did not answer" }
+            Write-Host "health:" ($r | ConvertTo-Json -Compress)
+            $f = Invoke-RestMethod -Method Post "http://127.0.0.1:17999/fleet/connect" -Body '{"stagger_ms":0,"accounts":[]}' -ContentType "application/json"
+            if (-not $f.ok) { throw "empty /fleet/connect failed" }
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: API Accounts tests (against the Windows engine build)
+        env:
+          HAMMER_ENGINE_EXE: ${{ github.workspace }}\API\engine\build\Release\hammer_mt5_engine.exe
+        run: python -m pytest tests/test_api_engine_process.py tests/test_api_desk.py tests/test_api_trading_runtime.py tests/test_hwc_min_wick.py -q --tb=short
+
+      - name: API preset parity (dashboard vs API desk, Qt offscreen)
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests/test_api_preset_parity.py -q --tb=short
+
       - name: Verify runtime imports (must pass before PyInstaller)
         shell: pwsh
         run: |
@@ -95,6 +137,8 @@ jobs:
           if ($sz -ge 80MB) { throw "Stashed stub is too large - wrong binary" }
 
       - name: Build runtime (HammerRuntime.exe)
+        env:
+          HAMMER_REQUIRE_ENGINE: "1"
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
       - name: Restore stub into dist/

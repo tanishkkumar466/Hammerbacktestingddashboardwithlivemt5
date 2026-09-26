@@ -60,6 +60,25 @@ TRADE_CSV_COLUMNS: List[str] = [
     "strategy_entry",
     "strategy_sl",
     "strategy_tp",
+    # History breakdown (see live_history.signal_breakdown)
+    "account",
+    "preset",
+    "signal_open",
+    "signal_high",
+    "signal_low",
+    "signal_close",
+    "entry_rule",
+    "entry_rule_price",
+    "entry_offset",
+    "signal_entry",
+    "pullback_pct",
+    "sl_mode",
+    "sl_anchor_label",
+    "sl_anchor",
+    "sl_buffer_mode",
+    "sl_buffer_setting",
+    "sl_buffer_amount",
+    "params",
 ]
 
 
@@ -190,6 +209,24 @@ def append_session_header(journal_dir: str, header: str) -> None:
     append_session_log(journal_dir, bar)
 
 
+def _upgrade_csv_header(path: str) -> None:
+    """Rewrite an older live_trades.csv with the current columns (keeps every row)."""
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header is None or header == TRADE_CSV_COLUMNS:
+            return
+        f.seek(0)
+        rows = list(csv.DictReader(f))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for old in rows:
+            writer.writerow({col: old.get(col, "") or "" for col in TRADE_CSV_COLUMNS})
+    os.replace(tmp, path)
+
+
 def append_trade_row(journal_dir: str, row: Dict[str, Any]) -> None:
     if not (journal_dir or "").strip():
         return
@@ -197,6 +234,11 @@ def append_trade_row(journal_dir: str, row: Dict[str, Any]) -> None:
         os.makedirs(journal_dir, exist_ok=True)
         path = trades_csv_path(journal_dir)
         write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+        if not write_header:
+            try:
+                _upgrade_csv_header(path)
+            except (OSError, csv.Error, UnicodeDecodeError):
+                pass
         with open(path, "a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS, extrasaction="ignore")
             if write_header:

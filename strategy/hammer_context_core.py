@@ -18,6 +18,16 @@ from typing import Dict, List, Optional, Tuple
 
 from . import logic
 
+def _clamp_pct(raw, default: float) -> float:
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if pct != pct:  # NaN
+        return default
+    return max(0.0, min(100.0, pct))
+
+
 @dataclass
 class HammerContextConfig:
     buy_hammer_ratios: logic.HammerRatioConfig = field(default_factory=logic.HammerRatioConfig)
@@ -29,6 +39,12 @@ class HammerContextConfig:
     # direction uses the previous candle color (red→BUY, green→SELL).
     buy_require_wick: bool = True
     sell_require_wick: bool = True
+    # Extra wick filter (off by default). Applies with the wick shape on or off.
+    # BUY: lower wick ≥ this % of range; SELL: upper wick ≥ this % of range.
+    buy_min_lower_wick_enabled: bool = False
+    buy_min_lower_wick_pct: float = 35.0
+    sell_min_upper_wick_enabled: bool = False
+    sell_min_upper_wick_pct: float = 35.0
     # Wait for price to move this % of |entry−SL| toward the stop before entering.
     # BUY: entry drops; SELL: entry rises. 0 = enter at the normal entry rule price.
     entry_pullback_pct: float = 0.0
@@ -71,6 +87,8 @@ class HammerContextConfig:
             self.entry_pullback_pct = 0.0
         if self.entry_pullback_pct > 100:
             self.entry_pullback_pct = 100.0
+        self.buy_min_lower_wick_pct = _clamp_pct(self.buy_min_lower_wick_pct, 35.0)
+        self.sell_min_upper_wick_pct = _clamp_pct(self.sell_min_upper_wick_pct, 35.0)
         self.entry_rule = logic.coerce_entry_rule(self.entry_rule)
         self.inverted_entry_rule = logic.coerce_entry_rule(self.inverted_entry_rule)
         self.sl_mode = logic.coerce_stop_loss_mode(self.sl_mode)
@@ -170,6 +188,31 @@ def body_only_ok(
     return True, ""
 
 
+def wick_pct_of_candle(candle: logic.Candle, side: str, min_range: float = 1e-9) -> float:
+    """Lower (side='lower') or upper wick as % of the candle range."""
+    rng = candle.range_
+    if rng <= min_range:
+        return 0.0
+    wick = candle.lower_wick if side == "lower" else candle.upper_wick
+    return (wick / rng) * 100.0
+
+
+def min_wick_ok(config: HammerContextConfig, candle: logic.Candle, is_buy: bool) -> Tuple[bool, str]:
+    """Optional extra filter: BUY lower wick / SELL upper wick at least the configured %."""
+    if is_buy:
+        if not config.buy_min_lower_wick_enabled:
+            return True, ""
+        need, side, name = config.buy_min_lower_wick_pct, "lower", "Lower"
+    else:
+        if not config.sell_min_upper_wick_enabled:
+            return True, ""
+        need, side, name = config.sell_min_upper_wick_pct, "upper", "Upper"
+    actual = wick_pct_of_candle(candle, side, config.min_range)
+    if actual < need:
+        return False, f"{name} wick {actual:.1f}% below min {need:g}%"
+    return True, ""
+
+
 def previous_candle_direction(
     candles: List[logic.Candle],
     signal_index: int,
@@ -213,6 +256,8 @@ def describe_hammer_context_rules(config: HammerContextConfig) -> str:
                 f"body ≤ {buy_hi:g}% (signal color ignored; prev red → BUY; "
                 f"wick upper/lower ignored)"
             )
+        if config.buy_min_lower_wick_enabled:
+            buy_shape += f" + lower wick ≥ {config.buy_min_lower_wick_pct:g}% of range"
         parts.append(f"BUY: {buy_shape} + {buy_ctx}")
     if config.enable_sell:
         if config.sell_require_wick:
@@ -223,6 +268,8 @@ def describe_hammer_context_rules(config: HammerContextConfig) -> str:
                 f"body ≤ {sell_hi:g}% (signal color ignored; prev green → SELL; "
                 f"wick upper/lower ignored)"
             )
+        if config.sell_min_upper_wick_enabled:
+            sell_shape += f" + upper wick ≥ {config.sell_min_upper_wick_pct:g}% of range"
         parts.append(f"SELL: {sell_shape} + {sell_ctx}")
     note = " | ".join(parts) if parts else "Both BUY and SELL setups disabled"
     if (config.enable_buy and not config.buy_require_wick) or (
@@ -398,6 +445,9 @@ def detect_buy_setup(
             return "Not a classic green hammer"
         if hr.hammer_variant != logic.HammerVariant.CLASSIC:
             return "Not classic hammer shape"
+    ok, msg = min_wick_ok(config, signal, is_buy=True)
+    if not ok:
+        return msg
     ok, msg = prior_closes_ok_for_buy(candles, signal_index, lookback)
     if not ok:
         return msg
@@ -430,6 +480,9 @@ def detect_sell_setup(
             return "Not an inverted red hammer"
         if hr.hammer_variant != logic.HammerVariant.INVERTED:
             return "Not inverted hammer shape"
+    ok, msg = min_wick_ok(config, signal, is_buy=False)
+    if not ok:
+        return msg
     ok, msg = prior_closes_ok_for_sell(candles, signal_index, lookback)
     if not ok:
         return msg

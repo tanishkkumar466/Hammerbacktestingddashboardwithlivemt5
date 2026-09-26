@@ -16,6 +16,7 @@ on:
       - "live.py"
       - "live_journal.py"
       - "fetch.py"
+      - "API/**"
       - "indicators/**"
       - "pyinstaller/**"
       - "requirements.txt"
@@ -72,6 +73,20 @@ jobs:
       - name: Unit tests (updater + paths)
         run: python -m pytest tests/test_updater.py tests/test_logs_layout.py -q --tb=short
 
+      - name: Build C++ MT5 API engine (hammer_mt5_engine.exe)
+        shell: pwsh
+        run: |
+          cmake -S API/engine -B API/engine/build -A x64
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build API/engine/build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+          if (-not (Test-Path "API/engine/build/Release/hammer_mt5_engine.exe")) { throw "engine build missing" }
+
+      - name: API Accounts tests (against the Windows engine build)
+        env:
+          HAMMER_ENGINE_EXE: ${{ github.workspace }}\API\engine\build\Release\hammer_mt5_engine.exe
+        run: python -m pytest tests/test_api_engine_process.py tests/test_api_desk.py tests/test_api_trading_runtime.py tests/test_hwc_min_wick.py -q --tb=short
+
       - name: Verify runtime imports
         shell: pwsh
         run: |
@@ -91,6 +106,8 @@ jobs:
           if ($sz -ge 80MB) { throw "Stashed stub is too large - wrong binary" }
 
       - name: Build runtime (HammerRuntime.exe)
+        env:
+          HAMMER_REQUIRE_ENGINE: "1"
         run: pyinstaller --noconfirm --clean HammerCandleBacktestDashboard.spec
 
       - name: Restore stub into dist/
